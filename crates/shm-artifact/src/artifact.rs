@@ -189,12 +189,40 @@ impl Artifact {
         self.commit_inner(expect, owner, commit, batch, registry)
     }
 
-    /// The shared install path for both exclusive and optimistic commits.
+    /// **ADDITIVE (v0.2 stage C — for `shm-stream`).** Optimistically install a
+    /// batch of **pre-staged** chunks (each already written + loaned via
+    /// [`shm_arrow::write_batch`] + [`ChunkCtrl::try_loan`](shm_core::ChunkCtrl::try_loan))
+    /// as the next version, expecting `current == expect`.
     ///
-    /// Everything is staged off to the side (loaned, written, published) and
-    /// reference-counted **before** the single `current` CAS, so nothing already
-    /// visible is ever mutated and a torn read is impossible. On CAS failure the
-    /// staged work is fully rolled back.
+    /// This is the pre-staged, multi-chunk analogue of
+    /// [`commit_optimistic`](Artifact::commit_optimistic): where that writes one
+    /// batch inline, this installs `N` chunks a stream accumulated invisibly.
+    /// It shares the identical RCU install path
+    /// ([`commit_staged_inner`](Artifact::commit_staged_inner)); see that method
+    /// for the success/failure ownership contract `shm-stream` relies on. Fails
+    /// with [`Error::Conflict`] if another committer moved `current` first, after
+    /// returning every staged chunk to the pool.
+    ///
+    /// `schema_id` is the interned id shared by all staged chunks; `owner` must
+    /// be non-zero.
+    pub fn commit_staged_optimistic(
+        &self,
+        owner: u32,
+        expect: u64,
+        commit: Commit,
+        staged: &[ChunkDesc],
+        schema_id: u32,
+    ) -> Result<u64> {
+        self.commit_staged_inner(expect, owner, commit, staged, schema_id)
+    }
+
+    /// The shared install path for both exclusive and optimistic single-batch
+    /// commits.
+    ///
+    /// Writes and loans the single data chunk, then delegates to
+    /// [`commit_staged_inner`](Artifact::commit_staged_inner) — the one true RCU
+    /// install path — so single-batch commits and pre-staged (`shm-stream`)
+    /// commits share identical staging, reference-counting, and CAS logic.
     fn commit_inner(
         &self,
         expect: u64,
@@ -208,19 +236,75 @@ impl Artifact {
             return Err(Error::Unsupported("Patch commit deferred to v0.2"));
         }
 
-        let head = self.head();
         let pool = Pool::attach(&self.data_seg)?;
         let alloc = PoolAllocator::new(&pool, &self.data_seg);
         let schema_id = registry.intern(&batch.schema());
 
-        // 1. Stage the new data chunk (written once, published, +1 ref for the
-        //    new version, owner released so refcount alone gates reclamation).
-        let data_desc = stage_chunk(
-            &pool,
-            |a| write_batch(a, registry, batch).map_err(Error::from),
-            &alloc,
-            owner,
-        )?;
+        // Write the one data chunk and loan it (FREE -> LOANED): exactly the
+        // pre-staged shape `commit_staged_inner` installs. Any staging failure
+        // below returns the chunk to the pool via that path's rollback.
+        let desc = write_batch(&alloc, registry, batch)?;
+        pool.ctrl(&desc)?.try_loan(owner)?;
+        self.commit_staged_inner(expect, owner, commit, &[desc], schema_id)
+    }
+
+    /// **The one true RCU install path**, shared by single-batch commits and by
+    /// `shm-stream`'s pre-staged multi-chunk commits.
+    ///
+    /// `staged` names chunks that have already been **written and loaned**
+    /// (`LOANED`, owned by `owner`) — for a single-batch commit by
+    /// [`commit_inner`](Artifact::commit_inner) just above, for a stream by its
+    /// `append_batch`. This method publishes them, reference-counts any Append
+    /// predecessor chunks, stages the manifest, and installs the new version with
+    /// one linearising CAS.
+    ///
+    /// # Contract (relied on by `shm-stream`)
+    ///
+    /// - **Success:** every `staged` chunk is `PUBLISHED` and owned by the new
+    ///   version (its reclamation is now governed by the artifact's pin/refcount
+    ///   rules, not the writer's borrow journal). Returns the new version number.
+    /// - **Failure:** every `staged` chunk is returned to the pool (`FREE`) —
+    ///   whether it had been published (released via refcount) or was still
+    ///   `LOANED` (dropped) — so the caller must **not** free them again. The
+    ///   caller need only release its own borrow-journal slots. (The `Patch`
+    ///   rejection is the sole early return that does *not* consume `staged`;
+    ///   callers pre-validate the commit kind, so a real staged commit never hits
+    ///   it — `shm-stream` rejects `Patch` at `open`.)
+    fn commit_staged_inner(
+        &self,
+        expect: u64,
+        owner: u32,
+        commit: Commit,
+        staged: &[ChunkDesc],
+        schema_id: u32,
+    ) -> Result<u64> {
+        debug_assert_ne!(owner, NO_WRITER, "commit owner id must be non-zero");
+        if let Commit::Patch(_) = commit {
+            return Err(Error::Unsupported("Patch commit deferred to v0.2"));
+        }
+
+        let head = self.head();
+        let pool = Pool::attach(&self.data_seg)?;
+
+        // 1. Publish each pre-staged data chunk (LOANED -> PUBLISHED, +1 version
+        //    ref, owner released). On a mid-loop failure, undo so *every* staged
+        //    chunk is returned to the pool: release those already published and
+        //    drop the remaining still-LOANED loans.
+        let mut published: Vec<ChunkDesc> = Vec::with_capacity(staged.len());
+        for (i, desc) in staged.iter().enumerate() {
+            match publish_staged(&pool, desc) {
+                Ok(()) => published.push(*desc),
+                Err(e) => {
+                    for c in &published {
+                        release_chunk(&pool, c);
+                    }
+                    for d in &staged[i..] {
+                        free_loaned(&pool, d);
+                    }
+                    return Err(e);
+                }
+            }
+        }
 
         // 2. Assemble the new version's manifest chunk list, referencing any
         //    retained (Append) chunks into the new version up front.
@@ -239,7 +323,7 @@ impl Artifact {
                                 chunks.push(*c);
                             }
                             Err(e) => {
-                                self.rollback(&pool, &data_desc, &retained, None, None);
+                                self.rollback_staged(&pool, &published, &retained, None, None);
                                 return Err(Error::from(e));
                             }
                         }
@@ -247,7 +331,7 @@ impl Artifact {
                 }
                 _ => {
                     // Prior version moved or is unreadable: treat as a conflict.
-                    self.rollback(&pool, &data_desc, &retained, None, None);
+                    self.rollback_staged(&pool, &published, &retained, None, None);
                     return Err(Error::Conflict {
                         expected: expect,
                         actual: head.current.load(SeqCst),
@@ -255,11 +339,12 @@ impl Artifact {
                 }
             }
         }
-        chunks.push(data_desc);
+        chunks.extend_from_slice(&published);
 
         let target = expect + 1;
 
         // 3. Stage the manifest chunk for the new version.
+        let alloc = PoolAllocator::new(&pool, &self.data_seg);
         let manifest_desc = match stage_chunk(
             &pool,
             |a| write_manifest(a, target, schema_id, &chunks),
@@ -268,7 +353,7 @@ impl Artifact {
         ) {
             Ok(d) => d,
             Err(e) => {
-                self.rollback(&pool, &data_desc, &retained, None, None);
+                self.rollback_staged(&pool, &published, &retained, None, None);
                 return Err(e);
             }
         };
@@ -278,7 +363,7 @@ impl Artifact {
         let slot_idx = match head.claim_slot(target, manifest_ref.to_bits()) {
             Some(i) => i,
             None => {
-                self.rollback(&pool, &data_desc, &retained, Some(&manifest_desc), None);
+                self.rollback_staged(&pool, &published, &retained, Some(&manifest_desc), None);
                 return Err(Error::Unsupported("live-version table full"));
             }
         };
@@ -305,9 +390,9 @@ impl Artifact {
             }
             Err(actual) => {
                 // Lost the race: undo everything staged.
-                self.rollback(
+                self.rollback_staged(
                     &pool,
-                    &data_desc,
+                    &published,
                     &retained,
                     Some(&manifest_desc),
                     Some(slot_idx),
@@ -317,12 +402,13 @@ impl Artifact {
         }
     }
 
-    /// Undo a failed commit: free the freed slot, release the manifest chunk, undo
-    /// retained-chunk references, and release the staged data chunk.
-    fn rollback(
+    /// Undo a failed commit: free the claimed slot, release the manifest chunk,
+    /// undo retained-chunk references, and release every published staged chunk
+    /// (refcount to 0 → `FREE`).
+    fn rollback_staged(
         &self,
         pool: &Pool<'_>,
-        data_desc: &ChunkDesc,
+        published: &[ChunkDesc],
         retained: &[ChunkDesc],
         manifest_desc: Option<&ChunkDesc>,
         slot_idx: Option<usize>,
@@ -330,8 +416,7 @@ impl Artifact {
         if let Some(idx) = slot_idx {
             let slot = &self.head().pins[idx];
             slot.version.store(0, Release);
-            slot.state
-                .store(crate::head::SLOT_FREE, Release);
+            slot.state.store(crate::head::SLOT_FREE, Release);
         }
         if let Some(m) = manifest_desc {
             release_chunk(pool, m);
@@ -341,7 +426,9 @@ impl Artifact {
             // its own reference).
             release_chunk(pool, c);
         }
-        release_chunk(pool, data_desc);
+        for c in published {
+            release_chunk(pool, c);
+        }
     }
 
     // ---- Read path ----
@@ -444,6 +531,31 @@ where
     ctrl.borrow_shared()?; // refcount 0 -> 1 : this version's reference
     ctrl.owner_release(); // owner -> NONE; refcount 1 so no reclaim
     Ok(desc)
+}
+
+/// Transition one **pre-staged** chunk (already `LOANED` + written, e.g. by an
+/// `shm-stream` `append_batch`) into a published, version-owned chunk: publish
+/// it, take this version's `+1` reference, and release the writer's exclusive
+/// ownership so the refcount alone gates reclamation.
+///
+/// This is the tail of [`stage_chunk`] for a chunk that was written and loaned
+/// earlier rather than in the same call.
+fn publish_staged(pool: &Pool<'_>, desc: &ChunkDesc) -> Result<()> {
+    let ctrl = pool.ctrl(desc)?;
+    ctrl.publish()?; // LOANED -> PUBLISHED
+    ctrl.borrow_shared()?; // refcount 0 -> 1 : this version's reference
+    ctrl.owner_release(); // owner -> NONE; refcount 1 so no reclaim
+    Ok(())
+}
+
+/// Free a staged chunk still in the `LOANED` state (a commit failed before it
+/// was published): recycle its control word to `FREE` and return it to the pool.
+fn free_loaned(pool: &Pool<'_>, desc: &ChunkDesc) {
+    if let Ok(ctrl) = pool.ctrl(desc) {
+        if ctrl.drop_loan().is_ok() {
+            let _ = pool.free(desc);
+        }
+    }
 }
 
 /// Release one version's reference on a chunk; if that was the last reference the
@@ -569,6 +681,31 @@ impl Committer<'_> {
         let expect = self.artifact.head().current.load(SeqCst);
         self.artifact
             .commit_inner(expect, self.owner, commit, batch, registry)
+    }
+
+    /// **ADDITIVE (v0.2 stage C — for `shm-stream`).** Install a batch of
+    /// **pre-staged** chunks (each already written + loaned via
+    /// [`shm_arrow::write_batch`] + [`ChunkCtrl::try_loan`](shm_core::ChunkCtrl::try_loan))
+    /// as the next version under the held exclusive lease.
+    ///
+    /// This is the pre-staged, multi-chunk analogue of
+    /// [`commit`](Committer::commit): where that writes one batch inline, this
+    /// installs the `N` chunks a stream accumulated invisibly under the lease.
+    /// The predecessor is whatever `current` reads now; the install CAS then
+    /// advances it by one. Shares the identical RCU install path
+    /// ([`commit_staged_inner`](Artifact::commit_staged_inner)); see that method
+    /// for the success/failure ownership contract `shm-stream` relies on.
+    ///
+    /// `schema_id` is the interned id shared by all staged chunks.
+    pub fn commit_staged(
+        &mut self,
+        commit: Commit,
+        staged: &[ChunkDesc],
+        schema_id: u32,
+    ) -> Result<u64> {
+        let expect = self.artifact.head().current.load(SeqCst);
+        self.artifact
+            .commit_staged_inner(expect, self.owner, commit, staged, schema_id)
     }
 
     /// The actor id holding the lease.

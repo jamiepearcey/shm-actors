@@ -21,6 +21,18 @@ pub enum Error {
     #[error("ring: {0}")]
     Ring(String),
 
+    /// An error from the artifact (RCU/MVCC) layer.
+    #[error("artifact: {0}")]
+    Artifact(String),
+
+    /// An error from the task-queue layer.
+    #[error("task: {0}")]
+    Task(String),
+
+    /// An error from the stream (transactional write) layer.
+    #[error("stream: {0}")]
+    Stream(String),
+
     /// A standard-library I/O error (UDS accept/connect/read/write).
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -68,5 +80,23 @@ impl From<shm_arrow::Error> for Error {
 impl From<shm_ring::Error> for Error {
     fn from(e: shm_ring::Error) -> Self {
         Error::Ring(e.to_string())
+    }
+}
+
+impl From<shm_artifact::Error> for Error {
+    fn from(e: shm_artifact::Error) -> Self {
+        Error::Artifact(e.to_string())
+    }
+}
+
+impl From<shm_task::Error> for Error {
+    fn from(e: shm_task::Error) -> Self {
+        Error::Task(e.to_string())
+    }
+}
+
+impl From<shm_stream::Error> for Error {
+    fn from(e: shm_stream::Error) -> Self {
+        Error::Stream(e.to_string())
     }
 }

@@ -5,7 +5,9 @@
 //! segment and hands its descriptor to an actor by attaching the raw fd to a
 //! `sendmsg` control message ([`ControlMessage::ScmRights`]); the kernel
 //! installs a *duplicate* fd in the receiver, which then adopts it via
-//! [`Segment::from_raw_fd`](shm_core::Segment::from_raw_fd).
+//! [`Segment::from_raw_fd`](shm_core::Segment::from_raw_fd). The same path also
+//! carries a topic's non-segment doorbell pipe fd (v0.2 stage D) alongside the
+//! ring-segment fd in a `Granted` reply.
 //!
 //! # Framing
 //!

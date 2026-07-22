@@ -59,6 +59,15 @@ impl<P: Parker> Subscriber<P> {
         Subscriber { ring, cursor, parker, reliable: None }
     }
 
+    /// Subscribe from sequence `0` (replaying whatever is still live) with a
+    /// custom [`Parker`] — the [`from_start`](Subscriber::from_start) counterpart
+    /// for a doorbell-backed subscriber.
+    pub fn from_start_with_parker(ring: Ring, parker: P) -> Subscriber<P> {
+        let mut s = Self::with_parker(ring, parker);
+        s.cursor = 0;
+        s
+    }
+
     /// Promote this subscriber to **reliable**, publishing its cursor into the
     /// ring so the producer side can observe how far behind it is.
     ///

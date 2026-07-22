@@ -14,8 +14,32 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 /// The demo topic name.
 pub const DEMO_TOPIC: &str = "demo";
 
+/// The cache-loop artifact name (v0.2 walking skeleton).
+pub const CACHE_ARTIFACT: &str = "cache";
+
 /// The demo batch's row count.
 pub const DEMO_ROWS: usize = 4;
+
+/// The value a worker derives from a pinned version of [`demo_batch`]: the sum
+/// of the `id` column (`10+20+30+40 = 100`).
+///
+/// Computing it requires the worker to have pinned the version and reconstructed
+/// the batch zero-copy via [`VersionPin::as_arrow`](shm_artifact::VersionPin),
+/// so a result matching this proves the full read path.
+pub const DEMO_ID_SUM: i64 = 100;
+
+/// Derive the cache-loop result from a reconstructed batch: `(sum(id), rows)`.
+///
+/// Returns an error string if the batch is not the expected shape.
+pub fn demo_derive(batch: &RecordBatch) -> std::result::Result<(i64, i64), String> {
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or("column 0 is not Int64")?;
+    let sum: i64 = ids.values().iter().copied().sum();
+    Ok((sum, batch.num_rows() as i64))
+}
 
 /// The one schema the walking skeleton uses: `(id: Int64, name: Utf8)`.
 ///

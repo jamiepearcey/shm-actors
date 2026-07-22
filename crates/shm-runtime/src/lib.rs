@@ -51,5 +51,5 @@ pub mod uds;
 pub use config::RuntimeConfig;
 pub use coordinator::{ChunkSnapshot, Coordinator};
 pub use error::{Error, Result};
-pub use node::{Node, Pin};
+pub use node::{ArtifactWatcher, Node, NodeStream, Pin, TaskQueueHandle};
 pub use protocol::{Request, Response};

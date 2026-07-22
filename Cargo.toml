@@ -4,7 +4,9 @@ members = [
     "crates/shm-core",
     "crates/shm-arrow",
     "crates/shm-ring",
+    "crates/shm-task",
     "crates/shm-artifact",
+    "crates/shm-stream",
     "crates/shm-runtime",
 ]
 
@@ -20,7 +22,9 @@ repository = "https://github.com/example/shm-actors"
 shm-core = { path = "crates/shm-core" }
 shm-arrow = { path = "crates/shm-arrow" }
 shm-ring = { path = "crates/shm-ring" }
+shm-task = { path = "crates/shm-task" }
 shm-artifact = { path = "crates/shm-artifact" }
+shm-stream = { path = "crates/shm-stream" }
 shm-runtime = { path = "crates/shm-runtime" }
 
 # External

@@ -8,6 +8,7 @@
 //! the optional heartbeat (a lease renewal, off the payload path).
 
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -16,17 +17,55 @@ use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use shm_arrow::{read_batch, write_batch, PinGuard, PoolAllocator, SchemaRegistry};
+use shm_artifact::{Artifact, VersionEvent, ARTIFACTS_TOPIC};
 use shm_core::{BorrowJournal, ChunkDesc, Pool, Segment};
-use shm_ring::{Publisher, Ring, Subscriber};
+use shm_ring::{DoorbellNotifier, DoorbellParker, Msg, Publisher, Ring, Subscriber};
+use shm_stream::{Commit, Coordination, StreamWriter};
+use shm_task::{
+    now_nanos, ClaimedTask, Outcome, TaskHandle, TaskQueue, TaskStatus,
+};
 
 use crate::error::{Error, Result};
 use crate::protocol::{Request, Response};
 use crate::uds::{recv_frame, send_frame};
 
-/// A mapped topic ring segment plus the ring region length.
+/// A mapped topic ring segment, its region length, and the topic's doorbell fd.
+///
+/// A `Node` uses a topic in a single role: the doorbell end fixed at the first
+/// [`Node::ensure_topic`] is the write-end (for a publisher) or the read-end
+/// (for a subscriber). The publisher's [`DoorbellNotifier`] borrows this fd; a
+/// subscriber's [`DoorbellParker`] gets its own duplicate so it can outlive
+/// nothing but still own its wakeup fd.
 struct TopicRing {
     segment: Arc<Segment>,
     region_len: usize,
+    doorbell: OwnedFd,
+}
+
+/// A coordinator-granted artifact: its handle plus the two segments backing it.
+///
+/// The `Artifact` carries a watch sink that, on every successful commit,
+/// publishes the [`VersionEvent`] onto the coordinator's `__artifacts` ring —
+/// so a stream commit through this artifact is observable by any
+/// [`watch_artifacts`](Node::watch_artifacts) subscriber. The segments are kept
+/// mapped for the artifact's (and every pin's) lifetime.
+struct ArtifactMap {
+    artifact: Artifact,
+    #[allow(dead_code)]
+    head_seg: Arc<Segment>,
+    data_seg: Arc<Segment>,
+}
+
+/// A coordinator-granted task-queue mapping: the segment plus every doorbell end
+/// (work/done, read/write) so this node can act as worker, submitter, and
+/// requester over the one shared queue.
+struct TaskQueueMap {
+    segment: Arc<Segment>,
+    region_len: usize,
+    work_read: OwnedFd,
+    work_write: OwnedFd,
+    done_read: OwnedFd,
+    done_write: OwnedFd,
 }
 
 /// An actor's handle onto a running coordinator's substrate.
@@ -34,10 +73,11 @@ pub struct Node {
     name: String,
     actor_id: u32,
     payload_seg: Arc<Segment>,
-    #[allow(dead_code)]
     journal_seg: Arc<Segment>,
     registry: Arc<SchemaRegistry>,
     topics: HashMap<String, TopicRing>,
+    artifacts: HashMap<String, ArtifactMap>,
+    task_queue: Option<TaskQueueMap>,
     /// Guarded send side (shared with the heartbeat thread).
     send: Arc<Mutex<UnixStream>>,
     /// Read side (responses only; main thread).
@@ -104,10 +144,18 @@ impl Node {
             journal_seg,
             registry,
             topics: HashMap::new(),
+            artifacts: HashMap::new(),
+            task_queue: None,
             send,
             read_stream,
             heartbeat: None,
         })
+    }
+
+    /// The schema registry this node was seeded with.
+    #[inline]
+    pub fn registry(&self) -> &Arc<SchemaRegistry> {
+        &self.registry
     }
 
     /// The actor id assigned by the coordinator.
@@ -163,12 +211,14 @@ impl Node {
             Response::Error { message } => return Err(Error::Rejected(message)),
             _ => return Err(Error::Protocol("expected Granted")),
         };
-        if fds.len() != 1 {
+        if fds.len() != 2 {
             return Err(Error::MissingFds {
-                expected: 1,
+                expected: 2,
                 received: fds.len(),
             });
         }
+        // fd order (coordinator send order): ring segment, then doorbell.
+        let doorbell = fds.pop().unwrap();
         let ring_fd = fds.pop().unwrap();
         // SAFETY: a freshly-received SCM_RIGHTS fd naming the topic's ring shm
         // segment; ownership transfers to the mapped `Segment`.
@@ -178,6 +228,7 @@ impl Node {
             TopicRing {
                 segment,
                 region_len,
+                doorbell,
             },
         );
         Ok(())
@@ -217,9 +268,17 @@ impl Node {
         ctrl.try_loan(self.actor_id)?;
         ctrl.publish()?;
 
-        // Broadcast the descriptor.
+        // Broadcast the descriptor, ringing the topic's doorbell to wake any
+        // parked subscribers. The write-end fd is owned by `TopicRing` (kept
+        // alive by `self`), so the borrowed `RawFd` is valid for this call.
         let ring = self.ring_for(topic)?;
-        Publisher::new(ring).publish(desc);
+        let write_fd = self
+            .topics
+            .get(topic)
+            .expect("topic ensured above")
+            .doorbell
+            .as_raw_fd();
+        Publisher::with_notifier(ring, DoorbellNotifier::new(write_fd)).publish(desc);
 
         // Tell the coordinator (control plane) which chunk is now published so it
         // can manage the exclusive-ownership handoff on the pinned ack.
@@ -227,14 +286,23 @@ impl Node {
         Ok(desc)
     }
 
-    /// Subscribe to `topic` from the start of its live ring history.
+    /// Subscribe to `topic` from the start of its live ring history, parking on
+    /// the topic's doorbell so an idle `recv` blocks instead of spinning.
     ///
     /// Using `from_start` makes the consumer robust to subscribing after the
     /// producer has already published (the message is still live in the ring).
-    pub fn subscribe(&mut self, topic: &str) -> Result<Subscriber> {
+    /// The returned [`Subscriber`] owns a duplicate of the doorbell read-end via
+    /// its [`DoorbellParker`], so its wakeup fd closes when the subscriber drops.
+    pub fn subscribe(&mut self, topic: &str) -> Result<Subscriber<DoorbellParker>> {
         self.ensure_topic(topic, true)?;
         let ring = self.ring_for(topic)?;
-        Ok(Subscriber::from_start(ring))
+        let read = self
+            .topics
+            .get(topic)
+            .expect("topic ensured above")
+            .doorbell
+            .try_clone()?;
+        Ok(Subscriber::from_start_with_parker(ring, DoorbellParker::new(read)))
     }
 
     /// Take a shared pin on a received `desc`, record it in the borrow journal,
@@ -292,6 +360,187 @@ impl Node {
         Ok(())
     }
 
+    // ---- v0.2 cache-loop API (ADR-0002 item A + walking skeleton) ----
+
+    /// Open (creating on first reference) the named artifact, mapping its head +
+    /// data segments and wiring a commit **watch sink** that publishes a
+    /// [`VersionEvent`] on the coordinator's `__artifacts` ring.
+    ///
+    /// Idempotent: a second call for the same name is a no-op. After opening,
+    /// [`artifact`](Node::artifact) reads (pin) and [`stream`](Node::stream)
+    /// writes. A stream commit fires the watch sink, so any
+    /// [`watch_artifacts`](Node::watch_artifacts) subscriber sees the new
+    /// version — this is ADR-0002 item A (watch-on-commit).
+    pub fn open_artifact(&mut self, name: &str) -> Result<()> {
+        if self.artifacts.contains_key(name) {
+            return Ok(());
+        }
+        // Map the built-in `__artifacts` ring as a publisher (we take the
+        // write-end) so the watch sink can broadcast commit events.
+        self.ensure_topic(ARTIFACTS_TOPIC, false)?;
+
+        let (resp, mut fds) = self.request(&Request::OpenArtifact { name: name.into() })?;
+        let (name_id, head_seg_id, data_seg_id) = match resp {
+            Response::ArtifactGranted {
+                name_id,
+                head_seg_id,
+                data_seg_id,
+            } => (name_id, head_seg_id, data_seg_id),
+            Response::Error { message } => return Err(Error::Rejected(message)),
+            _ => return Err(Error::Protocol("expected ArtifactGranted")),
+        };
+        if fds.len() != 2 {
+            return Err(Error::MissingFds {
+                expected: 2,
+                received: fds.len(),
+            });
+        }
+        // fd order (coordinator send order): head segment, then data segment.
+        let data_fd = fds.pop().unwrap();
+        let head_fd = fds.pop().unwrap();
+        // SAFETY: freshly-received SCM_RIGHTS fds naming the artifact's head/data
+        // shm segments; ownership transfers to the mapped `Segment`s.
+        let head_seg = Arc::new(unsafe { Segment::from_raw_fd(into_raw(head_fd), head_seg_id)? });
+        let data_seg = Arc::new(unsafe { Segment::from_raw_fd(into_raw(data_fd), data_seg_id)? });
+
+        // Build the watch sink over an independent, owned view of the
+        // `__artifacts` ring (segment Arc + a duplicated doorbell write-end), so
+        // it is `Send + Sync + 'static` and keeps its wakeup fd alive itself.
+        let art_topic = self.topics.get(ARTIFACTS_TOPIC).expect("ensured above");
+        let ring_seg = art_topic.segment.clone();
+        let region_len = art_topic.region_len;
+        let write_fd = art_topic.doorbell.try_clone()?;
+        let artifact = Artifact::attach(name_id, head_seg.clone(), data_seg.clone())?.with_watch(
+            move |ev: VersionEvent| {
+                // SAFETY: `ring_seg` (an owned Arc) keeps the ring segment mapped
+                // for this closure's life; `payload_ptr()` backs `region_len`
+                // bytes the coordinator initialised with `Ring::init`.
+                if let Ok(ring) = unsafe { Ring::attach(ring_seg.payload_ptr(), region_len) } {
+                    Publisher::with_notifier(ring, DoorbellNotifier::new(write_fd.as_raw_fd()))
+                        .publish(ev.to_desc());
+                }
+            },
+        );
+
+        self.artifacts.insert(
+            name.into(),
+            ArtifactMap {
+                artifact,
+                head_seg,
+                data_seg,
+            },
+        );
+        Ok(())
+    }
+
+    /// Borrow a previously [opened](Node::open_artifact) artifact, e.g. to
+    /// [`pin`](shm_artifact::Artifact::pin) and read a version zero-copy.
+    pub fn artifact(&self, name: &str) -> Result<&Artifact> {
+        self.artifacts
+            .get(name)
+            .map(|a| &a.artifact)
+            .ok_or(Error::NotFound("artifact not opened"))
+    }
+
+    /// Open a write transaction against a previously [opened](Node::open_artifact)
+    /// artifact, returning a [`NodeStream`] whose
+    /// [`writer`](NodeStream::writer) is an ordinary [`shm_stream::StreamWriter`]
+    /// bound to this node's borrow journal (so a crash mid-stage is reclaimed by
+    /// the coordinator) and this artifact's commit watch sink (so `commit()`
+    /// publishes a [`VersionEvent`]).
+    pub fn stream(&self, name: &str) -> Result<NodeStream<'_>> {
+        let am = self
+            .artifacts
+            .get(name)
+            .ok_or(Error::NotFound("artifact not opened"))?;
+        let journal = BorrowJournal::attach(&self.journal_seg)?;
+        Ok(NodeStream {
+            artifact: &am.artifact,
+            data_seg: am.data_seg.as_ref(),
+            journal,
+            registry: self.registry.as_ref(),
+            owner: self.actor_id,
+        })
+    }
+
+    /// Subscribe to the built-in `__artifacts` topic, parking on its doorbell so
+    /// an idle watcher blocks (≈0% CPU) until a commit event arrives — ADR-0002
+    /// stage D applied to item A.
+    ///
+    /// The returned [`ArtifactWatcher`] yields decoded [`VersionEvent`]s (via
+    /// [`VersionEvent::from_desc`]).
+    pub fn watch_artifacts(&mut self) -> Result<ArtifactWatcher> {
+        let sub = self.subscribe(ARTIFACTS_TOPIC)?;
+        Ok(ArtifactWatcher { sub })
+    }
+
+    /// Map the built-in task queue (idempotent). Usually called implicitly by
+    /// [`task_queue`](Node::task_queue).
+    pub fn open_task_queue(&mut self) -> Result<()> {
+        if self.task_queue.is_some() {
+            return Ok(());
+        }
+        let (resp, mut fds) = self.request(&Request::OpenTaskQueue)?;
+        let (queue_seg_id, region_len) = match resp {
+            Response::TaskQueueGranted {
+                queue_seg_id,
+                region_len,
+            } => (queue_seg_id, region_len as usize),
+            Response::Error { message } => return Err(Error::Rejected(message)),
+            _ => return Err(Error::Protocol("expected TaskQueueGranted")),
+        };
+        if fds.len() != 5 {
+            return Err(Error::MissingFds {
+                expected: 5,
+                received: fds.len(),
+            });
+        }
+        // fd order: queue seg, work read, work write, done read, done write.
+        let done_write = fds.pop().unwrap();
+        let done_read = fds.pop().unwrap();
+        let work_write = fds.pop().unwrap();
+        let work_read = fds.pop().unwrap();
+        let queue_fd = fds.pop().unwrap();
+        // SAFETY: a freshly-received SCM_RIGHTS fd naming the task-queue shm
+        // segment; ownership transfers to the mapped `Segment`.
+        let segment = Arc::new(unsafe { Segment::from_raw_fd(into_raw(queue_fd), queue_seg_id)? });
+        self.task_queue = Some(TaskQueueMap {
+            segment,
+            region_len,
+            work_read,
+            work_write,
+            done_read,
+            done_write,
+        });
+        Ok(())
+    }
+
+    /// A handle onto the built-in task queue for submit / claim / wait / complete
+    /// (mapping it on first use). The handle wires the work/done doorbells so
+    /// workers block on the work doorbell and requesters on the done doorbell.
+    pub fn task_queue(&mut self) -> Result<TaskQueueHandle> {
+        self.open_task_queue()?;
+        let m = self.task_queue.as_ref().expect("opened above");
+        // Own our own duplicated write-ends so the queue's notifiers reference
+        // fds that live exactly as long as the returned handle.
+        let work_write = m.work_write.try_clone()?;
+        let done_write = m.done_write.try_clone()?;
+        // SAFETY: the cloned `segment` Arc keeps the region mapped for the
+        // handle's life; the coordinator initialised it with `TaskQueue::init`.
+        let queue = unsafe { TaskQueue::attach(m.segment.payload_ptr(), m.region_len)? }
+            .with_work_notifier(DoorbellNotifier::new(work_write.as_raw_fd()))
+            .with_done_notifier(DoorbellNotifier::new(done_write.as_raw_fd()));
+        Ok(TaskQueueHandle {
+            queue,
+            _segment: m.segment.clone(),
+            work_read: m.work_read.try_clone()?,
+            done_read: m.done_read.try_clone()?,
+            _work_write: work_write,
+            _done_write: done_write,
+            worker_id: self.actor_id,
+        })
+    }
+
     /// Start a background heartbeat thread that renews this actor's lease every
     /// `interval`. Call once, after all request/response handshakes are done.
     pub fn start_heartbeat(&mut self, interval: Duration) {
@@ -328,6 +577,132 @@ pub struct Pin {
     pub slot: usize,
     /// The reconstructed record batch (buffers point into shared memory).
     pub batch: RecordBatch,
+}
+
+/// A write transaction opened via [`Node::stream`].
+///
+/// It owns the node's [`BorrowJournal`] handle for the transaction's duration
+/// and lends out an ordinary [`shm_stream::StreamWriter`] through
+/// [`writer`](NodeStream::writer). Keeping the journal here (rather than inside
+/// the writer) sidesteps a self-referential borrow: the `NodeStream` borrows the
+/// node, and the `StreamWriter` borrows the `NodeStream`.
+pub struct NodeStream<'a> {
+    artifact: &'a Artifact,
+    data_seg: &'a Segment,
+    journal: BorrowJournal<'a>,
+    registry: &'a SchemaRegistry,
+    owner: u32,
+}
+
+impl NodeStream<'_> {
+    /// Open a [`StreamWriter`] for this transaction with the given commit kind
+    /// and coordination discipline. Its `commit()` installs a new artifact
+    /// version and fires the artifact's watch sink (publishing a
+    /// [`VersionEvent`] on `__artifacts`).
+    pub fn writer(&self, kind: Commit, coordination: Coordination) -> Result<StreamWriter<'_>> {
+        Ok(StreamWriter::open(
+            self.artifact,
+            self.data_seg,
+            &self.journal,
+            self.registry,
+            self.owner,
+            kind,
+            coordination,
+        )?)
+    }
+}
+
+/// A doorbell-parked subscriber to the `__artifacts` topic that yields decoded
+/// [`VersionEvent`]s. Built by [`Node::watch_artifacts`].
+pub struct ArtifactWatcher {
+    sub: Subscriber<DoorbellParker>,
+}
+
+impl ArtifactWatcher {
+    /// Block (parked on the doorbell) until the next commit [`VersionEvent`],
+    /// decoding it from the ring descriptor. Skips ring-lag notices and any
+    /// non-event descriptor.
+    pub fn recv(&mut self) -> VersionEvent {
+        loop {
+            match self.sub.recv() {
+                Msg::Sample(desc) => {
+                    if let Some(ev) = VersionEvent::from_desc(&desc) {
+                        return ev;
+                    }
+                }
+                Msg::Lagged(_) => {}
+            }
+        }
+    }
+
+    /// Access the underlying [`Subscriber`] (e.g. to observe park behaviour or
+    /// drive a non-blocking receive).
+    #[inline]
+    pub fn subscriber(&mut self) -> &mut Subscriber<DoorbellParker> {
+        &mut self.sub
+    }
+}
+
+/// A handle onto the built-in task queue, wiring the work/done doorbells so
+/// workers block on the work doorbell and requesters on the done doorbell.
+/// Built by [`Node::task_queue`].
+pub struct TaskQueueHandle {
+    queue: TaskQueue,
+    _segment: Arc<Segment>,
+    work_read: OwnedFd,
+    done_read: OwnedFd,
+    _work_write: OwnedFd,
+    _done_write: OwnedFd,
+    worker_id: u32,
+}
+
+impl TaskQueueHandle {
+    /// This node's worker/owner id (the correlation owner stamped on a claim).
+    #[inline]
+    pub fn worker_id(&self) -> u32 {
+        self.worker_id
+    }
+
+    /// The underlying [`TaskQueue`] (for advanced/rare operations).
+    #[inline]
+    pub fn queue(&self) -> &TaskQueue {
+        &self.queue
+    }
+
+    /// Submit a task with an absolute `deadline_nanos` (in [`now_nanos`]'s clock
+    /// domain), returning its correlation [`TaskHandle`]. Rings the work doorbell
+    /// iff workers are parked.
+    pub fn submit(&self, request: ChunkDesc, deadline_nanos: u64) -> Result<TaskHandle> {
+        Ok(self.queue.submit(request, deadline_nanos)?)
+    }
+
+    /// Read a task's current [`TaskStatus`], re-validating the handle.
+    pub fn poll(&self, handle: TaskHandle) -> Result<TaskStatus> {
+        Ok(self.queue.poll(handle)?)
+    }
+
+    /// Non-blocking claim with a fresh lease `lease_nanos` into the future (its
+    /// deadline is stamped on the claim), or `None` if the queue is empty.
+    pub fn claim(&self, lease_nanos: u64) -> Option<ClaimedTask> {
+        self.queue
+            .claim_with_lease(self.worker_id, now_nanos().wrapping_add(lease_nanos))
+    }
+
+    /// Claim a task, parking on the work doorbell while none is queued, stamping
+    /// a fresh `lease_nanos` lease on the successful claim.
+    pub fn claim_blocking(&self, lease_nanos: u64) -> Result<ClaimedTask> {
+        let parker = DoorbellParker::new(self.work_read.try_clone()?);
+        Ok(self
+            .queue
+            .claim_blocking_with_lease(self.worker_id, lease_nanos, &parker))
+    }
+
+    /// Block (parked on the done doorbell) until the task reaches a terminal
+    /// [`Outcome`].
+    pub fn wait(&self, handle: TaskHandle) -> Result<Outcome> {
+        let parker = DoorbellParker::new(self.done_read.try_clone()?);
+        Ok(self.queue.wait(handle, &parker)?)
+    }
 }
 
 /// Consume an [`OwnedFd`] into its raw fd, transferring ownership onward.

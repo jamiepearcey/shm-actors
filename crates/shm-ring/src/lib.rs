@@ -32,7 +32,10 @@ pub mod ring;
 pub mod subscribe;
 
 pub use error::{Error, Result};
-pub use hooks::{NoopNotifier, Notifier, Parker, YieldParker};
+pub use hooks::{
+    DoorbellNotifier, DoorbellParker, NoopNotifier, Notifier, Parker, YieldParker,
+    DEFAULT_DOORBELL_TIMEOUT,
+};
 pub use publish::Publisher;
 pub use ring::{
     required_bytes, slots_offset, Ring, RingHeader, Slot, MAX_RELIABLE, RELIABLE_UNUSED, RING_MAGIC,

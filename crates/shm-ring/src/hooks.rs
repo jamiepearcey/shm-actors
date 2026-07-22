@@ -38,3 +38,87 @@ impl Parker for YieldParker {
         std::thread::yield_now();
     }
 }
+
+// ---- v0.2 doorbell-backed hooks (ADR-0002 stage D) ----
+
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::time::Duration;
+
+/// The default bounded [`DoorbellParker`] poll timeout.
+///
+/// A parked subscriber re-checks the ring at least this often even absent a
+/// wakeup, so a subscriber whose publisher died (and thus never rang the
+/// doorbell) still makes progress — it observes lag/shutdown rather than
+/// blocking forever. Tens of milliseconds keeps idle CPU negligible while
+/// bounding the "stolen doorbell byte" worst-case wake latency (see
+/// [`shm_core::doorbell_park`]).
+pub const DEFAULT_DOORBELL_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// A [`Notifier`] that rings a pipe-backed doorbell: it writes one byte to a
+/// ring's doorbell **write-end**, waking every subscriber parked in
+/// [`DoorbellParker`] on the matching read-end.
+///
+/// Holds a borrowed [`RawFd`]; the owner (the runtime's per-topic handle) keeps
+/// the write-end alive for as long as any publish may occur. This is a cheap
+/// `Copy` value so a wait-free [`Publisher`](crate::Publisher) can hold it
+/// inline.
+#[derive(Clone, Copy, Debug)]
+pub struct DoorbellNotifier {
+    write_fd: RawFd,
+}
+
+impl DoorbellNotifier {
+    /// Wrap a doorbell write-end fd. The caller must keep the underlying fd
+    /// open for the notifier's lifetime.
+    pub fn new(write_fd: RawFd) -> DoorbellNotifier {
+        DoorbellNotifier { write_fd }
+    }
+}
+
+impl Notifier for DoorbellNotifier {
+    fn notify(&self) {
+        // Best-effort: a failed doorbell must never fail a publish. A dropped
+        // wakeup is bounded-recovered by the parker's timeout re-check.
+        let _ = shm_core::doorbell_ring(self.write_fd);
+    }
+}
+
+/// A [`Parker`] that blocks in level-triggered `poll(2)` on a ring's doorbell
+/// **read-end** with a bounded timeout, then drains it.
+///
+/// Owns the read-end [`OwnedFd`] (closed on drop). Because the ring's `recv`
+/// registers the waiter and re-checks emptiness *before* calling `park`, and
+/// the doorbell is level-triggered, a publish that raced the registration is
+/// still observed: its byte persists in the pipe until drained, so the next
+/// `poll` returns immediately. The bounded timeout guarantees liveness even if
+/// a wakeup is missed or the publisher died.
+#[derive(Debug)]
+pub struct DoorbellParker {
+    read: OwnedFd,
+    timeout: Duration,
+}
+
+impl DoorbellParker {
+    /// Park on a doorbell read-end with the [`DEFAULT_DOORBELL_TIMEOUT`].
+    pub fn new(read: OwnedFd) -> DoorbellParker {
+        DoorbellParker { read, timeout: DEFAULT_DOORBELL_TIMEOUT }
+    }
+
+    /// Park on a doorbell read-end with a custom bounded timeout.
+    pub fn with_timeout(read: OwnedFd, timeout: Duration) -> DoorbellParker {
+        DoorbellParker { read, timeout }
+    }
+
+    /// The raw read-end fd (e.g. for diagnostics); ownership stays with `self`.
+    pub fn read_fd(&self) -> RawFd {
+        self.read.as_raw_fd()
+    }
+}
+
+impl Parker for DoorbellParker {
+    fn park(&self) {
+        // Ignore the wake/timeout distinction: the caller (`recv`) re-checks the
+        // ring either way, and an error here degrades to the timeout re-check.
+        let _ = shm_core::doorbell_park(self.read.as_raw_fd(), self.timeout);
+    }
+}

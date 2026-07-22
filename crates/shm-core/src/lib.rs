@@ -39,7 +39,10 @@ pub use ctrl::{ChunkCtrl, FREE, LOANED, OWNER_NONE, PUBLISHED};
 pub use desc::{ChunkDesc, PackedRef};
 pub use error::{Error, Result};
 pub use journal::{BorrowJournal, DEFAULT_CAPACITY};
-pub use platform::{DeathDetection, Platform, PosixPlatform};
+pub use platform::{
+    doorbell_pair, doorbell_park, doorbell_ring, DeathDetection, DoorbellPair, Platform,
+    PosixPlatform,
+};
 pub use pod::SharedPod;
 pub use pool::{Pool, PoolConfig, SizeClass};
 pub use segment::{Segment, SegmentHeader, LAYOUT_VERSION, SEGMENT_MAGIC};

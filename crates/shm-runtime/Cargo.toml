@@ -10,7 +10,9 @@ repository.workspace = true
 shm-core = { workspace = true }
 shm-arrow = { workspace = true }
 shm-ring = { workspace = true }
+shm-task = { workspace = true }
 shm-artifact = { workspace = true }
+shm-stream = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 libc = { workspace = true }
@@ -25,3 +27,7 @@ tempfile = { workspace = true }
 [[bin]]
 name = "shm-skeleton"
 path = "src/bin/shm-skeleton.rs"
+
+[[bin]]
+name = "shm-cacheloop"
+path = "src/bin/shm-cacheloop.rs"

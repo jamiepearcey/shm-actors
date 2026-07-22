@@ -15,7 +15,9 @@
 //!
 //! - [`Response::Registered`] carries **two** fds: the payload segment then the
 //!   actor's borrow-journal segment.
-//! - [`Response::Granted`] carries **one** fd: the topic's ring segment.
+//! - [`Response::Granted`] carries **two** fds: the topic's ring segment then
+//!   the topic's doorbell fd (v0.2 stage D — a subscriber receives the pipe
+//!   read-end, a publisher the write-end; see [`crate::coordinator`]).
 //! - All other messages carry no fds.
 
 use shm_core::ChunkDesc;
@@ -38,6 +40,10 @@ pub mod tags {
     pub const PINNED: u8 = 6;
     /// [`Request::Bye`].
     pub const BYE: u8 = 7;
+    /// [`Request::OpenArtifact`].
+    pub const OPEN_ARTIFACT: u8 = 8;
+    /// [`Request::OpenTaskQueue`].
+    pub const OPEN_TASK_QUEUE: u8 = 9;
 
     /// [`Response::Registered`].
     pub const REGISTERED: u8 = 128;
@@ -47,6 +53,10 @@ pub mod tags {
     pub const ACK: u8 = 130;
     /// [`Response::Error`].
     pub const ERROR: u8 = 131;
+    /// [`Response::ArtifactGranted`].
+    pub const ARTIFACT_GRANTED: u8 = 132;
+    /// [`Response::TaskQueueGranted`].
+    pub const TASK_QUEUE_GRANTED: u8 = 133;
 }
 
 /// A message sent by an actor to the coordinator.
@@ -85,6 +95,15 @@ pub enum Request {
     },
     /// Graceful goodbye; the coordinator drops the actor without reclamation.
     Bye,
+    /// Open (creating on first reference) the named artifact and receive its
+    /// head + data segment fds. Expects [`Response::ArtifactGranted`].
+    OpenArtifact {
+        /// Artifact name (interned to a stable `name_id` by the coordinator).
+        name: String,
+    },
+    /// Open the built-in task queue and receive its segment + doorbell fds.
+    /// Expects [`Response::TaskQueueGranted`].
+    OpenTaskQueue,
 }
 
 /// A message sent by the coordinator to an actor.
@@ -101,7 +120,9 @@ pub enum Response {
         /// The actor's journal segment's id.
         journal_seg_id: u32,
     },
-    /// A topic ring segment was granted; carries the ring-segment fd.
+    /// A topic ring segment was granted; carries **two** fds — the ring-segment
+    /// fd then the topic's doorbell fd (read-end for a subscriber, write-end for
+    /// a publisher). The body is unchanged from v0.1; only the fd count grew.
     Granted {
         /// The ring segment's id.
         ring_seg_id: u32,
@@ -115,13 +136,37 @@ pub enum Response {
         /// Why the request failed.
         message: String,
     },
+    /// An artifact was opened; carries **two** fds — the head segment then the
+    /// data segment (in that order).
+    ArtifactGranted {
+        /// The interned artifact name id (stable across every opener).
+        name_id: u32,
+        /// The artifact's head (management) segment id.
+        head_seg_id: u32,
+        /// The artifact's data (pool) segment id.
+        data_seg_id: u32,
+    },
+    /// The built-in task queue was granted; carries **five** fds in this order:
+    /// the queue segment, then the work doorbell read-end + write-end, then the
+    /// done doorbell read-end + write-end. A general actor is both a worker
+    /// (parks on the work read-end, rings the done write-end) and a
+    /// submitter/requester (rings the work write-end, parks on the done
+    /// read-end), so it receives every end.
+    TaskQueueGranted {
+        /// The task-queue segment id.
+        queue_seg_id: u32,
+        /// The task-queue region length in bytes (`shm-task` `required_bytes`).
+        region_len: u32,
+    },
 }
 
 /// How many passed fds a decoded [`Response`] requires.
 pub fn response_fd_count(resp: &Response) -> usize {
     match resp {
         Response::Registered { .. } => 2,
-        Response::Granted { .. } => 1,
+        Response::Granted { .. } => 2,
+        Response::ArtifactGranted { .. } => 2,
+        Response::TaskQueueGranted { .. } => 5,
         _ => 0,
     }
 }
@@ -245,6 +290,11 @@ impl Request {
                 put_desc(&mut buf, desc);
             }
             Request::Bye => buf.push(tags::BYE),
+            Request::OpenArtifact { name } => {
+                buf.push(tags::OPEN_ARTIFACT);
+                put_str(&mut buf, name);
+            }
+            Request::OpenTaskQueue => buf.push(tags::OPEN_TASK_QUEUE),
         }
         buf
     }
@@ -261,6 +311,8 @@ impl Request {
             tags::PUBLISHED => Request::Published { desc: r.desc()? },
             tags::PINNED => Request::Pinned { desc: r.desc()? },
             tags::BYE => Request::Bye,
+            tags::OPEN_ARTIFACT => Request::OpenArtifact { name: r.string()? },
+            tags::OPEN_TASK_QUEUE => Request::OpenTaskQueue,
             _ => return Err(Error::Protocol("unknown request tag")),
         })
     }
@@ -296,6 +348,24 @@ impl Response {
                 buf.push(tags::ERROR);
                 put_str(&mut buf, message);
             }
+            Response::ArtifactGranted {
+                name_id,
+                head_seg_id,
+                data_seg_id,
+            } => {
+                buf.push(tags::ARTIFACT_GRANTED);
+                put_u32(&mut buf, *name_id);
+                put_u32(&mut buf, *head_seg_id);
+                put_u32(&mut buf, *data_seg_id);
+            }
+            Response::TaskQueueGranted {
+                queue_seg_id,
+                region_len,
+            } => {
+                buf.push(tags::TASK_QUEUE_GRANTED);
+                put_u32(&mut buf, *queue_seg_id);
+                put_u32(&mut buf, *region_len);
+            }
         }
         buf
     }
@@ -317,6 +387,15 @@ impl Response {
             },
             tags::ACK => Response::Ack,
             tags::ERROR => Response::Error { message: r.string()? },
+            tags::ARTIFACT_GRANTED => Response::ArtifactGranted {
+                name_id: r.u32()?,
+                head_seg_id: r.u32()?,
+                data_seg_id: r.u32()?,
+            },
+            tags::TASK_QUEUE_GRANTED => Response::TaskQueueGranted {
+                queue_seg_id: r.u32()?,
+                region_len: r.u32()?,
+            },
             _ => return Err(Error::Protocol("unknown response tag")),
         })
     }
@@ -353,6 +432,8 @@ mod tests {
             Request::Published { desc: sample_desc() },
             Request::Pinned { desc: sample_desc() },
             Request::Bye,
+            Request::OpenArtifact { name: "cache".into() },
+            Request::OpenTaskQueue,
         ];
         for req in cases {
             let body = req.encode();
@@ -377,6 +458,15 @@ mod tests {
             Response::Ack,
             Response::Error {
                 message: "no such topic".into(),
+            },
+            Response::ArtifactGranted {
+                name_id: 3,
+                head_seg_id: 5000,
+                data_seg_id: 5001,
+            },
+            Response::TaskQueueGranted {
+                queue_seg_id: 600,
+                region_len: 40_000,
             },
         ];
         for resp in cases {
@@ -435,8 +525,23 @@ mod tests {
                 ring_seg_id: 1,
                 region_len: 1,
             }),
-            1
+            2
         );
         assert_eq!(response_fd_count(&Response::Ack), 0);
+        assert_eq!(
+            response_fd_count(&Response::ArtifactGranted {
+                name_id: 1,
+                head_seg_id: 2,
+                data_seg_id: 3,
+            }),
+            2
+        );
+        assert_eq!(
+            response_fd_count(&Response::TaskQueueGranted {
+                queue_seg_id: 1,
+                region_len: 2,
+            }),
+            5
+        );
     }
 }

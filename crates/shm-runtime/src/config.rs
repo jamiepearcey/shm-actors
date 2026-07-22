@@ -40,10 +40,32 @@ pub struct RuntimeConfig {
 
     /// How often the lease monitor wakes to check for expired leases.
     pub monitor_tick: Duration,
+
+    /// Slot count of the built-in [`shm_task`] task queue (power of two).
+    pub task_capacity: u32,
+
+    /// Reap retry cap for the built-in task queue (see
+    /// [`shm_task::TaskQueue::reap`]).
+    pub task_max_retries: u32,
+
+    /// Pool geometry carved into each artifact's data segment (backs data +
+    /// manifest chunks).
+    pub artifact_pool: PoolConfig,
+
+    /// Size in bytes of each artifact's data segment.
+    pub artifact_data_size: usize,
 }
 
 /// Id offset separating the journal-segment id range from payload/ring ids.
 pub const JOURNAL_ID_OFFSET: u32 = 1024;
+
+/// Id offset of the built-in task-queue segment (below the journal range, above
+/// the ring range).
+pub const TASKQ_ID_OFFSET: u32 = 512;
+
+/// Base id offset of the per-artifact segment pair (head, data). Kept well above
+/// the journal range so a busy actor/topic/artifact population never collides.
+pub const ARTIFACT_ID_OFFSET: u32 = 4096;
 
 impl Default for RuntimeConfig {
     fn default() -> RuntimeConfig {
@@ -58,6 +80,12 @@ impl Default for RuntimeConfig {
             heartbeat_interval: Duration::from_millis(150),
             lease_deadline: Duration::from_millis(500),
             monitor_tick: Duration::from_millis(40),
+            task_capacity: 256,
+            task_max_retries: shm_task::DEFAULT_MAX_RETRIES,
+            // Small classes (256 B..8 KiB) hold the cache-loop demo batch + its
+            // manifest chunk comfortably and fit the 1 MiB data segment.
+            artifact_pool: PoolConfig::power_of_two(256, 8192, 8),
+            artifact_data_size: 1 << 20,
         }
     }
 }
@@ -88,5 +116,23 @@ impl RuntimeConfig {
     #[inline]
     pub fn journal_seg_id(&self, actor_id: u32) -> u32 {
         self.seg_base + JOURNAL_ID_OFFSET + actor_id
+    }
+
+    /// The built-in task-queue segment id.
+    #[inline]
+    pub fn task_queue_seg_id(&self) -> u32 {
+        self.seg_base + TASKQ_ID_OFFSET
+    }
+
+    /// The head-segment id for the artifact at registry index `i`.
+    ///
+    /// The head segment carries no chunks, so its id is unconstrained and stays
+    /// in the `seg_base`-derived space. The **data** segment, by contrast, backs
+    /// chunks referenced by 16-bit-`segment_id` manifest [`PackedRef`](shm_core::PackedRef)s,
+    /// so its id must be `< 2^16` and is allocated separately (see the
+    /// coordinator's `alloc_artifact_data_id`).
+    #[inline]
+    pub fn artifact_head_seg_id(&self, i: u32) -> u32 {
+        self.seg_base + ARTIFACT_ID_OFFSET + 2 * i
     }
 }

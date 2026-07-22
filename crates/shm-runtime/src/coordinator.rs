@@ -16,6 +16,7 @@
 //! mechanism works whether an actor exits cleanly, hangs, or is `kill -9`ed.
 
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -25,8 +26,13 @@ use std::time::Instant;
 
 use core::sync::atomic::Ordering;
 
-use shm_core::{BorrowJournal, ChunkCtrl, ChunkDesc, Pool, Segment, FREE, LOANED, PUBLISHED};
-use shm_ring::{required_bytes, Ring};
+use shm_artifact::Artifact;
+use shm_core::{
+    doorbell_pair, BorrowJournal, ChunkCtrl, ChunkDesc, DoorbellPair, Pool, Segment, FREE, LOANED,
+    PUBLISHED,
+};
+use shm_ring::{required_bytes, DoorbellNotifier, Ring};
+use shm_task::{now_nanos, ReapReport, TaskQueue};
 
 use crate::config::RuntimeConfig;
 use crate::error::{Error, Result};
@@ -66,20 +72,46 @@ struct ActorEntry {
     liveness: Liveness,
 }
 
-/// A topic's ring segment.
+/// A topic's ring segment plus its broadcast doorbell.
 struct TopicEntry {
     #[allow(dead_code)]
     index: u32,
     segment: Arc<Segment>,
     region_len: usize,
+    /// The per-topic wakeup doorbell. The coordinator keeps **both** ends open
+    /// for the topic's lifetime, granting a duplicate of the read-end to each
+    /// subscriber and of the write-end to each publisher via `SCM_RIGHTS`.
+    /// Retaining the write-end keeps subscribers' `poll` from ever seeing
+    /// `POLLHUP` when the last publisher exits (liveness then rests on the
+    /// bounded parker timeout).
+    doorbell: DoorbellPair,
+}
+
+/// A coordinator-hosted artifact: its two segments plus its interned name id.
+///
+/// The coordinator [creates](shm_artifact::Artifact::create) the artifact's
+/// head + data segments on first `OpenArtifact`, then grants their fds; every
+/// [`Node`](crate::Node) merely [attaches](shm_artifact::Artifact::attach). The
+/// coordinator keeps both segments mapped for the artifact's lifetime so it can
+/// reap a dead producer's staged data chunks (which live in the *data* pool, not
+/// the shared payload pool) and inspect the artifact's version/pool for tests.
+struct ArtifactEntry {
+    name_id: u32,
+    #[allow(dead_code)]
+    index: u32,
+    head_seg: Arc<Segment>,
+    data_seg: Arc<Segment>,
 }
 
 /// Mutable coordinator state, guarded by one mutex.
 struct CoordState {
     next_actor_id: u32,
     next_topic_index: u32,
+    next_artifact_index: u32,
+    next_name_id: u32,
     actors: HashMap<u32, ActorEntry>,
     topics: HashMap<String, TopicEntry>,
+    artifacts: HashMap<String, ArtifactEntry>,
     last_published: Option<ChunkDesc>,
     armed: bool,
     reclaimed: Vec<ChunkDesc>,
@@ -90,6 +122,18 @@ struct CoordState {
 struct CoordShared {
     config: RuntimeConfig,
     payload_seg: Arc<Segment>,
+    /// The built-in [`shm_task`] task-queue segment.
+    task_queue_seg: Arc<Segment>,
+    /// A coordinator handle onto the task queue, wired to the work/done
+    /// doorbells so a lease-driven [`reap`](TaskQueue::reap) wakes parked
+    /// workers/requesters.
+    task_queue: TaskQueue,
+    /// The task queue's work doorbell (wakes idle workers on submit/requeue).
+    /// The coordinator keeps both ends open for the queue's lifetime and grants
+    /// duplicates to actors.
+    work_db: DoorbellPair,
+    /// The task queue's done doorbell (wakes parked requesters on completion).
+    done_db: DoorbellPair,
     state: Mutex<CoordState>,
     running: AtomicBool,
 }
@@ -121,18 +165,55 @@ impl Coordinator {
         // Lay out the pool inside the payload segment.
         Pool::create(&payload_seg, &config.pool)?;
 
+        // Built-in task queue: one segment sized to hold its header + slot array,
+        // plus its two doorbells (work = wake workers, done = wake requesters).
+        let task_queue_id = config.task_queue_seg_id();
+        let taskq_region = shm_task::required_bytes(config.task_capacity);
+        let task_queue_seg = Arc::new(create_segment(
+            task_queue_id,
+            shm_core::segment::HEADER_SIZE + taskq_region,
+        )?);
+        // SAFETY: `payload_ptr()` is 64-byte aligned and backs `payload_len()`
+        // writable bytes we exclusively own here; nothing else initializes it.
+        unsafe {
+            TaskQueue::init_with_max_retries(
+                task_queue_seg.payload_ptr(),
+                task_queue_seg.payload_len(),
+                config.task_capacity,
+                config.task_max_retries,
+            )?;
+        }
+        let work_db = doorbell_pair()?;
+        let done_db = doorbell_pair()?;
+        // The coordinator's own queue handle, wired so reap can ring the
+        // doorbells. Its notifiers borrow the write-ends the coordinator retains.
+        // SAFETY: the region was just initialized above and stays mapped for the
+        // shared struct's lifetime (it owns `task_queue_seg`).
+        let task_queue = unsafe {
+            TaskQueue::attach(task_queue_seg.payload_ptr(), task_queue_seg.payload_len())?
+        }
+        .with_work_notifier(DoorbellNotifier::new(work_db.write.as_raw_fd()))
+        .with_done_notifier(DoorbellNotifier::new(done_db.write.as_raw_fd()));
+
         let shared = Arc::new(CoordShared {
             config,
             payload_seg,
+            task_queue_seg,
+            task_queue,
+            work_db,
+            done_db,
             state: Mutex::new(CoordState {
                 next_actor_id: 1,
                 next_topic_index: 0,
+                next_artifact_index: 0,
+                next_name_id: 1,
                 actors: HashMap::new(),
                 topics: HashMap::new(),
+                artifacts: HashMap::new(),
                 last_published: None,
                 armed: false,
                 reclaimed: Vec::new(),
-                created_seg_ids: vec![payload_id],
+                created_seg_ids: vec![payload_id, task_queue_id],
             }),
             running: AtomicBool::new(true),
         });
@@ -146,6 +227,14 @@ impl Coordinator {
 
     /// Start the accept loop and the lease monitor on background threads.
     pub fn start(&mut self) -> Result<()> {
+        // Pre-create the built-in `__artifacts` topic so a watcher can subscribe
+        // (and park on its doorbell) before any producer has committed. This is
+        // just an ordinary broadcast ring the runtime routes `VersionEvent`s on.
+        {
+            let mut st = self.shared.state.lock().unwrap();
+            let _ = get_or_create_topic(&mut st, &self.shared.config, shm_artifact::ARTIFACTS_TOPIC)?;
+        }
+
         let listener = UnixListener::bind(&self.uds_path)?;
         listener.set_nonblocking(true)?;
 
@@ -242,6 +331,49 @@ impl Coordinator {
         st.reclaimed.extend(reclaimed.iter().copied());
         Ok(reclaimed)
     }
+
+    /// The current (latest installed) version of a hosted artifact, or `None` if
+    /// the artifact is not (yet) known to the coordinator. `0` means "no version
+    /// committed yet".
+    pub fn artifact_current_version(&self, name: &str) -> Option<u64> {
+        let (name_id, head, data) = {
+            let st = self.shared.state.lock().unwrap();
+            let a = st.artifacts.get(name)?;
+            (a.name_id, a.head_seg.clone(), a.data_seg.clone())
+        };
+        Artifact::attach(name_id, head, data)
+            .ok()
+            .map(|a| a.current_version())
+    }
+
+    /// Free-chunk count of a hosted artifact's data pool for `class_idx` (test /
+    /// observability helper), or `None` if the artifact is unknown.
+    pub fn artifact_free_count(&self, name: &str, class_idx: usize) -> Option<usize> {
+        let data = {
+            let st = self.shared.state.lock().unwrap();
+            st.artifacts.get(name)?.data_seg.clone()
+        };
+        Pool::attach(&data).ok().map(|p| p.free_count(class_idx))
+    }
+
+    /// Total free chunks across **all** size classes of a hosted artifact's data
+    /// pool, or `None` if the artifact is unknown. Useful when a caller does not
+    /// know which class a staged chunk landed in.
+    pub fn artifact_free_total(&self, name: &str) -> Option<usize> {
+        let data = {
+            let st = self.shared.state.lock().unwrap();
+            st.artifacts.get(name)?.data_seg.clone()
+        };
+        let pool = Pool::attach(&data).ok()?;
+        Some((0..pool.num_classes()).map(|c| pool.free_count(c)).sum())
+    }
+
+    /// Drive one task-queue [`reap`](TaskQueue::reap) sweep at `now_nanos`,
+    /// returning what it did. Exposes the exact lease-driven requeue path the
+    /// monitor runs, for deterministic same-process tests.
+    pub fn reap_tasks(&self, now_nanos: u64) -> ReapReport {
+        self.shared.task_queue.reap(now_nanos)
+    }
 }
 
 impl Drop for Coordinator {
@@ -272,9 +404,13 @@ fn accept_loop(shared: Arc<CoordShared>, listener: UnixListener) {
             Ok((stream, _addr)) => {
                 let s = shared.clone();
                 std::thread::spawn(move || {
-                    if let Err(_e) = handle_connection(s, stream) {
+                    if let Err(err) = handle_connection(s, stream) {
                         // Connection errors are non-fatal; the lease monitor
-                        // governs liveness, not the socket state.
+                        // governs liveness, not the socket state. Surface them
+                        // only under an opt-in debug env var.
+                        if std::env::var_os("SHM_DEBUG").is_some() {
+                            eprintln!("coordinator: handler error: {err}");
+                        }
                     }
                 });
             }
@@ -318,14 +454,23 @@ fn handle_connection(shared: Arc<CoordShared>, stream: UnixStream) -> Result<()>
                     }
                 }
             }
-            Request::CreateTopic { topic } | Request::Subscribe { topic } => {
-                grant_topic(&shared, &topic, &stream)?;
+            Request::CreateTopic { topic } => {
+                grant_topic(&shared, &topic, &stream, false)?;
+            }
+            Request::Subscribe { topic } => {
+                grant_topic(&shared, &topic, &stream, true)?;
             }
             Request::Published { desc } => {
                 shared.state.lock().unwrap().last_published = Some(desc);
             }
             Request::Pinned { desc } => {
                 handle_pinned(&shared, &desc);
+            }
+            Request::OpenArtifact { name } => {
+                grant_artifact(&shared, &name, &stream)?;
+            }
+            Request::OpenTaskQueue => {
+                grant_task_queue(&shared, &stream)?;
             }
             Request::Bye => {
                 if let Some(id) = actor_id {
@@ -383,51 +528,171 @@ fn register_actor(shared: &Arc<CoordShared>, name: &str, stream: &UnixStream) ->
     Ok(actor_id)
 }
 
-/// Ensure a topic's ring segment exists and pass its fd to the requester.
+/// Ensure a topic's ring segment (and doorbell) exists and pass their fds to
+/// the requester.
 ///
 /// Get-or-create is performed under a single lock hold so two actors racing to
 /// reference the same topic (a producer's `CreateTopic` and a consumer's
-/// `Subscribe`) always converge on **one** ring segment — otherwise a publisher
-/// and subscriber could end up on different rings and never meet.
-fn grant_topic(shared: &Arc<CoordShared>, topic: &str, stream: &UnixStream) -> Result<()> {
-    let config = &shared.config;
-    let region_len = required_bytes(config.ring_capacity);
-
-    let (ring_seg_id, ring_fd, region_len) = {
+/// `Subscribe`) always converge on **one** ring segment and **one** doorbell —
+/// otherwise a publisher and subscriber could end up on different rings/pipes
+/// and never meet.
+///
+/// The requester's doorbell end depends on its role: a `subscribe`r receives
+/// the pipe **read-end** (to `poll`/drain), a publisher the **write-end** (to
+/// ring). `SCM_RIGHTS` installs a *duplicate* in the receiver; the coordinator
+/// retains its own copy of both ends.
+fn grant_topic(
+    shared: &Arc<CoordShared>,
+    topic: &str,
+    stream: &UnixStream,
+    subscribe: bool,
+) -> Result<()> {
+    let (ring_seg_id, ring_fd, region_len, read_fd, write_fd) = {
         let mut st = shared.state.lock().unwrap();
-        if let Some(t) = st.topics.get(topic) {
-            (t.segment.id(), t.segment.as_raw_fd(), t.region_len)
-        } else {
-            let idx = st.next_topic_index;
-            st.next_topic_index += 1;
-            let ring_seg_id = config.ring_seg_id(idx);
-            let seg_size = shm_core::segment::HEADER_SIZE + region_len;
-            let ring_seg = Arc::new(create_segment(ring_seg_id, seg_size)?);
-            // SAFETY: `payload_ptr()` is 64-byte aligned and backs `region_len`
-            // writable bytes we exclusively own here; no other party initializes
-            // this region (we hold the state lock).
-            unsafe {
-                Ring::init(ring_seg.payload_ptr(), region_len, config.ring_capacity)?;
-            }
-            let ring_fd = ring_seg.as_raw_fd();
-            st.created_seg_ids.push(ring_seg_id);
-            st.topics.insert(
-                topic.into(),
-                TopicEntry {
-                    index: idx,
-                    segment: ring_seg,
-                    region_len,
-                },
-            );
-            (ring_seg_id, ring_fd, region_len)
-        }
+        get_or_create_topic(&mut st, &shared.config, topic)?
     };
+    // The requester's doorbell end depends on its role.
+    let doorbell_fd = if subscribe { read_fd } else { write_fd };
 
     let resp = Response::Granted {
         ring_seg_id,
         region_len: region_len as u32,
     };
-    send_frame(stream, &resp.encode(), &[ring_fd])?;
+    // fd order the actor relies on: ring segment first, then the doorbell.
+    send_frame(stream, &resp.encode(), &[ring_fd, doorbell_fd])?;
+    Ok(())
+}
+
+/// Get-or-create a topic's ring segment + doorbell under the held state lock,
+/// returning `(ring_seg_id, ring_fd, region_len, read_fd, write_fd)`.
+///
+/// Factored so both [`grant_topic`] and the coordinator's `start` (which
+/// pre-creates the built-in `__artifacts` topic) converge on **one** ring +
+/// **one** doorbell per name. The returned fds are the coordinator's retained
+/// ends; `SCM_RIGHTS` installs duplicates in receivers.
+fn get_or_create_topic(
+    st: &mut CoordState,
+    config: &RuntimeConfig,
+    topic: &str,
+) -> Result<(u32, RawFd, usize, RawFd, RawFd)> {
+    if let Some(t) = st.topics.get(topic) {
+        return Ok((
+            t.segment.id(),
+            t.segment.as_raw_fd(),
+            t.region_len,
+            t.doorbell.read.as_raw_fd(),
+            t.doorbell.write.as_raw_fd(),
+        ));
+    }
+    let region_len = required_bytes(config.ring_capacity);
+    let idx = st.next_topic_index;
+    st.next_topic_index += 1;
+    let ring_seg_id = config.ring_seg_id(idx);
+    let seg_size = shm_core::segment::HEADER_SIZE + region_len;
+    let ring_seg = Arc::new(create_segment(ring_seg_id, seg_size)?);
+    // SAFETY: `payload_ptr()` is 64-byte aligned and backs `region_len` writable
+    // bytes we exclusively own here; no other party initializes this region (we
+    // hold the state lock).
+    unsafe {
+        Ring::init(ring_seg.payload_ptr(), region_len, config.ring_capacity)?;
+    }
+    let ring_fd = ring_seg.as_raw_fd();
+    // One broadcast doorbell per topic, created alongside the ring.
+    let doorbell = doorbell_pair()?;
+    let read_fd = doorbell.read.as_raw_fd();
+    let write_fd = doorbell.write.as_raw_fd();
+    st.created_seg_ids.push(ring_seg_id);
+    st.topics.insert(
+        topic.into(),
+        TopicEntry {
+            index: idx,
+            segment: ring_seg,
+            region_len,
+            doorbell,
+        },
+    );
+    Ok((ring_seg_id, ring_fd, region_len, read_fd, write_fd))
+}
+
+/// Get-or-create the named artifact and grant its head + data segment fds.
+///
+/// On first reference the coordinator interns a stable `name_id`, creates the
+/// head + data segments, and runs [`Artifact::create`] (laying the pool + head)
+/// so that every actor merely [attaches](shm_artifact::Artifact::attach). The
+/// two fds are sent head-first, data-second — the order the actor relies on.
+fn grant_artifact(shared: &Arc<CoordShared>, name: &str, stream: &UnixStream) -> Result<()> {
+    let config = &shared.config;
+    let (name_id, head_seg_id, data_seg_id, head_fd, data_fd) = {
+        let mut st = shared.state.lock().unwrap();
+        if let Some(a) = st.artifacts.get(name) {
+            (
+                a.name_id,
+                a.head_seg.id(),
+                a.data_seg.id(),
+                a.head_seg.as_raw_fd(),
+                a.data_seg.as_raw_fd(),
+            )
+        } else {
+            let index = st.next_artifact_index;
+            st.next_artifact_index += 1;
+            let name_id = st.next_name_id;
+            st.next_name_id += 1;
+
+            let head_seg_id = config.artifact_head_seg_id(index);
+            let data_seg_id = alloc_artifact_data_id();
+            let head_size = shm_core::segment::HEADER_SIZE
+                + shm_artifact::ArtifactHead::region_bytes();
+            let head_seg = Arc::new(create_segment(head_seg_id, head_size)?);
+            let data_seg = Arc::new(create_segment(data_seg_id, config.artifact_data_size)?);
+            // Initialise the artifact (pool + head) once, coordinator-side.
+            Artifact::create(name_id, head_seg.clone(), data_seg.clone(), &config.artifact_pool)?;
+
+            let head_fd = head_seg.as_raw_fd();
+            let data_fd = data_seg.as_raw_fd();
+            st.created_seg_ids.push(head_seg_id);
+            st.created_seg_ids.push(data_seg_id);
+            st.artifacts.insert(
+                name.into(),
+                ArtifactEntry {
+                    name_id,
+                    index,
+                    head_seg,
+                    data_seg,
+                },
+            );
+            (name_id, head_seg_id, data_seg_id, head_fd, data_fd)
+        }
+    };
+
+    let resp = Response::ArtifactGranted {
+        name_id,
+        head_seg_id,
+        data_seg_id,
+    };
+    send_frame(stream, &resp.encode(), &[head_fd, data_fd])?;
+    Ok(())
+}
+
+/// Grant the built-in task queue: its segment fd plus both doorbells' read and
+/// write ends (work read, work write, done read, done write), in that order.
+///
+/// A general actor is both a worker and a submitter/requester, so it receives
+/// every end; the [`Node`](crate::Node) picks read-ends for parking and
+/// write-ends for its notifiers.
+fn grant_task_queue(shared: &Arc<CoordShared>, stream: &UnixStream) -> Result<()> {
+    let seg = &shared.task_queue_seg;
+    let resp = Response::TaskQueueGranted {
+        queue_seg_id: seg.id(),
+        region_len: seg.payload_len() as u32,
+    };
+    let fds = [
+        seg.as_raw_fd(),
+        shared.work_db.read.as_raw_fd(),
+        shared.work_db.write.as_raw_fd(),
+        shared.done_db.read.as_raw_fd(),
+        shared.done_db.write.as_raw_fd(),
+    ];
+    send_frame(stream, &resp.encode(), &fds)?;
     Ok(())
 }
 
@@ -449,7 +714,15 @@ fn handle_pinned(shared: &Arc<CoordShared>, desc: &ChunkDesc) {
 
 // ---- Lease monitor + crash reclamation ----
 
-/// Periodically expire leases and reclaim dead actors' journals.
+/// Periodically expire leases, reclaim dead actors' journals, and reap lapsed
+/// task claims.
+///
+/// Task reap is tied to the same lease clock: a worker refreshes its task's
+/// deadline on claim (see [`TaskQueue::claim_with_lease`]), so a task whose
+/// deadline has passed is one whose claiming worker's lease has lapsed. Each
+/// tick runs a [`reap`](TaskQueue::reap); a freshly-detected actor death also
+/// triggers an immediate reap so a dead worker's `CLAIMED` task is requeued
+/// promptly (at-least-once) rather than waiting a whole tick.
 fn lease_monitor(shared: Arc<CoordShared>) {
     let tick = shared.config.monitor_tick;
     let deadline = shared.config.lease_deadline;
@@ -471,84 +744,133 @@ fn lease_monitor(shared: Arc<CoordShared>) {
             }
         }
 
+        let had_death = !dead.is_empty();
+
         // Reclaim outside the lock (touches shm atomics, not the mutex).
         for (id, jseg) in dead {
             let reclaimed = reclaim_dead(&shared, id, &jseg);
             if !reclaimed.is_empty() {
-                shared
-                    .state
-                    .lock()
-                    .unwrap()
-                    .reclaimed
-                    .extend(reclaimed);
+                shared.state.lock().unwrap().reclaimed.extend(reclaimed);
             }
+        }
+
+        // Requeue lapsed task claims (a dead worker's claim lapses with its
+        // lease). Run every tick, and again right after a death for promptness.
+        shared.task_queue.reap(now_nanos());
+        if had_death {
+            shared.task_queue.reap(now_nanos());
         }
     }
 }
 
-/// Replay a dead actor's borrow journal and reclaim every chunk it held.
-fn reclaim_dead(shared: &Arc<CoordShared>, actor_id: u32, journal_seg: &Arc<Segment>) -> Vec<ChunkDesc> {
-    let pool = match Pool::attach(&shared.payload_seg) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
+/// Replay a dead actor's borrow journal and reclaim every chunk it held —
+/// across **every** pool the coordinator hosts.
+///
+/// A dead actor's journal can name chunks in more than one segment: shared-pin
+/// chunks in the payload pool (v0.1) **and** a producer's staged stream chunks
+/// in an artifact's *data* pool (v0.2 stage C). Because [`Pool::ctrl`] locates a
+/// chunk by `offset` alone (ignoring `segment_id`), each descriptor must be
+/// reclaimed against the pool of its own segment; this routes by `segment_id`.
+fn reclaim_dead(
+    shared: &Arc<CoordShared>,
+    actor_id: u32,
+    journal_seg: &Arc<Segment>,
+) -> Vec<ChunkDesc> {
     let journal = match BorrowJournal::attach(journal_seg) {
         Ok(j) => j,
         Err(_) => return Vec::new(),
     };
-    replay_and_reclaim(&pool, &journal, actor_id)
+    // Every segment whose pool could hold a chunk this actor journaled: the
+    // shared payload pool plus every hosted artifact's data pool.
+    let segs: Vec<Arc<Segment>> = {
+        let st = shared.state.lock().unwrap();
+        let mut v = vec![shared.payload_seg.clone()];
+        for a in st.artifacts.values() {
+            v.push(a.data_seg.clone());
+        }
+        v
+    };
+    let pools: Vec<(u32, Pool)> = segs
+        .iter()
+        .filter_map(|s| Pool::attach(s).ok().map(|p| (s.id(), p)))
+        .collect();
+    replay_and_reclaim_segmented(&pools, &journal, actor_id)
 }
 
-/// The reclaim core, factored out so it can be unit-tested in isolation.
-///
-/// For every descriptor a dead actor still had journaled, release the hold it
-/// represents and, if that recycles the chunk to `FREE`, return it to the pool.
-/// Returns the descriptors that were actually reclaimed (recycled + freed).
-pub(crate) fn replay_and_reclaim(
-    pool: &Pool,
+/// Reclaim a dead actor's journal against a set of `(segment_id, pool)` pools,
+/// routing each descriptor to the pool of its own segment.
+fn replay_and_reclaim_segmented(
+    pools: &[(u32, Pool)],
     journal: &BorrowJournal,
     actor_id: u32,
 ) -> Vec<ChunkDesc> {
     let mut reclaimed = Vec::new();
     for desc in journal.replay() {
-        let ctrl = match pool.ctrl(&desc) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        // A generation mismatch means this chunk was already recycled (its hold
-        // is long gone); skip to avoid a spurious refcount underflow.
-        if ctrl.validate(&desc).is_err() {
-            continue;
-        }
-        let recycled = match ctrl.state() {
-            PUBLISHED => {
-                if ctrl.refcount() > 0 {
-                    // Drop this actor's shared pin; reclaims iff it was the last
-                    // hold and the owner has already released.
-                    ctrl.release_shared()
-                } else {
-                    // No shared pins: the dead actor was the exclusive owner of a
-                    // published-but-undelivered chunk; release ownership.
-                    ctrl.owner_release()
-                }
+        if let Some((_, pool)) = pools.iter().find(|(id, _)| *id == desc.segment_id) {
+            if let Some(d) = reclaim_one(pool, &desc, actor_id) {
+                reclaimed.push(d);
             }
-            LOANED => {
-                // A never-published exclusive loan held by the dead actor.
-                if ctrl.owner_actor.load(Ordering::Acquire) == actor_id {
-                    ctrl.drop_loan().is_ok()
-                } else {
-                    false
-                }
-            }
-            FREE => false,
-            _ => false,
-        };
-        if recycled {
-            let _ = pool.free(&desc);
-            reclaimed.push(desc);
         }
     }
     reclaimed
+}
+
+/// The single-pool reclaim core, factored out so it can be unit-tested in
+/// isolation (and reused by the segmented path).
+///
+/// For every descriptor a dead actor still had journaled, release the hold it
+/// represents and, if that recycles the chunk to `FREE`, return it to the pool.
+/// Returns the descriptors that were actually reclaimed (recycled + freed).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn replay_and_reclaim(
+    pool: &Pool,
+    journal: &BorrowJournal,
+    actor_id: u32,
+) -> Vec<ChunkDesc> {
+    journal
+        .replay()
+        .filter_map(|desc| reclaim_one(pool, &desc, actor_id))
+        .collect()
+}
+
+/// Reclaim one journaled descriptor against `pool`, returning it iff the hold it
+/// represented recycled the chunk to `FREE`.
+fn reclaim_one(pool: &Pool, desc: &ChunkDesc, actor_id: u32) -> Option<ChunkDesc> {
+    let ctrl = pool.ctrl(desc).ok()?;
+    // A generation mismatch means this chunk was already recycled (its hold is
+    // long gone); skip to avoid a spurious refcount underflow.
+    if ctrl.validate(desc).is_err() {
+        return None;
+    }
+    let recycled = match ctrl.state() {
+        PUBLISHED => {
+            if ctrl.refcount() > 0 {
+                // Drop this actor's shared pin; reclaims iff it was the last hold
+                // and the owner has already released.
+                ctrl.release_shared()
+            } else {
+                // No shared pins: the dead actor was the exclusive owner of a
+                // published-but-undelivered chunk; release ownership.
+                ctrl.owner_release()
+            }
+        }
+        LOANED => {
+            // A never-published exclusive loan held by the dead actor.
+            if ctrl.owner_actor.load(Ordering::Acquire) == actor_id {
+                ctrl.drop_loan().is_ok()
+            } else {
+                false
+            }
+        }
+        FREE => false,
+        _ => false,
+    };
+    if recycled {
+        let _ = pool.free(desc);
+        Some(*desc)
+    } else {
+        None
+    }
 }
 
 // ---- helpers ----
@@ -569,6 +891,38 @@ fn journal_segment_size(capacity: usize) -> usize {
     // Each slot is a 24-byte ChunkDesc; the bitmap is capacity/8 bytes; add
     // header slack. 32 bytes/pin + 4 KiB is a safe upper bound.
     shm_core::segment::HEADER_SIZE + 4096 + capacity * 32
+}
+
+/// Allocate a process-unique **16-bit** segment id for an artifact's data
+/// segment.
+///
+/// A data segment backs chunks whose manifest [`PackedRef`](shm_core::PackedRef)
+/// packs `segment_id` into 16 bits, so the id must be `< 2^16`. A process-global
+/// counter guarantees uniqueness among artifacts created by one coordinator
+/// process (only the coordinator ever *creates* these segments; actors attach by
+/// fd); a randomized per-process base keeps the small shared shm-name space from
+/// clashing with a prior crashed run's leftovers. `create_segment`'s
+/// unlink-and-retry is the final backstop.
+fn alloc_artifact_data_id() -> u32 {
+    use std::sync::atomic::AtomicU32;
+    use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static BASE: OnceLock<u32> = OnceLock::new();
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let base = *BASE.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let pid = std::process::id() as u64;
+        // A base in [1, 50_000], leaving a comfortable per-process run of ids.
+        1 + (((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 50_000) as u32
+    });
+    let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    // Stay within the 16-bit id space; never hand out 0 (the ZERO sentinel).
+    (base.wrapping_add(n) % 65_536).max(1)
 }
 
 /// Create a segment, clearing a stale name from a prior crashed run first.
