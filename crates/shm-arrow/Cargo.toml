@@ -1,0 +1,19 @@
+[package]
+name = "shm-arrow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+shm-core = { workspace = true }
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-array = { workspace = true }
+arrow-data = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

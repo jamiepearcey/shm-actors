@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shm-core",
+    "crates/shm-arrow",
+    "crates/shm-ring",
+    "crates/shm-artifact",
+    "crates/shm-runtime",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/example/shm-actors"
+
+[workspace.dependencies]
+# Intra-workspace
+shm-core = { path = "crates/shm-core" }
+shm-arrow = { path = "crates/shm-arrow" }
+shm-ring = { path = "crates/shm-ring" }
+shm-artifact = { path = "crates/shm-artifact" }
+shm-runtime = { path = "crates/shm-runtime" }
+
+# External
+bytemuck = { version = "1", features = ["derive"] }
+libc = "0.2"
+nix = { version = "0.29", default-features = false, features = ["socket", "uio", "mman", "fs", "signal", "process", "poll"] }
+thiserror = "2"
+arrow = { version = "58", default-features = false, features = ["ipc"] }
+arrow-schema = "58"
+arrow-buffer = "58"
+arrow-array = "58"
+arrow-data = "58"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
