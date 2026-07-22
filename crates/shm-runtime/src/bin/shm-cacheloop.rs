@@ -9,7 +9,16 @@
 //! shm-cacheloop watcher       --uds <path> --result <file> [--lease-ms <n>]
 //! shm-cacheloop worker        --uds <path> --result <file> [--lease-ms <n>]
 //! shm-cacheloop worker-hang   --uds <path> --result <file> [--lease-ms <n>]  # claims, hangs
+//! shm-cacheloop worker-pin-hang --uds <path> --result <file>  # journal-pins a version, hangs
+//! shm-cacheloop writer-hang   --uds <path> --result <file>   # takes the exclusive lease, hangs
 //! ```
+//!
+//! The `--nested` flag (ADR-0003 S5 "hostile cache loop") routes the
+//! `producer`, `worker-pin-hang`, and `writer-hang` roles at the **nested
+//! Struct/List multi-chunk** artifact ([`NESTED_ARTIFACT`]) under its
+//! coordinator-negotiated schema, instead of the flat demo one — so the S5
+//! integration test can chain a real nested producer, a mid-pin crash, and a
+//! mid-write crash on one multi-chunk artifact and take a zero-leak census.
 //!
 //! The integration test runs the coordinator **in-process** (so it can inspect
 //! artifact segments + the task queue) and spawns the other roles as separate OS
@@ -30,7 +39,10 @@ use std::time::Duration;
 
 use shm_arrow::SchemaRegistry;
 use shm_core::ChunkDesc;
-use shm_runtime::demo::{demo_batch, demo_derive, demo_schema, CACHE_ARTIFACT};
+use shm_runtime::demo::{
+    demo_batch, demo_derive, demo_schema, nested_batch, nested_schema, CACHE_ARTIFACT,
+    NESTED_ARTIFACT,
+};
 use shm_runtime::{Coordinator, Node, RuntimeConfig};
 use shm_stream::{Commit, Coordination};
 use shm_task::{now_nanos, Outcome};
@@ -47,10 +59,12 @@ fn main() {
         "watcher" => run_watcher(&opts),
         "worker" => run_worker(&opts, /*hang=*/ false),
         "worker-hang" => run_worker(&opts, /*hang=*/ true),
+        "worker-pin-hang" => run_pin_hang(&opts),
+        "writer-hang" => run_writer_hang(&opts),
         other => {
             eprintln!(
-                "unknown role {other:?}; expected \
-                 coordinator|producer|producer-hang|watcher|worker|worker-hang"
+                "unknown role {other:?}; expected coordinator|producer|producer-hang|\
+                 watcher|worker|worker-hang|worker-pin-hang|writer-hang"
             );
             2
         }
@@ -64,6 +78,9 @@ struct Opts {
     result: Option<String>,
     seg_base: u32,
     lease_ms: u64,
+    /// S5: operate on the nested Struct/List multi-chunk artifact under its
+    /// coordinator-negotiated schema, rather than the flat demo one.
+    nested: bool,
 }
 
 impl Opts {
@@ -72,6 +89,7 @@ impl Opts {
         let mut result = None;
         let mut seg_base = 1u32;
         let mut lease_ms = 500u64;
+        let mut nested = false;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
@@ -91,6 +109,10 @@ impl Opts {
                     lease_ms = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(500);
                     i += 2;
                 }
+                "--nested" => {
+                    nested = true;
+                    i += 1;
+                }
                 _ => i += 1,
             }
         }
@@ -99,13 +121,48 @@ impl Opts {
             result,
             seg_base,
             lease_ms,
+            nested,
         }
     }
 }
 
-/// Seed a registry identically to every other actor (the v0.1 schema contract).
+/// The artifact name this actor operates on: the nested Struct/List multi-chunk
+/// artifact when `--nested` (S5), else the flat cache-loop artifact.
+fn art_name(opts: &Opts) -> &'static str {
+    if opts.nested {
+        NESTED_ARTIFACT
+    } else {
+        CACHE_ARTIFACT
+    }
+}
+
+/// The Arrow schema this actor negotiates + writes: nested Struct/List (S5) or
+/// the flat demo schema.
+fn art_schema(opts: &Opts) -> arrow_schema::SchemaRef {
+    if opts.nested {
+        nested_schema()
+    } else {
+        demo_schema()
+    }
+}
+
+/// The batch this actor stages: the nested multi-chunk batch (S5) or the flat
+/// demo batch.
+fn art_batch(opts: &Opts) -> arrow_array::RecordBatch {
+    if opts.nested {
+        nested_batch()
+    } else {
+        demo_batch()
+    }
+}
+
+/// An **empty** local schema cache. Since ADR-0003 item E, actors no longer seed
+/// identical registries: the coordinator issues `schema_id`s, and each actor
+/// fills its cache via `Node::intern_schema` (producers) / `Node::resolve_schema`
+/// (consumers). The cache loop proving out E therefore starts every actor with a
+/// blank registry and lets the coordinator be the single source of truth.
 fn registry() -> Arc<SchemaRegistry> {
-    Arc::new(SchemaRegistry::with_schemas(&[demo_schema()]))
+    Arc::new(SchemaRegistry::new())
 }
 
 /// Write the role's result marker file (atomically enough for the test).
@@ -155,12 +212,23 @@ fn run_producer(opts: &Opts, commit: bool) -> i32 {
         }
     };
     node.start_heartbeat(Duration::from_millis(150));
-    if let Err(e) = node.open_artifact(CACHE_ARTIFACT) {
+    let art = art_name(opts);
+    if let Err(e) = node.open_artifact(art) {
         eprintln!("producer open_artifact failed: {e}");
         return 1;
     }
+    // ADR-0003 item E: negotiate the schema id with the coordinator BEFORE
+    // writing, so the id stamped into the batch chunk + version manifest is the
+    // coordinator's globally-agreed id (this process was seeded with an EMPTY
+    // registry). The subsequent `write_batch` interns the same schema into this
+    // node's cache and transparently picks up that id. With `--nested` this is a
+    // Struct/List schema whose batch spans several chunks (S5, item F).
+    if let Err(e) = node.intern_schema(&art_schema(opts)) {
+        eprintln!("producer intern_schema failed: {e}");
+        return 1;
+    }
 
-    let stream = match node.stream(CACHE_ARTIFACT) {
+    let stream = match node.stream(art) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("producer stream failed: {e}");
@@ -175,7 +243,7 @@ fn run_producer(opts: &Opts, commit: bool) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = writer.append_batch(&demo_batch()) {
+    if let Err(e) = writer.append_batch(&art_batch(opts)) {
         eprintln!("producer append failed: {e}");
         return 1;
     }
@@ -353,11 +421,107 @@ fn run_worker(opts: &Opts, hang: bool) -> i32 {
 }
 
 /// Pin the artifact's current version and derive `(sum(id), rows)` zero-copy.
+/// Takes a **journalled** pin (item J) so a crash mid-compute is crash-reclaimed.
 fn compute(node: &Node) -> shm_runtime::Result<(i64, i64)> {
-    let art = node.artifact(CACHE_ARTIFACT)?;
-    let pin = art.pin()?;
+    let pin = node.pin_artifact(CACHE_ARTIFACT)?;
+    // ADR-0003 item E: learn the schema from the coordinator using the id read
+    // from the pinned version's manifest — this process was seeded with an EMPTY
+    // registry, so agreement rests entirely on the coordinator, not on identical
+    // seeding. `resolve_schema` caches it so `as_arrow`'s read path resolves it.
+    node.resolve_schema(pin.manifest().schema_id)?;
     let batch = pin.as_arrow(node.registry())?;
     demo_derive(&batch).map_err(|m| shm_runtime::Error::Protocol(leak(m)))
+}
+
+/// `worker-pin-hang` (item J): open the artifact, take a **journalled** pin on
+/// the current version, then hang forever holding it. A `kill -9` from the test
+/// leaves the pin's `ArtifactPin` journal entry (and its +1 version pin count)
+/// leaked, exactly as a crashed reader would; the coordinator's lease-monitor
+/// replay then decrements the pin table and retires the version.
+fn run_pin_hang(opts: &Opts) -> i32 {
+    let mut node = match Node::connect(&opts.uds, "worker-pin-hang", registry()) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("worker-pin-hang connect failed: {e}");
+            return 1;
+        }
+    };
+    node.start_heartbeat(Duration::from_millis(150));
+    let art = art_name(opts);
+    if let Err(e) = node.open_artifact(art) {
+        eprintln!("worker-pin-hang open_artifact failed: {e}");
+        return 1;
+    }
+
+    // Wait until a version exists, then journal-pin it and hold it forever.
+    loop {
+        match node.pin_artifact(art) {
+            Ok(pin) => {
+                write_result(opts, &format!("PINNED {}\n", pin.version()));
+                println!("worker-pin-hang pinned version {}", pin.version());
+                // Hold the pin (never dropped) until kill -9.
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// `writer-hang` (item K): open the artifact, take the **exclusive** write lease
+/// (opened journalled, so it lands in this actor's borrow journal), stage one
+/// batch under it, then hang forever holding the lease. A `kill -9` from the test
+/// leaves the lease held (and its `WriteLease` journal entry leaked), exactly as a
+/// crashed exclusive writer would; the coordinator's lease-monitor replay then
+/// force-releases + fences the lease so a second writer can take over.
+fn run_writer_hang(opts: &Opts) -> i32 {
+    let mut node = match Node::connect(&opts.uds, "writer-hang", registry()) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("writer-hang connect failed: {e}");
+            return 1;
+        }
+    };
+    node.start_heartbeat(Duration::from_millis(150));
+    let art = art_name(opts);
+    if let Err(e) = node.open_artifact(art) {
+        eprintln!("writer-hang open_artifact failed: {e}");
+        return 1;
+    }
+    // Negotiate the schema id before staging (empty local registry; item E).
+    // With `--nested` this stages a Struct/List multi-chunk batch (S5, item F).
+    if let Err(e) = node.intern_schema(&art_schema(opts)) {
+        eprintln!("writer-hang intern_schema failed: {e}");
+        return 1;
+    }
+
+    let stream = match node.stream(art) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("writer-hang stream failed: {e}");
+            return 1;
+        }
+    };
+    let mut writer = match stream.writer(Commit::Replace, Coordination::Exclusive) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("writer-hang writer (exclusive open) failed: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = writer.append_batch(&art_batch(opts)) {
+        eprintln!("writer-hang append failed: {e}");
+        return 1;
+    }
+
+    // Lease acquired + one chunk staged; hold both forever (never commit/drop)
+    // until `kill -9`.
+    write_result(opts, "LEASED");
+    println!("writer-hang holds the exclusive lease (no commit)");
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Leak a derive-error string into a `'static str` for the `Protocol` variant

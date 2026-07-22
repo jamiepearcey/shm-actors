@@ -8,8 +8,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::{Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 
 /// The demo topic name.
 pub const DEMO_TOPIC: &str = "demo";
@@ -60,6 +61,78 @@ pub fn demo_batch() -> RecordBatch {
         vec![Arc::new(ids), Arc::new(names)],
     )
     .expect("demo batch is well formed")
+}
+
+/// The nested cache-loop artifact name (item-F walking-skeleton half).
+pub const NESTED_ARTIFACT: &str = "cache-nested";
+
+/// Row count of [`nested_batch`] — chosen so its serialized buffers exceed one
+/// artifact chunk (the runtime's max artifact chunk is 8 KiB), forcing a
+/// **multi-chunk** version, while every individual buffer stays under one chunk.
+pub const NESTED_ROWS: usize = 800;
+
+/// The nested demo schema (item F): `s: Struct<{id: Int64, tag: Utf8}>` plus
+/// `vals: List<Int64>`.
+///
+/// Exercises the recursive nested layout (`Struct` + `List` with child buffers)
+/// through the coordinator-negotiated schema path (item E) and the multi-chunk
+/// writer/reader (item F).
+pub fn nested_schema() -> SchemaRef {
+    let struct_fields = Fields::from(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tag", DataType::Utf8, false),
+    ]);
+    let item = Arc::new(Field::new("item", DataType::Int64, false));
+    Arc::new(Schema::new(vec![
+        Field::new("s", DataType::Struct(struct_fields), false),
+        Field::new("vals", DataType::List(item), false),
+    ]))
+}
+
+/// Build the nested, **multi-chunk** demo batch the item-F skeleton commits.
+///
+/// Row `i` holds `s = {id: i, tag: "t{i}"}` and `vals = [i]` (one element per
+/// row). At [`NESTED_ROWS`] rows the serialized buffers span several artifact
+/// chunks, while every individual buffer stays under one chunk.
+pub fn nested_batch() -> RecordBatch {
+    let n = NESTED_ROWS;
+    let ids = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+    let tags = StringArray::from((0..n).map(|i| format!("t{i}")).collect::<Vec<_>>());
+    let struct_fields = match nested_schema().field(0).data_type() {
+        DataType::Struct(f) => f.clone(),
+        _ => unreachable!("field 0 is a struct"),
+    };
+    let s = StructArray::new(
+        struct_fields,
+        vec![Arc::new(ids), Arc::new(tags)],
+        None,
+    );
+
+    // One Int64 element per row: values [0, 1, 2, ...], offsets 0,1,2,...,n.
+    let values = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(
+        (0..=n as i32).collect::<Vec<_>>(),
+    ));
+    let item = Arc::new(Field::new("item", DataType::Int64, false));
+    let list = ListArray::new(item, offsets, Arc::new(values), None);
+
+    RecordBatch::try_new(nested_schema(), vec![Arc::new(s), Arc::new(list)])
+        .expect("nested demo batch is well formed")
+}
+
+/// Verify a reconstructed [`nested_batch`] matches exactly (used by the consumer
+/// to prove the multi-chunk nested zero-copy read produced the right bytes).
+pub fn verify_nested_batch(batch: &RecordBatch) -> std::result::Result<(), String> {
+    if batch.num_rows() != NESTED_ROWS {
+        return Err(format!("row count {} != {NESTED_ROWS}", batch.num_rows()));
+    }
+    if batch.schema() != nested_schema() {
+        return Err("schema mismatch vs nested_schema()".to_string());
+    }
+    if *batch != nested_batch() {
+        return Err("nested batch content mismatch".to_string());
+    }
+    Ok(())
 }
 
 /// Verify a reconstructed batch matches [`demo_batch`] exactly (used by the

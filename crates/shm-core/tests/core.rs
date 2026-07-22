@@ -4,9 +4,23 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use shm_core::ctrl::ChunkCtrl;
 use shm_core::{
-    BorrowJournal, ChunkDesc, Error, PackedRef, Platform, Pool, PoolConfig, PosixPlatform, Segment,
-    SharedPod, FREE, LAYOUT_VERSION, LOANED, PUBLISHED, SEGMENT_MAGIC,
+    BorrowJournal, ChunkDesc, Error, JournalRecord, PackedRef, Platform, Pool, PoolConfig,
+    PosixPlatform, Segment, SharedPod, FREE, LAYOUT_VERSION, LOANED, PUBLISHED, SEGMENT_MAGIC,
 };
+
+/// The chunk offsets of the `ChunkPin` records a replay yields (ignores any
+/// `ArtifactPin` records), sorted.
+fn chunk_offsets(jrn: &BorrowJournal) -> Vec<u32> {
+    let mut offs: Vec<u32> = jrn
+        .replay()
+        .filter_map(|r| match r {
+            JournalRecord::ChunkPin(d) => Some(d.offset),
+            JournalRecord::ArtifactPin { .. } | JournalRecord::WriteLease { .. } => None,
+        })
+        .collect();
+    offs.sort_unstable();
+    offs
+}
 
 // ---------------------------------------------------------------------------
 // segment-id allocation so parallel tests don't collide on global shm names
@@ -50,15 +64,17 @@ fn chunkdesc_abi_is_frozen() {
 
 #[test]
 fn packed_ref_roundtrips_within_widths() {
-    let r = PackedRef::pack(0xABCD, 0x1234, 0xDEAD_BEEF);
-    assert_eq!(r.unpack(), (0xABCD, 0x1234, 0xDEAD_BEEF));
-    assert_eq!(r.segment_id(), 0xABCD);
-    assert_eq!(r.generation(), 0x1234);
+    // v0.3 (ADR-0003a): PackedRef packs [segment_id:32 | offset:32]; the
+    // generation field is dropped. Both halves are lossless over the full u32.
+    let r = PackedRef::pack(0xABCD_1234, 0xDEAD_BEEF);
+    assert_eq!(r.unpack(), (0xABCD_1234, 0xDEAD_BEEF));
+    assert_eq!(r.segment_id(), 0xABCD_1234);
     assert_eq!(r.offset(), 0xDEAD_BEEF);
 
-    // Generation is stored mod 2^16; the low 16 bits survive.
-    let r2 = PackedRef::pack(1, 0x1_0005, 64);
-    assert_eq!(r2.generation(), 0x0005);
+    // A segment id above the former 2^16 cap now round-trips exactly.
+    let r2 = PackedRef::pack(0x0010_0005, 64);
+    assert_eq!(r2.segment_id(), 0x0010_0005);
+    assert_eq!(r2.offset(), 64);
 
     let desc = ChunkDesc {
         segment_id: 3,
@@ -69,7 +85,8 @@ fn packed_ref_roundtrips_within_widths() {
         _pad: 0,
     };
     let p = PackedRef::from_desc(&desc);
-    assert_eq!(p.unpack(), (3, 7, 128));
+    // `from_desc` carries only `{segment_id, offset}`; `generation` is dropped.
+    assert_eq!(p.unpack(), (3, 128));
 }
 
 // ---------------------------------------------------------------------------
@@ -335,9 +352,7 @@ fn journal_record_release_replay_and_full() {
     assert!(matches!(jrn.record(mk_desc(256)), Err(Error::JournalFull)));
 
     // Replay yields exactly the three pinned descriptors.
-    let mut offs: Vec<u32> = jrn.replay().map(|d| d.offset).collect();
-    offs.sort_unstable();
-    assert_eq!(offs, vec![64, 128, 192]);
+    assert_eq!(chunk_offsets(&jrn), vec![64, 128, 192]);
 
     // Release the middle slot, record a new pin (reuses a free slot).
     jrn.release(s1).unwrap();
@@ -346,16 +361,93 @@ fn journal_record_release_replay_and_full() {
     let s3 = jrn.record(mk_desc(999)).unwrap();
     assert_eq!(jrn.len(), 3);
 
-    let mut offs2: Vec<u32> = jrn.replay().map(|d| d.offset).collect();
-    offs2.sort_unstable();
-    assert_eq!(offs2, vec![64, 192, 999]);
+    assert_eq!(chunk_offsets(&jrn), vec![64, 192, 999]);
     let _ = s3;
 
     // Attach a second handle and replay identically (POD in shared memory).
     let jrn2 = BorrowJournal::attach(&seg).unwrap();
-    let mut offs3: Vec<u32> = jrn2.replay().map(|d| d.offset).collect();
-    offs3.sort_unstable();
-    assert_eq!(offs3, vec![64, 192, 999]);
+    assert_eq!(chunk_offsets(&jrn2), vec![64, 192, 999]);
+
+    seg.unlink().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Borrow journal: tagged entries (item J) — chunk-pin AND artifact-pin kinds
+// ---------------------------------------------------------------------------
+
+#[test]
+fn journal_tagged_entries_roundtrip_all_kinds() {
+    let seg = fresh(64 * 1024);
+    let jrn = BorrowJournal::create(&seg, 8).unwrap();
+
+    // Mix all three entry kinds in the same journal (ChunkPin / ArtifactPin /
+    // WriteLease — item K adds the third).
+    let c0 = jrn.record(mk_desc(64)).unwrap();
+    let a0 = jrn
+        .record_artifact_pin(/*artifact_id*/ 7, /*version*/ 0x1_0000_0002)
+        .unwrap();
+    let c1 = jrn.record(mk_desc(128)).unwrap();
+    let a1 = jrn.record_artifact_pin(42, 5).unwrap();
+    let w0 = jrn
+        .record_write_lease(/*artifact_id*/ 9, /*fence*/ 3)
+        .unwrap();
+    assert_eq!(jrn.len(), 5);
+    assert!(
+        jrn.is_occupied(c0)
+            && jrn.is_occupied(a0)
+            && jrn.is_occupied(c1)
+            && jrn.is_occupied(a1)
+            && jrn.is_occupied(w0)
+    );
+
+    // Replay decodes each slot back into its typed record — including a large
+    // (> 2^32) version, proving the u64 payload survives the u32-word packing.
+    let mut chunks: Vec<u32> = Vec::new();
+    let mut arts: Vec<(u32, u64)> = Vec::new();
+    let mut leases: Vec<(u32, u32)> = Vec::new();
+    for rec in jrn.replay() {
+        match rec {
+            JournalRecord::ChunkPin(d) => chunks.push(d.offset),
+            JournalRecord::ArtifactPin {
+                artifact_id,
+                version,
+            } => arts.push((artifact_id, version)),
+            JournalRecord::WriteLease { artifact_id, fence } => leases.push((artifact_id, fence)),
+        }
+    }
+    chunks.sort_unstable();
+    arts.sort_unstable();
+    assert_eq!(chunks, vec![64, 128]);
+    assert_eq!(arts, vec![(7, 0x1_0000_0002u64), (42, 5)]);
+    assert_eq!(leases, vec![(9, 3)], "the write-lease entry round-trips");
+
+    // Releasing the write-lease slot frees it (proving record/release/replay
+    // works for the new kind alongside the others): 5 → 4 entries, and no
+    // WriteLease survives the replay.
+    jrn.release(w0).unwrap();
+    assert_eq!(jrn.len(), 4);
+    assert!(!jrn.replay().any(|r| matches!(r, JournalRecord::WriteLease { .. })));
+
+    // A ChunkPin round-trips its whole descriptor, not just the offset.
+    let full = jrn
+        .replay()
+        .find_map(|r| match r {
+            JournalRecord::ChunkPin(d) if d.offset == 64 => Some(d),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(full, mk_desc(64));
+
+    // Releasing an artifact-pin slot frees it for reuse by either kind, and the
+    // JournalFull backpressure still applies once every slot is taken.
+    jrn.release(a0).unwrap();
+    assert_eq!(jrn.len(), 3);
+    while jrn.record_artifact_pin(1, 1).is_ok() {}
+    assert!(matches!(jrn.record(mk_desc(1)), Err(Error::JournalFull)));
+
+    // A second attached handle sees the identical tagged contents (POD in shm).
+    let jrn2 = BorrowJournal::attach(&seg).unwrap();
+    assert_eq!(jrn2.len(), 8);
 
     seg.unlink().unwrap();
 }

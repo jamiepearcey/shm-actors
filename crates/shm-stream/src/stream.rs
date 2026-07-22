@@ -1,7 +1,7 @@
 //! The [`StreamWriter`] transaction handle and its coordination modes.
 
 use arrow_array::RecordBatch;
-use shm_arrow::{write_batch, PoolAllocator, SchemaRegistry};
+use shm_arrow::{write_batch_chunks, PoolAllocator, SchemaRegistry};
 use shm_artifact::{Artifact, Commit, Committer};
 use shm_core::{BorrowJournal, ChunkDesc, Pool, Segment};
 
@@ -13,10 +13,14 @@ use crate::error::{Error, Result};
 /// [`Artifact::open_exclusive`] vs [`Artifact::commit_optimistic`]).
 #[derive(Clone, Copy, Debug)]
 pub enum Coordination {
-    /// Take the artifact's exclusive write lease at [`StreamWriter::open`]. A
-    /// second exclusive `open` on the same artifact fails fast with
-    /// [`shm_artifact::Error::WriteLocked`]; the lease is held for the whole
-    /// transaction and released on commit/abort/drop.
+    /// Take the artifact's **fenced** exclusive write lease at
+    /// [`StreamWriter::open`]. A second exclusive `open` on the same artifact
+    /// fails fast with [`shm_artifact::Error::WriteLocked`]; the lease is held for
+    /// the whole transaction and released on commit/abort/drop. The lease is
+    /// opened *journalled* (ADR-0003 item K), so a `kill -9`ed exclusive writer is
+    /// force-released and fenced by the coordinator rather than wedging the
+    /// artifact; a paused writer that was declared dead sees
+    /// [`shm_artifact::Error::Fenced`] if it later tries to commit.
     Exclusive,
     /// Take no lease; race on the install CAS at [`commit`](StreamWriter::commit),
     /// expecting the artifact's current version to still be `expect_version`. A
@@ -84,7 +88,9 @@ enum Coord<'a> {
 /// monitor replays this journal and frees the staged chunks (the exact same path
 /// exercised by [`crate` tests]); the stream layer adds **no** extra crash
 /// machinery. Because staging never touches `current`, no partial version is
-/// ever observable.
+/// ever observable. In [`Coordination::Exclusive`] mode the same journal replay
+/// also **force-releases and fences** the dead writer's write lease (item K), so
+/// a crashed exclusive writer never leaves the artifact permanently un-writable.
 pub struct StreamWriter<'a> {
     artifact: &'a Artifact,
     /// The data segment the artifact's chunk pool lives in — the caller must
@@ -98,7 +104,13 @@ pub struct StreamWriter<'a> {
     coord: Coord<'a>,
     owner: u32,
     commit_kind: Commit,
+    /// Every staged chunk of every staged batch, **flat** and in order. A
+    /// multi-chunk batch (item F) contributes several consecutive entries here;
+    /// each is journaled so a crash frees *all* of a batch's chunks.
     staged: Vec<Staged>,
+    /// Batch boundaries over `staged`: `batch_spans[b]` consecutive `staged`
+    /// chunks form the `b`-th appended batch. `sum(batch_spans) == staged.len()`.
+    batch_spans: Vec<u32>,
     /// The interned schema id shared by every staged batch (set by the first
     /// [`append_batch`](StreamWriter::append_batch)).
     schema_id: Option<u32>,
@@ -141,7 +153,13 @@ impl<'a> StreamWriter<'a> {
         }
         let pool = Pool::attach(data_seg)?;
         let coord = match coordination {
-            Coordination::Exclusive => Coord::Exclusive(artifact.open_exclusive(owner)?),
+            // Open the exclusive lease **journalled** (item K): the lease's
+            // WriteLease entry lands in this writer's borrow journal, so a
+            // `kill -9` mid-transaction is force-released (and fenced) by the
+            // coordinator's lease monitor — not left permanently wedged.
+            Coordination::Exclusive => {
+                Coord::Exclusive(artifact.open_exclusive_journaled(owner, journal)?)
+            }
             Coordination::Optimistic { expect_version } => Coord::Optimistic {
                 expect: expect_version,
             },
@@ -156,12 +174,15 @@ impl<'a> StreamWriter<'a> {
             owner,
             commit_kind,
             staged: Vec::new(),
+            batch_spans: Vec::new(),
             schema_id: None,
             finished: false,
         })
     }
 
-    /// Number of batches staged (accumulated but not yet committed).
+    /// Number of staged **chunks** (accumulated but not yet committed). A
+    /// multi-chunk batch (item F) contributes several; for single-chunk batches
+    /// this equals the number of appended batches.
     #[inline]
     pub fn staged_len(&self) -> usize {
         self.staged.len()
@@ -185,43 +206,70 @@ impl<'a> StreamWriter<'a> {
     /// concatenated on read); a mismatch returns [`Error::SchemaMismatch`] and
     /// leaves the previously staged batches untouched.
     pub fn append_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        // 1. Serialize the batch into a fresh chunk (state stays FREE).
-        let desc = {
+        // 1. Serialize the batch into one or more fresh chunks (item F: a large
+        //    or nested batch may span several chunks). Each chunk is `FREE`.
+        let descs = {
             let alloc = PoolAllocator::new(&self.pool, self.data_seg);
-            write_batch(&alloc, self.registry, batch)?
+            write_batch_chunks(&alloc, self.registry, batch)?
         };
+        let batch_schema_id = descs[0].schema_id;
 
-        // Reject a schema mismatch before taking the loan, so a rejected append
+        // Reject a schema mismatch before taking any loan, so a rejected append
         // costs nothing and leaves the pool exactly as it was.
         if let Some(expected) = self.schema_id {
-            if expected != desc.schema_id {
-                let _ = self.pool.free(&desc);
+            if expected != batch_schema_id {
+                for d in &descs {
+                    let _ = self.pool.free(d);
+                }
                 return Err(Error::SchemaMismatch {
                     expected,
-                    appended: desc.schema_id,
+                    appended: batch_schema_id,
                 });
             }
         }
 
-        // 2. Loan the chunk to this writer (FREE -> LOANED).
-        if let Err(e) = self.pool.ctrl(&desc)?.try_loan(self.owner) {
-            let _ = self.pool.free(&desc);
-            return Err(e.into());
+        // 2. Loan + journal EVERY chunk of this batch. On any mid-batch failure,
+        //    unwind this batch's chunks (drop loans + release journal slots) and
+        //    return every remaining (un-staged) chunk to the pool, so a rejected
+        //    append leaks nothing and leaves prior batches untouched.
+        let mut batch_staged: Vec<Staged> = Vec::with_capacity(descs.len());
+        for (i, desc) in descs.iter().enumerate() {
+            let staged = self
+                .pool
+                .ctrl(desc)
+                .map_err(Error::from)
+                .and_then(|c| c.try_loan(self.owner).map_err(Error::from))
+                .and_then(|()| self.journal.record(*desc).map_err(Error::from));
+            match staged {
+                Ok(slot) => batch_staged.push(Staged { desc: *desc, slot }),
+                Err(e) => {
+                    // Undo the chunks already loaned+journaled in THIS batch:
+                    // drop the loan, release the journal slot, and return the
+                    // chunk to the pool.
+                    for s in &batch_staged {
+                        if let Ok(c) = self.pool.ctrl(&s.desc) {
+                            let _ = c.drop_loan();
+                        }
+                        let _ = self.journal.release(s.slot);
+                        let _ = self.pool.free(&s.desc);
+                    }
+                    // Return every remaining (un-staged) chunk of this batch,
+                    // including the one whose loan/journal just failed (dropping
+                    // its loan first if it is still LOANED).
+                    for d in &descs[i..] {
+                        if let Ok(c) = self.pool.ctrl(d) {
+                            let _ = c.drop_loan();
+                        }
+                        let _ = self.pool.free(d);
+                    }
+                    return Err(e);
+                }
+            }
         }
 
-        // 3. Record it for crash reclamation. On journal exhaustion, undo the
-        //    loan and return the chunk to the pool.
-        let slot = match self.journal.record(desc) {
-            Ok(slot) => slot,
-            Err(e) => {
-                let _ = self.pool.ctrl(&desc).map(|c| c.drop_loan());
-                let _ = self.pool.free(&desc);
-                return Err(e.into());
-            }
-        };
-
-        self.schema_id.get_or_insert(desc.schema_id);
-        self.staged.push(Staged { desc, slot });
+        self.schema_id.get_or_insert(batch_schema_id);
+        self.staged.extend(batch_staged);
+        self.batch_spans.push(descs.len() as u32);
         Ok(())
     }
 
@@ -246,14 +294,15 @@ impl<'a> StreamWriter<'a> {
         // but well-formed, so fall back to the untyped id.
         let schema_id = self.schema_id.unwrap_or(shm_arrow::RAW_SCHEMA_ID);
         let descs: Vec<ChunkDesc> = self.staged.iter().map(|s| s.desc).collect();
+        let spans = self.batch_spans.clone();
         let kind = self.commit_kind.clone();
         let owner = self.owner;
         let artifact = self.artifact;
 
         let result = match &mut self.coord {
-            Coord::Exclusive(committer) => committer.commit_staged(kind, &descs, schema_id),
+            Coord::Exclusive(committer) => committer.commit_staged(kind, &descs, &spans, schema_id),
             Coord::Optimistic { expect } => {
-                artifact.commit_staged_optimistic(owner, *expect, kind, &descs, schema_id)
+                artifact.commit_staged_optimistic(owner, *expect, kind, &descs, &spans, schema_id)
             }
         };
 

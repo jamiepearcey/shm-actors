@@ -17,8 +17,9 @@ pub enum Error {
     #[error("bad batch header magic (not an shm-arrow batch chunk)")]
     BadMagic,
 
-    /// The schema id was not present in the reader's [`crate::SchemaRegistry`].
-    #[error("unknown schema id {0} (registry not seeded identically?)")]
+    /// The schema id was not present in the reader's [`crate::SchemaRegistry`]
+    /// cache (resolve it from the coordinator first — ADR-0003 item E).
+    #[error("unknown schema id {0} (not resolved into the local registry cache?)")]
     UnknownSchema(u32),
 
     /// The [`shm_core::ChunkDesc::schema_id`] and the on-chunk
@@ -40,9 +41,17 @@ pub enum Error {
         have: usize,
     },
 
-    /// A v0.1 limitation was hit (sliced input, multi-chunk batch, ...).
-    #[error("unsupported in v0.1: {0}")]
+    /// An unsupported input was hit (e.g. a Dictionary/Union/Map type, or a
+    /// single Arrow buffer larger than the pool's max chunk size).
+    #[error("unsupported: {0}")]
     Unsupported(&'static str),
+
+    /// The on-chunk batch layout was internally inconsistent (a table cursor ran
+    /// off the end, a buffer entry pointed outside its chunk, the flattened
+    /// node/buffer counts disagreed with the schema, etc.). Signals corruption or
+    /// a version/format mismatch rather than a plain stale descriptor.
+    #[error("inconsistent batch layout: {0}")]
+    Layout(&'static str),
 }
 
 /// Convenience alias for `Result<T, shm_arrow::Error>`.

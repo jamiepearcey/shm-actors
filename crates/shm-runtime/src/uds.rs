@@ -28,9 +28,16 @@ use crate::error::{Error, Result};
 
 /// The maximum control-frame body the runtime will send or receive.
 ///
-/// Registration/grant messages are a few dozen bytes; this cap keeps the
-/// one-`recvmsg`-per-frame invariant honest and bounds the receive buffer.
-pub const MAX_FRAME: usize = 4096;
+/// Most messages are a few dozen bytes, but the item-E schema-coordinator frames
+/// ([`InternSchema`](crate::protocol::Request::InternSchema) /
+/// [`SchemaResolved`](crate::protocol::Response::SchemaResolved)) carry a
+/// schema's serialized Arrow-IPC bytes inline, and a **nested** schema (item F:
+/// deep `Struct`/`List` trees with metadata) can exceed the old 4 KiB cap. Raised
+/// to 64 KiB — comfortably above any realistic single-schema IPC message — while
+/// still bounding the per-frame receive buffer and keeping the
+/// one-`recvmsg`-per-frame invariant honest. A schema larger than this is
+/// rejected rather than silently truncated.
+pub const MAX_FRAME: usize = 64 * 1024;
 
 /// Send one framed control message plus optional passed fds over `sock`.
 ///

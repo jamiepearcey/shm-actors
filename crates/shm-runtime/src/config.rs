@@ -128,9 +128,10 @@ impl RuntimeConfig {
     ///
     /// The head segment carries no chunks, so its id is unconstrained and stays
     /// in the `seg_base`-derived space. The **data** segment, by contrast, backs
-    /// chunks referenced by 16-bit-`segment_id` manifest [`PackedRef`](shm_core::PackedRef)s,
-    /// so its id must be `< 2^16` and is allocated separately (see the
-    /// coordinator's `alloc_artifact_data_id`).
+    /// chunks referenced by manifest [`PackedRef`](shm_core::PackedRef)s. Since
+    /// v0.3 (ADR-0003a) a `PackedRef` carries a full 32-bit `segment_id`, so the
+    /// former 2^16 cap is lifted; the id is still allocated separately (see the
+    /// coordinator's `alloc_artifact_data_id`) for shm-name-space hygiene.
     #[inline]
     pub fn artifact_head_seg_id(&self, i: u32) -> u32 {
         self.seg_base + ARTIFACT_ID_OFFSET + 2 * i

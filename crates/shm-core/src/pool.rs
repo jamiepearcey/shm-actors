@@ -271,6 +271,20 @@ impl<'s> Pool<'s> {
         self.total_chunks
     }
 
+    /// The largest chunk size (bytes) any class in this pool can satisfy — the
+    /// ceiling a single [`alloc`](Self::alloc) request can be rounded up to.
+    ///
+    /// `shm-arrow`'s multi-chunk writer uses this as the per-chunk packing
+    /// capacity: an individual Arrow buffer must fit within one chunk, so it must
+    /// not exceed this bound.
+    #[inline]
+    pub fn max_chunk_size(&self) -> u32 {
+        (0..self.num_classes)
+            .map(|i| self.class(i).chunk_size)
+            .max()
+            .unwrap_or(0)
+    }
+
     fn class(&self, i: usize) -> &ClassHeader {
         debug_assert!(i < self.num_classes);
         // SAFETY: `i < num_classes`; the class array has `num_classes` entries.

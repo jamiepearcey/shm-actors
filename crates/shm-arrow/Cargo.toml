@@ -13,6 +13,7 @@ arrow-schema = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-array = { workspace = true }
 arrow-data = { workspace = true }
+arrow-select = "58"
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -16,6 +16,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use shm_arrow::{read_batch, write_batch, PinGuard, PoolAllocator, SchemaRegistry};
 use shm_artifact::{Artifact, VersionEvent, ARTIFACTS_TOPIC};
 use shm_core::{BorrowJournal, ChunkDesc, Pool, Segment};
@@ -89,9 +90,12 @@ impl Node {
     /// Connect to the coordinator at `uds_path`, register as `name`, and adopt
     /// the payload + journal segments the coordinator passes back.
     ///
-    /// `registry` must be seeded identically to every other actor's (the v0.1
-    /// in-process schema contract) so interned `schema_id`s agree across the
-    /// socket.
+    /// `registry` is this node's **local schema cache**. Since ADR-0003 item E it
+    /// no longer needs to be seeded identically to other actors': pass an empty
+    /// [`SchemaRegistry::new`] and let [`intern_schema`](Self::intern_schema) /
+    /// [`resolve_schema`](Self::resolve_schema) fill it from the coordinator, the
+    /// authoritative catalog. A pre-seeded ([`with_schemas`](SchemaRegistry::with_schemas))
+    /// registry still works for single-process use.
     pub fn connect(
         uds_path: impl AsRef<Path>,
         name: &str,
@@ -152,10 +156,60 @@ impl Node {
         })
     }
 
-    /// The schema registry this node was seeded with.
+    /// This node's local schema-registry **cache** (filled by
+    /// [`intern_schema`](Self::intern_schema) / [`resolve_schema`](Self::resolve_schema)).
     #[inline]
     pub fn registry(&self) -> &Arc<SchemaRegistry> {
         &self.registry
+    }
+
+    /// Intern `schema` at the coordinator (ADR-0003 item E), returning its stable
+    /// coordinator-issued `schema_id` and caching the `(id, schema)` mapping
+    /// locally both ways.
+    ///
+    /// Probes the local cache by content hash first (no syscall on a hit);
+    /// otherwise serializes the schema ([`shm_arrow::serialize_schema`]), asks the
+    /// coordinator to intern it over UDS, and records the result. A **producer**
+    /// calls this before writing so the id it stamps into batch chunks and version
+    /// manifests is the coordinator's globally-agreed id — not a process-local one.
+    /// Because the subsequent [`write_batch`] interns the same schema into this
+    /// same cache, it transparently picks up the coordinator id.
+    pub fn intern_schema(&self, schema: &SchemaRef) -> Result<u32> {
+        if let Some(id) = self.registry.id_for(schema) {
+            return Ok(id);
+        }
+        let schema_bytes = shm_arrow::serialize_schema(schema);
+        let (resp, _fds) = self.request(&Request::InternSchema { schema_bytes })?;
+        let schema_id = match resp {
+            Response::SchemaInterned { schema_id } => schema_id,
+            Response::Error { message } => return Err(Error::Rejected(message)),
+            _ => return Err(Error::Protocol("expected SchemaInterned")),
+        };
+        self.registry.insert(schema_id, schema.clone());
+        Ok(schema_id)
+    }
+
+    /// Resolve a coordinator-issued `schema_id` to its [`SchemaRef`] (ADR-0003
+    /// item E), caching the mapping locally.
+    ///
+    /// Local cache first; otherwise asks the coordinator over UDS, deserializes
+    /// the returned bytes ([`shm_arrow::deserialize_schema`]), and records the
+    /// mapping. A **consumer** calls this with the id it read from a version
+    /// manifest (or batch header) before reconstructing the batch — proving two
+    /// processes agree on the schema without ever seeding identical registries.
+    pub fn resolve_schema(&self, schema_id: u32) -> Result<SchemaRef> {
+        if let Some(schema) = self.registry.resolve(schema_id) {
+            return Ok(schema);
+        }
+        let (resp, _fds) = self.request(&Request::ResolveSchema { schema_id })?;
+        let schema_bytes = match resp {
+            Response::SchemaResolved { schema_bytes } => schema_bytes,
+            Response::Error { message } => return Err(Error::Rejected(message)),
+            _ => return Err(Error::Protocol("expected SchemaResolved")),
+        };
+        let schema = shm_arrow::deserialize_schema(&schema_bytes)?;
+        self.registry.insert(schema_id, schema.clone());
+        Ok(schema)
     }
 
     /// The actor id assigned by the coordinator.
@@ -440,6 +494,21 @@ impl Node {
             .get(name)
             .map(|a| &a.artifact)
             .ok_or(Error::NotFound("artifact not opened"))
+    }
+
+    /// Pin a previously [opened](Node::open_artifact) artifact's current version
+    /// **through this actor's borrow journal** (ADR-0003 item J), so a `kill -9`
+    /// mid-pin is crash-reclaimed by the coordinator's lease-monitor replay
+    /// (which decrements the artifact's per-version pin count).
+    ///
+    /// Prefer this over `node.artifact(name)?.pin()` for any pin held across an
+    /// await/blocking point in a cross-process actor: the plain
+    /// [`pin`](shm_artifact::Artifact::pin) leaks its version forever if the
+    /// holder dies. The returned [`VersionPin`](shm_artifact::VersionPin)
+    /// releases its journal entry on a clean drop.
+    pub fn pin_artifact(&self, name: &str) -> Result<shm_artifact::VersionPin> {
+        let art = self.artifact(name)?;
+        Ok(art.pin_journaled(&self.journal_seg)?)
     }
 
     /// Open a write transaction against a previously [opened](Node::open_artifact)

@@ -1,4 +1,47 @@
 //! The [`Artifact`] handle and its RCU/MVCC read/write/reclaim machinery.
+//!
+//! # Pin hazard handshake — the interleavings the `SeqCst` ordering forbids
+//!
+//! (ADR-0003a mandate 1.) S0 repacked [`PackedRef`](shm_core::PackedRef) to
+//! `[seg:32|off:32]`, dropping the generation field, and made a
+//! [`VersionManifest`](crate::VersionManifest) self-validate its
+//! `{artifact_id, version}`. That alone does **not** close the *ghost-read
+//! window*: if a reader's pin published *after* a reclaimer's pin scan, the
+//! reclaimer could free + recycle the manifest chunk while it still held intact
+//! old bytes, and a bare `manifest.version == pinned` check would validate
+//! against ghost data whose `ChunkDesc`s reference freed chunks.
+//!
+//! The fix is a hazard-pointer handshake on each live-version [`PinSlot`]:
+//!
+//! - **Reader** ([`pin`](Artifact::pin)): (1) `Acquire`-load `current` → `v`;
+//!   (2) `SeqCst` `fetch_add` on the slot's pin count — this **publishes** the
+//!   pin; (3) re-validate the slot is still `{version == v, state == SLOT_LIVE}`
+//!   with `SeqCst` loads — if it flipped to `SLOT_FREEING` or the version moved,
+//!   undo the bump and retry; (4) only *then* `Acquire`-load `manifest_desc`,
+//!   confirm it names the slot we pinned, and `read_manifest_checked`.
+//! - **Reclaimer** ([`try_retire_version`]): (1) CAS-elect itself
+//!   `SLOT_LIVE → SLOT_FREEING` and store `FREEING` with `SeqCst` **before**
+//!   scanning; (2) `SeqCst`-load the pin count; `== 0` ⇒ free the version's
+//!   exclusively-owned chunks + manifest and store `SLOT_FREE`; `> 0` ⇒ revert
+//!   to `SLOT_LIVE` and leave the drop of the live pin (or a re-loop) to retire.
+//!
+//! **Why the ghost read is now impossible.** Let an *accepting* reader perform
+//! `A1 = pins.fetch_add (SeqCst)` then `A2 = state.load (SeqCst) == LIVE`, and
+//! let the *freeing* reclaimer perform `B1 = state.store FREEING (SeqCst)` then
+//! `B2 = pins.load (SeqCst) == 0`. In the single `SeqCst` total order **S**:
+//! the freeing reclaimer never reverts (it reverts only on `pins > 0`, i.e. it
+//! did *not* free), so if `B1 <_S A2` then `A2` observes `FREEING` and the
+//! reader rejects — contradiction. Hence `A2 <_S B1`. With `A1 <_S A2`
+//! (program order) and `B1 <_S B2` (program order), transitivity gives
+//! `A1 <_S B2`, so `B2` observes the incremented pin count (`≥ 1 ≠ 0`) and the
+//! reclaimer does **not** free. ∎ No accepting reader ever dereferences a chunk
+//! a reclaimer freed.
+//!
+//! Because `version` is monotonic and never reissued, a slot re-validated as
+//! `{version == v, LIVE}` is unambiguously `v`'s slot; and confirming
+//! `slot.manifest == head.manifest_desc` rejects a not-yet-endorsed slot (the
+//! transient duplicate two committers create when both claim a slot for the same
+//! `n+1` before the install CAS elects one).
 
 use std::panic::RefUnwindSafe;
 use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
@@ -6,13 +49,16 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_select::concat::concat_batches;
-use shm_arrow::{read_batch, write_batch, PoolAllocator, SchemaRegistry, SegmentBase};
-use shm_core::{ChunkDesc, PackedRef, Pool, PoolConfig, Segment, PUBLISHED};
+use shm_arrow::{
+    read_batch_chunks, write_batch_chunks, ChunkAllocator, PoolAllocator, SchemaRegistry,
+    SegmentBase,
+};
+use shm_core::{BorrowJournal, ChunkCtrl, ChunkDesc, PackedRef, Pool, PoolConfig, Segment, PUBLISHED};
 
 use crate::error::{Error, Result};
 use crate::event::{CommitKind, VersionEvent};
-use crate::head::{ArtifactHead, NO_VERSION, NO_WRITER, SLOT_LIVE, SLOT_RETIRED};
-use crate::manifest::{read_manifest, write_manifest, Manifest};
+use crate::head::{ArtifactHead, NO_VERSION, OWNER_NONE, SLOT_FREE, SLOT_FREEING, SLOT_LIVE};
+use crate::manifest::{read_manifest, read_manifest_checked, write_manifest, Manifest};
 
 /// How a commit relates the new version to its predecessor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,25 +198,62 @@ impl Artifact {
 
     // ---- Write path: exclusive + optimistic commit ----
 
-    /// Acquire the exclusive write lease, returning a [`Committer`]. A second
-    /// caller fails fast with [`Error::WriteLocked`] until the returned committer
-    /// is dropped. `owner` must be a non-zero actor id.
+    /// Acquire the **fenced** exclusive write lease, returning a [`Committer`]
+    /// bound to the fence token it acquired under. A second caller fails fast with
+    /// [`Error::WriteLocked`] while a live owner holds it (unchanged healthy
+    /// behaviour); `owner` must be a non-zero actor id.
     ///
-    /// v0.1 models the lease as an atomic owner field in the [`ArtifactHead`]; a
-    /// real coordinator-backed lease (with crash reclamation) arrives in
-    /// `shm-runtime`.
+    /// This is the **single-process / unjournaled** open: a lease leaked by a
+    /// `kill -9`ed writer is not reclaimed. Cross-process actors should open
+    /// through [`open_exclusive_journaled`](Artifact::open_exclusive_journaled) so
+    /// a dead writer's lease is force-released (with a fence bump) by the
+    /// coordinator (ADR-0003 item K), mirroring [`pin`](Artifact::pin) vs
+    /// [`pin_journaled`](Artifact::pin_journaled).
     pub fn open_exclusive(&self, owner: u32) -> Result<Committer<'_>> {
-        debug_assert_ne!(owner, NO_WRITER, "writer owner id must be non-zero");
-        let head = self.head();
-        match head
-            .writer_owner
-            .compare_exchange(NO_WRITER, owner, SeqCst, Acquire)
-        {
-            Ok(_) => Ok(Committer {
+        debug_assert_ne!(owner, OWNER_NONE, "writer owner id must be non-zero");
+        match self.head().acquire_write_lease(owner) {
+            Some(token) => Ok(Committer {
                 artifact: self,
                 owner,
+                token,
+                lease: None,
             }),
-            Err(_) => Err(Error::WriteLocked),
+            None => Err(Error::WriteLocked),
+        }
+    }
+
+    /// Acquire the fenced exclusive write lease **and journal it** so a crash
+    /// while holding it is reclaimed (item K): the open records a
+    /// [`WriteLease`](shm_core::JournalRecord::WriteLease) entry into `journal`
+    /// (carrying this artifact's id and the acquired fence), and a clean release
+    /// (commit / abort / drop) removes it. If this actor dies while the lease is
+    /// held, the coordinator's lease-monitor replay force-releases the lease with
+    /// a fence bump via [`release_leaked_write_lease`](Artifact::release_leaked_write_lease),
+    /// unwedging the artifact and fencing the dead writer out.
+    ///
+    /// The lease is acquired first, then journalled; on journal exhaustion the
+    /// lease is released again so the artifact is left exactly as it was found.
+    pub fn open_exclusive_journaled<'j>(
+        &'j self,
+        owner: u32,
+        journal: &'j BorrowJournal<'j>,
+    ) -> Result<Committer<'j>> {
+        debug_assert_ne!(owner, OWNER_NONE, "writer owner id must be non-zero");
+        let head = self.head();
+        let token = head.acquire_write_lease(owner).ok_or(Error::WriteLocked)?;
+        match journal.record_write_lease(self.name_id, token) {
+            Ok(slot) => Ok(Committer {
+                artifact: self,
+                owner,
+                token,
+                lease: Some(LeaseJournal { journal, slot }),
+            }),
+            Err(e) => {
+                // Undo the acquire (bumps the fence — harmless) so a failed open
+                // never leaves the lease stuck.
+                head.release_write_lease(owner, token);
+                Err(e.into())
+            }
         }
     }
 
@@ -186,7 +269,8 @@ impl Artifact {
         batch: &RecordBatch,
         registry: &SchemaRegistry,
     ) -> Result<u64> {
-        self.commit_inner(expect, owner, commit, batch, registry)
+        // Optimistic commits hold no lease, so there is no fence to validate.
+        self.commit_inner(expect, owner, commit, batch, registry, None)
     }
 
     /// **ADDITIVE (v0.2 stage C — for `shm-stream`).** Optimistically install a
@@ -204,16 +288,20 @@ impl Artifact {
     /// returning every staged chunk to the pool.
     ///
     /// `schema_id` is the interned id shared by all staged chunks; `owner` must
-    /// be non-zero.
+    /// be non-zero. `batch_spans` partitions `staged` into Arrow batches (item F):
+    /// `batch_spans[b]` consecutive `staged` chunks form batch `b`, and their sum
+    /// must equal `staged.len()`.
     pub fn commit_staged_optimistic(
         &self,
         owner: u32,
         expect: u64,
         commit: Commit,
         staged: &[ChunkDesc],
+        batch_spans: &[u32],
         schema_id: u32,
     ) -> Result<u64> {
-        self.commit_staged_inner(expect, owner, commit, staged, schema_id)
+        // Optimistic commits hold no lease, so there is no fence to validate.
+        self.commit_staged_inner(expect, owner, commit, staged, batch_spans, schema_id, None)
     }
 
     /// The shared install path for both exclusive and optimistic single-batch
@@ -230,8 +318,9 @@ impl Artifact {
         commit: Commit,
         batch: &RecordBatch,
         registry: &SchemaRegistry,
+        lease_fence: Option<u32>,
     ) -> Result<u64> {
-        debug_assert_ne!(owner, NO_WRITER, "commit owner id must be non-zero");
+        debug_assert_ne!(owner, OWNER_NONE, "commit owner id must be non-zero");
         if let Commit::Patch(_) = commit {
             return Err(Error::Unsupported("Patch commit deferred to v0.2"));
         }
@@ -240,12 +329,15 @@ impl Artifact {
         let alloc = PoolAllocator::new(&pool, &self.data_seg);
         let schema_id = registry.intern(&batch.schema());
 
-        // Write the one data chunk and loan it (FREE -> LOANED): exactly the
-        // pre-staged shape `commit_staged_inner` installs. Any staging failure
-        // below returns the chunk to the pool via that path's rollback.
-        let desc = write_batch(&alloc, registry, batch)?;
-        pool.ctrl(&desc)?.try_loan(owner)?;
-        self.commit_staged_inner(expect, owner, commit, &[desc], schema_id)
+        // Write the batch's data chunk(s) and loan each (FREE -> LOANED): exactly
+        // the pre-staged shape `commit_staged_inner` installs. A large/nested
+        // batch may span multiple chunks (item F); they form ONE batch, so its
+        // span is the whole chunk list. Any staging failure below (including a
+        // fenced lease) returns every chunk to the pool via that path's rollback.
+        let staged = write_batch_chunks(&alloc, registry, batch)?;
+        loan_all(&pool, &alloc, &staged, owner)?;
+        let spans = [staged.len() as u32];
+        self.commit_staged_inner(expect, owner, commit, &staged, &spans, schema_id, lease_fence)
     }
 
     /// **The one true RCU install path**, shared by single-batch commits and by
@@ -266,25 +358,63 @@ impl Artifact {
     /// - **Failure:** every `staged` chunk is returned to the pool (`FREE`) —
     ///   whether it had been published (released via refcount) or was still
     ///   `LOANED` (dropped) — so the caller must **not** free them again. The
-    ///   caller need only release its own borrow-journal slots. (The `Patch`
-    ///   rejection is the sole early return that does *not* consume `staged`;
-    ///   callers pre-validate the commit kind, so a real staged commit never hits
-    ///   it — `shm-stream` rejects `Patch` at `open`.)
+    ///   caller need only release its own borrow-journal slots. A fenced lease
+    ///   ([`Error::Fenced`], item K) is one such failure: the `LOANED` staged
+    ///   chunks are freed before returning, so a zombie writer's late commit
+    ///   installs nothing and leaks nothing. (The `Patch` rejection is the sole
+    ///   early return that does *not* consume `staged`; callers pre-validate the
+    ///   commit kind, so a real staged commit never hits it — `shm-stream` rejects
+    ///   `Patch` at `open`.)
+    ///
+    /// `lease_fence` is `Some(token)` for a leased ([`Committer`]) commit and
+    /// `None` for an optimistic one; when `Some`, the head lease must still read
+    /// `{owner, token}` or the commit is fenced.
+    // The parameters are the irreducible install-path inputs (expectation, owner,
+    // commit kind, the staged chunks + their batch spans, schema id, fence); each
+    // is a distinct scalar/slice, so bundling them into a struct would only add
+    // indirection without clarifying the one true RCU path.
+    #[allow(clippy::too_many_arguments)]
     fn commit_staged_inner(
         &self,
         expect: u64,
         owner: u32,
         commit: Commit,
         staged: &[ChunkDesc],
+        staged_spans: &[u32],
         schema_id: u32,
+        lease_fence: Option<u32>,
     ) -> Result<u64> {
-        debug_assert_ne!(owner, NO_WRITER, "commit owner id must be non-zero");
+        debug_assert_ne!(owner, OWNER_NONE, "commit owner id must be non-zero");
+        debug_assert_eq!(
+            staged_spans.iter().map(|&s| s as usize).sum::<usize>(),
+            staged.len(),
+            "staged batch spans must partition the staged chunk list"
+        );
         if let Commit::Patch(_) = commit {
             return Err(Error::Unsupported("Patch commit deferred to v0.2"));
         }
 
         let head = self.head();
         let pool = Pool::attach(&self.data_seg)?;
+
+        // 0. Fenced-lease guard (item K). If this committer's lease was fenced
+        //    (its fence advanced — the coordinator declared it dead and released
+        //    the lease, letting a second writer take over), reject **before**
+        //    publishing anything and return every `LOANED` staged chunk to the
+        //    pool. Checking here linearises against the release CAS: once the
+        //    fence has advanced, no `{owner, token}` load ever matches again, so a
+        //    zombie can never install. A second writer that took over but has not
+        //    yet committed leaves the fence check passing, and the install CAS on
+        //    `current` (step 5) is the backstop — a superseding commit moves
+        //    `current`, so the zombie's CAS fails with `Conflict`.
+        if let Some(token) = lease_fence {
+            if !head.lease_held_by(owner, token) {
+                for d in staged {
+                    free_loaned(&pool, d);
+                }
+                return Err(Error::Fenced);
+            }
+        }
 
         // 1. Publish each pre-staged data chunk (LOANED -> PUBLISHED, +1 version
         //    ref, owner released). On a mid-loop failure, undo so *every* staged
@@ -306,15 +436,20 @@ impl Artifact {
             }
         }
 
-        // 2. Assemble the new version's manifest chunk list, referencing any
-        //    retained (Append) chunks into the new version up front.
+        // 2. Assemble the new version's manifest chunk list + batch boundaries,
+        //    referencing any retained (Append) chunks into the new version up
+        //    front. Retained chunks keep the prior version's batch spans; the
+        //    newly staged chunks contribute `staged_spans`.
         let mut chunks: Vec<ChunkDesc> = Vec::new();
+        let mut batch_spans: Vec<u32> = Vec::new();
         let mut retained: Vec<ChunkDesc> = Vec::new();
         let is_append = matches!(commit, Commit::Append) && expect != NO_VERSION;
         if is_append {
             let mref = PackedRef(head.manifest_desc.load(Acquire));
-            match read_manifest(&self.data_seg, mref) {
-                Ok(prior) if prior.version == expect => {
+            // Validate the prior manifest self-identifies as this artifact's
+            // `expect` version (ADR-0003a) before adopting its chunks.
+            match read_manifest_checked(&self.data_seg, mref, self.name_id, expect) {
+                Ok(prior) => {
                     for c in &prior.chunks {
                         // +1 ref for the new version on each shared chunk.
                         match pool.ctrl(c).and_then(|ctrl| ctrl.borrow_shared()) {
@@ -328,6 +463,7 @@ impl Artifact {
                             }
                         }
                     }
+                    batch_spans.extend_from_slice(&prior.batch_spans);
                 }
                 _ => {
                     // Prior version moved or is unreadable: treat as a conflict.
@@ -340,6 +476,7 @@ impl Artifact {
             }
         }
         chunks.extend_from_slice(&published);
+        batch_spans.extend_from_slice(staged_spans);
 
         let target = expect + 1;
 
@@ -347,7 +484,7 @@ impl Artifact {
         let alloc = PoolAllocator::new(&pool, &self.data_seg);
         let manifest_desc = match stage_chunk(
             &pool,
-            |a| write_manifest(a, target, schema_id, &chunks),
+            |a| write_manifest(a, self.name_id, target, schema_id, &chunks, &batch_spans),
             &alloc,
             owner,
         ) {
@@ -437,16 +574,42 @@ impl Artifact {
     /// while the returned [`VersionPin`] (or any Arrow batch built from it) is
     /// alive.
     ///
-    /// The fast path is a single `SeqCst` load of `current` plus one `SeqCst`
-    /// `fetch_add` on the version's pin counter — no lock, no data-chunk CAS.
-    /// A commit racing the pin is detected by re-reading `current`; the pin then
-    /// retries against the new current version. Returns [`Error::VersionGone`] if
-    /// nothing has been committed yet.
+    /// The fast path is a single `Acquire` load of `current` plus one `SeqCst`
+    /// `fetch_add` on the version's pin counter — no lock, no data-chunk CAS —
+    /// followed by the ADR-0003a hazard-handshake re-validation (see this
+    /// module's doc). A commit racing the pin is detected and retried. Returns
+    /// [`Error::VersionGone`] if nothing has been committed yet.
+    ///
+    /// This is the **single-process / unjournaled** pin: a leaked pin (its
+    /// holder never dropping it) pins the version forever. Cross-process actors
+    /// should instead take a [`pin_journaled`](Artifact::pin_journaled) pin so a
+    /// `kill -9` mid-pin is crash-reclaimed (ADR-0003 item J).
     pub fn pin(&self) -> Result<VersionPin> {
+        self.pin_inner(None)
+    }
+
+    /// Pin the current version **and journal the pin** so a crash mid-pin is
+    /// reclaimed: the pin records an [`ArtifactPin`](shm_core::JournalRecord)
+    /// entry into `journal_seg`'s [`BorrowJournal`] and releases it on drop
+    /// (item J), mirroring how `shm-stream` journals staged chunks.
+    ///
+    /// `journal_seg` is the actor's borrow-journal segment (an owned
+    /// [`Arc<Segment>`] so the pin's [`Drop`] can re-attach the journal to
+    /// release its slot without borrowing). If this actor dies while the pin is
+    /// live, the coordinator's lease-monitor replay decrements this artifact's
+    /// per-version pin count via the *same* retire path as a clean drop.
+    pub fn pin_journaled(&self, journal_seg: &Arc<Segment>) -> Result<VersionPin> {
+        self.pin_inner(Some(journal_seg.clone()))
+    }
+
+    /// The shared pin path: run the hazard handshake, and (if `journal_seg` is
+    /// `Some`) journal the resulting version pin for crash reclamation.
+    fn pin_inner(&self, journal_seg: Option<Arc<Segment>>) -> Result<VersionPin> {
         let head = self.head();
         let mut spins: u32 = 0;
         loop {
-            let v = head.current.load(SeqCst);
+            // (1) Acquire-load the current version.
+            let v = head.current.load(Acquire);
             if v == NO_VERSION {
                 return Err(Error::VersionGone);
             }
@@ -460,28 +623,63 @@ impl Artifact {
             };
             let slot = &head.pins[idx];
 
-            // Bump first, then validate — the SeqCst bump ordered against the
-            // committer's SeqCst `current` store is the Dekker guarantee that a
-            // live pin is never missed by reclamation. This only ever *adds*
-            // then (on failure) *subtracts* the same slot, so pin counts are
-            // never under-counted — a chunk is never freed under a live reader.
+            // (2) Publish the pin: SeqCst fetch_add. This only ever *adds* then
+            // (on failure) *subtracts* the same slot, so pin counts are never
+            // under-counted — a chunk is never freed under a live reader.
             slot.pins.fetch_add(1, SeqCst);
-            if head.current.load(SeqCst) != v || slot.version.load(Acquire) != v {
+
+            // (3) Re-validate the slot is still {version == v, state == LIVE}
+            // with SeqCst loads — the reader half of the hazard handshake. If it
+            // flipped to SLOT_FREEING (a reclaimer won the election) or the
+            // version moved, back off and retry. The `state` load is SeqCst and
+            // ordered after the SeqCst bump: this is the Dekker pairing against
+            // the reclaimer's `FREEING`-store-then-pins-scan.
+            if slot.state.load(SeqCst) != SLOT_LIVE || slot.version.load(SeqCst) != v {
                 undo_pin(head, &self.data_seg, idx);
                 backoff(&mut spins);
                 continue;
             }
 
-            // Read the manifest and confirm it is `v`'s (guards the install race
-            // where `current == v` but `manifest_desc` is not yet stored).
-            let mref = PackedRef(head.manifest_desc.load(Acquire));
-            let manifest = match read_manifest(&self.data_seg, mref) {
-                Ok(m) if m.version == v => m,
+            // (4) Only now Acquire-load `manifest_desc`. Confirm it names the
+            // slot we pinned (rejects the transient duplicate slot two optimistic
+            // committers create for the same version, and the install window
+            // where `current == v` but `manifest_desc` is not yet stored), then
+            // `read_manifest_checked` confirms it self-identifies as this
+            // artifact's version `v` (ADR-0003a manifest self-validation).
+            let head_md = head.manifest_desc.load(Acquire);
+            if slot.manifest.load(Acquire) != head_md {
+                undo_pin(head, &self.data_seg, idx);
+                backoff(&mut spins);
+                continue;
+            }
+            let mref = PackedRef(head_md);
+            let manifest = match read_manifest_checked(&self.data_seg, mref, self.name_id, v) {
+                Ok(m) => m,
                 _ => {
                     undo_pin(head, &self.data_seg, idx);
                     backoff(&mut spins);
                     continue;
                 }
+            };
+
+            // The pin is accepted. If journalled, record the ArtifactPin now (so
+            // a crash after this point is reclaimable); on journal exhaustion,
+            // undo the pin and surface the backpressure.
+            let journal = match &journal_seg {
+                Some(seg) => {
+                    let j = BorrowJournal::attach(seg)?;
+                    match j.record_artifact_pin(self.name_id, v) {
+                        Ok(slot_idx) => Some(JournalPin {
+                            seg: seg.clone(),
+                            slot: slot_idx,
+                        }),
+                        Err(e) => {
+                            undo_pin(head, &self.data_seg, idx);
+                            return Err(e.into());
+                        }
+                    }
+                }
+                None => None,
             };
 
             return Ok(VersionPin {
@@ -491,9 +689,62 @@ impl Artifact {
                     version: v,
                     slot_idx: idx,
                     manifest,
+                    journal,
                 }),
             });
         }
+    }
+
+    /// The live pin count on `version`'s slot, or `None` if no live slot tracks
+    /// it (never committed, or already reclaimed). Observability / test helper —
+    /// e.g. a coordinator proving a leaked pin was decremented after a crash.
+    pub fn version_pin_count(&self, version: u64) -> Option<u32> {
+        let head = self.head();
+        let idx = head.find_slot(version)?;
+        Some(head.pins[idx].pins.load(SeqCst))
+    }
+
+    /// **ADR-0003 item J — crash reclamation.** Decrement `version`'s pin count
+    /// for a pin a dead actor leaked (its `VersionPin` never dropped), running
+    /// the *exact* retire path a clean drop would: if this releases the last pin
+    /// and the version is no longer current, its chunks are reclaimed.
+    ///
+    /// The coordinator calls this once per replayed
+    /// [`ArtifactPin`](shm_core::JournalRecord::ArtifactPin) journal entry, so a
+    /// leaked cross-process pin retires exactly as if the reader had dropped it.
+    /// Returns `true` iff a live slot for `version` was found and decremented.
+    pub fn release_leaked_pin(&self, version: u64) -> Result<bool> {
+        let head = self.head();
+        let idx = match head.find_slot(version) {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+        let slot = &head.pins[idx];
+        let prev = slot.pins.fetch_sub(1, SeqCst);
+        if prev == 1 && head.current.load(SeqCst) != version {
+            try_retire_version(head, &self.data_seg, version)?;
+        }
+        Ok(true)
+    }
+
+    /// **ADR-0003 item K — crash reclamation.** Force-release the exclusive write
+    /// lease a dead writer leaked (its [`Committer`] never dropped), bumping the
+    /// fence so the dead writer is fenced out: a second writer can immediately
+    /// acquire, and the dead writer's late commit fails with [`Error::Fenced`].
+    ///
+    /// The coordinator calls this once per replayed
+    /// [`WriteLease`](shm_core::JournalRecord::WriteLease) journal entry. Returns
+    /// `true` iff a lease was actually held (and is now released + fenced);
+    /// `false` if it had already been released cleanly.
+    pub fn release_leaked_write_lease(&self) -> bool {
+        self.head().force_release_write_lease()
+    }
+
+    /// The current exclusive-lease owner actor id, or [`OWNER_NONE`](crate::head::OWNER_NONE)
+    /// (`0`) if the lease is free. Observability / test helper — e.g. proving a
+    /// dead writer's lease was force-released.
+    pub fn write_lease_owner(&self) -> u32 {
+        self.head().write_lease_owner()
     }
 }
 
@@ -548,6 +799,35 @@ fn publish_staged(pool: &Pool<'_>, desc: &ChunkDesc) -> Result<()> {
     Ok(())
 }
 
+/// Loan every chunk of a freshly written batch (`FREE -> LOANED`, owned by
+/// `owner`) — the pre-staged shape `commit_staged_inner` expects. On a mid-loop
+/// failure, undo: drop the loans already taken and return **every** chunk
+/// (loaned or not) to the pool, so a failed inline commit leaks nothing.
+fn loan_all(
+    pool: &Pool<'_>,
+    alloc: &PoolAllocator<'_>,
+    chunks: &[ChunkDesc],
+    owner: u32,
+) -> Result<()> {
+    for (i, desc) in chunks.iter().enumerate() {
+        match pool.ctrl(desc).and_then(|c| c.try_loan(owner)) {
+            Ok(()) => {}
+            Err(e) => {
+                for d in &chunks[..i] {
+                    if let Ok(c) = pool.ctrl(d) {
+                        let _ = c.drop_loan();
+                    }
+                }
+                for d in chunks {
+                    alloc.free(d);
+                }
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Free a staged chunk still in the `LOANED` state (a commit failed before it
 /// was published): recycle its control word to `FREE` and return it to the pool.
 fn free_loaned(pool: &Pool<'_>, desc: &ChunkDesc) {
@@ -585,9 +865,26 @@ fn undo_pin(head: &ArtifactHead, data_seg: &Segment, idx: usize) {
     }
 }
 
-/// Reclaim `version` iff it is non-current and unpinned: elect a single reclaimer
-/// via a `SLOT_LIVE → SLOT_RETIRED` CAS, then release every reference the version
-/// held (its data chunks and its manifest chunk) and free the slot.
+/// Reclaim `version` iff it is non-current and unpinned, using the ADR-0003a
+/// hazard handshake: mark the slot `SLOT_FREEING` **before** scanning pins.
+///
+/// # The reclaimer half of the handshake
+///
+/// The reclaimer CAS-elects itself `SLOT_LIVE → SLOT_FREEING` and *then*
+/// `SeqCst`-loads the pin count. This `FREEING`-store-before-scan, paired with a
+/// reader's publish-then-revalidate ([`Artifact::pin`]), guarantees that either
+/// the reclaimer observes `pins > 0` (and does not free) or the reader observes
+/// `SLOT_FREEING` (and retries) — never a ghost read of a freed manifest chunk
+/// (see the module doc for the `SeqCst` total-order proof).
+///
+/// - `pins == 0` under `SLOT_FREEING`: no reader can hold or complete a pin on
+///   `version`, so we free it and store `SLOT_FREE`.
+/// - `pins > 0`: a reader is (or a racing reader may be mid-protocol). We
+///   **revert** `SLOT_FREEING → SLOT_LIVE` and either hand the retire to that
+///   reader's drop (a genuine live pin remains) or re-loop (a racing reader has
+///   since backed off, dropping pins to `0`, and its retire attempt found us
+///   mid-`FREEING`, so we retry the free ourselves). Only the elected reclaimer
+///   ever leaves `SLOT_FREEING`, so these stores need no CAS.
 ///
 /// # The exact reclamation rule
 ///
@@ -596,58 +893,77 @@ fn undo_pin(head: &ArtifactHead, data_seg: &Segment, idx: usize) {
 /// versions referencing it (one `borrow_shared` per referencing version); a
 /// shared (Append) chunk therefore survives until the **last** referencing
 /// version is reclaimed. A version's manifest chunk is unique to it and is freed
-/// with it. Because a non-current version's pin count can only *decrease* (new
-/// pins always target `current`), the `pins == 0` check is stable once observed.
+/// with it. Because `current` is monotonic and never revisits `version`, once
+/// `current != version` it stays so — the reclaimability precondition is stable.
 fn try_retire_version(head: &ArtifactHead, data_seg: &Segment, version: u64) -> Result<()> {
-    let idx = match head.find_slot(version) {
-        Some(i) => i,
-        None => return Ok(()), // already reclaimed
-    };
-    let slot = &head.pins[idx];
+    let mut spins: u32 = 0;
+    loop {
+        let idx = match head.find_slot(version) {
+            Some(i) => i,
+            None => return Ok(()), // already reclaimed, or another reclaimer owns FREEING
+        };
+        let slot = &head.pins[idx];
 
-    if head.current.load(SeqCst) == version {
-        return Ok(()); // still current: not reclaimable
-    }
-    if slot.pins.load(SeqCst) != 0 {
-        return Ok(()); // still pinned
-    }
-    // Elect the single reclaimer.
-    if slot
-        .state
-        .compare_exchange(SLOT_LIVE, SLOT_RETIRED, SeqCst, Acquire)
-        .is_err()
-    {
-        return Ok(()); // someone else is reclaiming
-    }
-
-    let pool = Pool::attach(data_seg)?;
-
-    // Release this version's reference on each data chunk (shared chunks survive
-    // if another version still references them).
-    let mref = PackedRef(slot.manifest.load(Acquire));
-    if let Ok(manifest) = read_manifest(data_seg, mref) {
-        for c in &manifest.chunks {
-            release_chunk(&pool, c);
+        if head.current.load(SeqCst) == version {
+            return Ok(()); // still current: not reclaimable
         }
+        // Elect the single reclaimer AND publish the `FREEING` hazard flag with a
+        // SeqCst store, all in one CAS — this must precede the pin scan below.
+        if slot
+            .state
+            .compare_exchange(SLOT_LIVE, SLOT_FREEING, SeqCst, Acquire)
+            .is_err()
+        {
+            return Ok(()); // someone else is reclaiming (or slot changed)
+        }
+
+        // Scan pins AFTER publishing FREEING (the handshake ordering).
+        if slot.pins.load(SeqCst) != 0 {
+            // A reader is live (or a racing reader is mid-protocol). Do NOT free.
+            // Revert so a later retire can proceed.
+            slot.state.store(SLOT_LIVE, SeqCst);
+            if slot.pins.load(SeqCst) != 0 {
+                // A genuine live pin remains; its drop re-runs retire.
+                return Ok(());
+            }
+            // Raced with a reader that backed off (decrementing to 0) while we
+            // held FREEING, so its own retire attempt no-op'd on our FREEING
+            // slot. Retry the free ourselves. No new pins can target `version`
+            // (readers only pin `current`, which has moved on), so this loop is
+            // bounded by the finite set of racing readers.
+            backoff(&mut spins);
+            continue;
+        }
+
+        let pool = Pool::attach(data_seg)?;
+
+        // Release this version's reference on each data chunk (shared chunks
+        // survive if another version still references them).
+        let mref = PackedRef(slot.manifest.load(Acquire));
+        if let Ok(manifest) = read_manifest(data_seg, mref) {
+            for c in &manifest.chunks {
+                release_chunk(&pool, c);
+            }
+        }
+
+        // Free the version's own (unshared) manifest chunk. `len`/`generation`
+        // are irrelevant to `ctrl`/`free`, which locate the chunk by `offset`.
+        let manifest_chunk = ChunkDesc {
+            segment_id: mref.segment_id(),
+            generation: 0,
+            offset: mref.offset(),
+            len: 0,
+            schema_id: 0,
+            _pad: 0,
+        };
+        release_chunk(&pool, &manifest_chunk);
+
+        // Return the slot to the free pool (FREEING -> FREE).
+        slot.version.store(0, Release);
+        slot.manifest.store(0, Release);
+        slot.state.store(SLOT_FREE, SeqCst);
+        return Ok(());
     }
-
-    // Free the version's own (unshared) manifest chunk. `len`/`generation` are
-    // irrelevant to `ctrl`/`free`, which locate the chunk by `offset` alone.
-    let manifest_chunk = ChunkDesc {
-        segment_id: mref.segment_id(),
-        generation: 0,
-        offset: mref.offset(),
-        len: 0,
-        schema_id: 0,
-        _pad: 0,
-    };
-    release_chunk(&pool, &manifest_chunk);
-
-    // Return the slot to the free pool.
-    slot.version.store(0, Release);
-    slot.manifest.store(0, Release);
-    slot.state.store(crate::head::SLOT_FREE, Release);
-    Ok(())
 }
 
 /// Small bounded backoff for the pin/commit retry loops.
@@ -661,17 +977,42 @@ fn backoff(spins: &mut u32) {
     }
 }
 
-/// The exclusive-write-lease handle. Holding it excludes other exclusive writers
-/// (a second [`Artifact::open_exclusive`] returns [`Error::WriteLocked`]); the
-/// lease is released on drop.
+/// A journalled write lease: the borrow journal recording this lease's
+/// [`WriteLease`](shm_core::JournalRecord::WriteLease) entry, and its slot. Held
+/// by a [`Committer`] opened via
+/// [`open_exclusive_journaled`](Artifact::open_exclusive_journaled); its
+/// [`Drop`] releases the slot so a *clean* release leaves nothing for the
+/// coordinator to replay, while a crash (no `Drop`) leaves it for the
+/// lease-monitor force-release (item K).
+struct LeaseJournal<'a> {
+    journal: &'a shm_core::BorrowJournal<'a>,
+    slot: usize,
+}
+
+/// The **fenced** exclusive-write-lease handle. Holding it excludes other
+/// exclusive writers (a second [`Artifact::open_exclusive`] returns
+/// [`Error::WriteLocked`]); the lease — and its journal entry, if journalled — is
+/// released on drop, bumping the fence.
+///
+/// The committer carries the **fence token** it acquired the lease under. Every
+/// commit re-validates the head lease still reads `{owner, token}`; if a
+/// coordinator declared this writer dead and force-released the lease (advancing
+/// the fence), the commit is rejected with [`Error::Fenced`] and installs no
+/// version (ADR-0003 item K).
 pub struct Committer<'a> {
     artifact: &'a Artifact,
     owner: u32,
+    /// The fence generation this lease was acquired under (the fencing token).
+    token: u32,
+    /// The crash-reclaim journal entry backing this lease, if opened journalled.
+    lease: Option<LeaseJournal<'a>>,
 }
 
 impl Committer<'_> {
     /// Commit a new version under the held lease. The predecessor is whatever
-    /// `current` reads now; the install CAS then advances it by one.
+    /// `current` reads now; the install CAS then advances it by one. Fails with
+    /// [`Error::Fenced`] if this writer's lease was fenced (declared dead and
+    /// superseded) — installing no version.
     pub fn commit(
         &mut self,
         commit: Commit,
@@ -680,7 +1021,7 @@ impl Committer<'_> {
     ) -> Result<u64> {
         let expect = self.artifact.head().current.load(SeqCst);
         self.artifact
-            .commit_inner(expect, self.owner, commit, batch, registry)
+            .commit_inner(expect, self.owner, commit, batch, registry, Some(self.token))
     }
 
     /// **ADDITIVE (v0.2 stage C — for `shm-stream`).** Install a batch of
@@ -696,16 +1037,26 @@ impl Committer<'_> {
     /// ([`commit_staged_inner`](Artifact::commit_staged_inner)); see that method
     /// for the success/failure ownership contract `shm-stream` relies on.
     ///
-    /// `schema_id` is the interned id shared by all staged chunks.
+    /// `schema_id` is the interned id shared by all staged chunks. `batch_spans`
+    /// partitions `staged` into Arrow batches (item F); their sum must equal
+    /// `staged.len()`.
     pub fn commit_staged(
         &mut self,
         commit: Commit,
         staged: &[ChunkDesc],
+        batch_spans: &[u32],
         schema_id: u32,
     ) -> Result<u64> {
         let expect = self.artifact.head().current.load(SeqCst);
-        self.artifact
-            .commit_staged_inner(expect, self.owner, commit, staged, schema_id)
+        self.artifact.commit_staged_inner(
+            expect,
+            self.owner,
+            commit,
+            staged,
+            batch_spans,
+            schema_id,
+            Some(self.token),
+        )
     }
 
     /// The actor id holding the lease.
@@ -713,15 +1064,31 @@ impl Committer<'_> {
     pub fn owner(&self) -> u32 {
         self.owner
     }
+
+    /// The fence generation (token) this lease was acquired under.
+    #[inline]
+    pub fn fence_token(&self) -> u32 {
+        self.token
+    }
 }
 
 impl Drop for Committer<'_> {
     fn drop(&mut self) {
+        // Release the fenced lease FIRST (this clears the wedge and bumps the
+        // fence), THEN the crash-ledger journal entry. This order is deliberate:
+        // if we crashed between the two, the coordinator would replay the still-
+        // present WriteLease entry and force-release a lease that is already free
+        // — a harmless no-op — rather than the reverse order, which could clear
+        // the ledger while the lease stayed stuck (the exact wedge item K fixes).
+        // A `false` result (the lease was already fenced by the coordinator) is
+        // fine: the CAS is a no-op and the journal entry, if any, is still cleared.
         let _ = self
             .artifact
             .head()
-            .writer_owner
-            .compare_exchange(self.owner, NO_WRITER, SeqCst, Acquire);
+            .release_write_lease(self.owner, self.token);
+        if let Some(l) = &self.lease {
+            let _ = l.journal.release(l.slot);
+        }
     }
 }
 
@@ -746,6 +1113,18 @@ struct PinState {
     version: u64,
     slot_idx: usize,
     manifest: Manifest,
+    /// The crash-reclaim journal entry backing this pin, if it was taken via
+    /// [`Artifact::pin_journaled`]. `Drop` releases the slot so a *clean* drop
+    /// leaves nothing for the coordinator to replay; a crash (no `Drop`) leaves
+    /// it for the lease-monitor replay (item J).
+    journal: Option<JournalPin>,
+}
+
+/// A journalled version pin: the actor's borrow-journal segment plus the slot
+/// index recording this pin's [`ArtifactPin`](shm_core::JournalRecord) entry.
+struct JournalPin {
+    seg: Arc<Segment>,
+    slot: usize,
 }
 
 impl SegmentBase for PinState {
@@ -756,6 +1135,13 @@ impl SegmentBase for PinState {
 
 impl Drop for PinState {
     fn drop(&mut self) {
+        // Release the crash-reclaim journal entry first (best-effort): a clean
+        // drop must leave nothing for the coordinator to replay.
+        if let Some(jp) = &self.journal {
+            if let Ok(journal) = BorrowJournal::attach(&jp.seg) {
+                let _ = journal.release(jp.slot);
+            }
+        }
         let head = head_ref(&self.head_seg);
         let slot = &head.pins[self.slot_idx];
         // We hold a live pin, so the slot still tracks our version and cannot be
@@ -788,16 +1174,29 @@ impl VersionPin {
     /// and a clone of this pin is the buffers' keep-alive (its lifetime holds the
     /// mapping *and* the version alive).
     ///
-    /// v0.1 single-data-chunk versions return that chunk's batch directly. An
-    /// Append version with multiple data chunks is reconstructed by reading each
-    /// chunk's batch and concatenating them in row order — turnover stays
-    /// O(new data) while reads still yield one logical batch.
+    /// Each Arrow batch in the version is reconstructed from its group of chunks
+    /// (a multi-chunk batch spans several consecutive `manifest.chunks`, per the
+    /// [`Manifest::batch_spans`] boundary table); the batches are then
+    /// concatenated in row order into one logical [`RecordBatch`]. A single
+    /// batch (the common case) is returned directly. Turnover stays O(new data)
+    /// while reads still yield one logical batch.
     pub fn as_arrow(&self, registry: &SchemaRegistry) -> Result<RecordBatch> {
         let pool = Pool::attach(&self.inner.data_seg)?;
-        let mut batches: Vec<RecordBatch> = Vec::with_capacity(self.inner.manifest.chunks.len());
-        for desc in &self.inner.manifest.chunks {
-            let ctrl = pool.ctrl(desc)?;
-            let batch = read_batch(self.inner.clone(), ctrl, desc, registry)?;
+        let manifest = &self.inner.manifest;
+        let mut batches: Vec<RecordBatch> = Vec::with_capacity(manifest.batch_spans.len());
+        let mut idx = 0usize;
+        for &span in &manifest.batch_spans {
+            let span = span as usize;
+            let group = manifest
+                .chunks
+                .get(idx..idx + span)
+                .ok_or(Error::Core(shm_core::Error::OutOfBounds))?;
+            idx += span;
+            let ctrls: Vec<&ChunkCtrl> = group
+                .iter()
+                .map(|d| pool.ctrl(d))
+                .collect::<core::result::Result<Vec<_>, shm_core::Error>>()?;
+            let batch = read_batch_chunks(self.inner.clone(), group, &ctrls, registry)?;
             batches.push(batch);
         }
         match batches.len() {

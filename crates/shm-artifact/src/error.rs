@@ -19,6 +19,16 @@ pub enum Error {
     #[error("artifact write lease is already held by another writer")]
     WriteLocked,
 
+    /// A [`Committer`](crate::Committer)'s exclusive write lease was **fenced**:
+    /// its fence generation was advanced (the coordinator declared the writer
+    /// dead and force-released the lease, or it was released and re-taken) after
+    /// this committer acquired it. The commit is rejected and installs no version
+    /// — a zombie/paused writer that was declared dead can never corrupt state
+    /// with a late commit (ADR-0003 item K). Every staged chunk is returned to
+    /// the pool, exactly as for a lost optimistic race.
+    #[error("artifact write lease was fenced: this writer was declared dead and superseded")]
+    Fenced,
+
     /// An optimistic commit lost the race: the artifact's `current` version was
     /// not the `expected` value at the moment of the install CAS.
     #[error("optimistic commit conflict: expected version {expected}, found {actual}")]
@@ -45,6 +55,13 @@ pub enum Error {
     /// use-after-reclaim attempt as a clean error rather than a stale read.
     #[error("version is gone: its chunks have been reclaimed")]
     VersionGone,
+
+    /// A manifest chunk read back a valid layout but self-identified as a
+    /// different `{artifact_id, version}` than expected — a stale or foreign
+    /// (recycled/ghost) manifest. Per ADR-0003a this replaces the dropped
+    /// `PackedRef` generation's ABA role for the manifest pointer.
+    #[error("stale manifest: {{artifact_id, version}} does not match the expected version")]
+    StaleManifest,
 }
 
 /// Convenience alias for `Result<T, shm_artifact::Error>`.

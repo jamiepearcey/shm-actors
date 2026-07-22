@@ -14,18 +14,22 @@
 //!   [`SchemaRegistry::with_schemas`] keeps a writer and reader agreeing.
 //! - [`ChunkAllocator`] — the allocation seam; [`PoolAllocator`] implements it
 //!   over a [`shm_core::Pool`] + [`shm_core::Segment`].
-//! - [`write_batch`] — serialize a batch into a loaned chunk (see [`layout`]
-//!   for the on-chunk [`BatchHeader`]/[`ColumnEntry`]/[`BufferEntry`] ABI).
-//! - [`read_batch`] — zero-copy reconstruction, validating generation via
+//! - [`write_batch`] / [`write_batch_chunks`] — serialize a batch into one (or
+//!   more) loaned chunk(s) (see [`layout`] for the on-chunk
+//!   [`BatchHeader`]/[`NodeEntry`]/[`BufferEntry`] ABI).
+//! - [`read_batch`] / [`read_batch_chunks`] — zero-copy reconstruction,
+//!   validating generation via
 //!   [`ChunkCtrl::validate`](shm_core::ChunkCtrl::validate) and the batch magic
 //!   first. Buffers borrow the mapping through a caller-supplied pin guard
 //!   (e.g. [`PinGuard`]).
 //!
-//! # Scope (v0.1)
+//! # Scope (v0.3, ADR-0003 item F)
 //!
-//! Single-chunk batches of flat columns (primitive + `Utf8`/`Binary`), unsliced
-//! input, in-process schema interning. Multi-chunk batches, nested types,
-//! sliced arrays, and a cross-process schema coordinator are v0.2 (ADR-0001).
+//! Real columnar tables: **nested** types (`Struct`/`List`/`LargeList`/
+//! `FixedSizeList` + recursive children), **sliced** arrays (normalized to
+//! offset `0` on write), and **multi-chunk** batches (a batch whose buffers
+//! exceed one chunk). Schema interning is coordinator-issued (item E).
+//! Dictionary/Union/Map/RunEndEncoded types remain unsupported.
 
 #![deny(missing_docs)]
 
@@ -38,7 +42,9 @@ pub mod write;
 
 pub use alloc::{ChunkAllocator, PoolAllocator};
 pub use error::{Error, Result};
-pub use layout::{BatchHeader, BufferEntry, ColumnEntry, BATCH_MAGIC, BUFFER_ALIGN};
-pub use read::{read_batch, PinGuard, SegmentBase};
-pub use schema::{SchemaRegistry, RAW_SCHEMA_ID};
-pub use write::{serialized_len, write_batch};
+pub use layout::{BatchHeader, BufferEntry, NodeEntry, BATCH_FORMAT, BATCH_MAGIC, BUFFER_ALIGN};
+pub use read::{read_batch, read_batch_chunks, PinGuard, SegmentBase};
+pub use schema::{
+    deserialize_schema, schema_content_hash, serialize_schema, SchemaRegistry, RAW_SCHEMA_ID,
+};
+pub use write::{serialized_len, write_batch, write_batch_chunks};

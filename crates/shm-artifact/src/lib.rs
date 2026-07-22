@@ -49,9 +49,13 @@
 //!
 //! # Scope (v0.1)
 //!
-//! Single-process (threads over one mapping) is exercised; the lease is a plain
-//! atomic (a coordinator-backed lease is `shm-runtime`'s job); `Patch` is
-//! deferred. Multi-data-chunk Append versions reconstruct via `concat`.
+//! Single-process (threads over one mapping) is exercised. The exclusive write
+//! lease is a **fenced** `{owner, fence}` atomic (ADR-0003 item K):
+//! [`open_exclusive`](Artifact::open_exclusive) is the unjournalled single-process
+//! open, while [`open_exclusive_journaled`](Artifact::open_exclusive_journaled)
+//! records a crash-ledger entry so `shm-runtime`'s coordinator can force-release
+//! (and fence) a dead writer's lease. `Patch` is deferred. Multi-data-chunk
+//! Append versions reconstruct via `concat`.
 
 #![deny(missing_docs)]
 
@@ -66,5 +70,6 @@ pub use error::{Error, Result};
 pub use event::{CommitKind, VersionEvent, ARTIFACTS_TOPIC, EVENT_MAGIC};
 pub use head::{ArtifactHead, PinSlot, MAX_LIVE_VERSIONS};
 pub use manifest::{
-    manifest_len, read_manifest, write_manifest, Manifest, VersionManifest, MANIFEST_MAGIC,
+    manifest_len, read_manifest, read_manifest_checked, write_manifest, Manifest, VersionManifest,
+    MANIFEST_MAGIC,
 };

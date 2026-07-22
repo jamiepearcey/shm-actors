@@ -69,8 +69,8 @@ impl ChunkDesc {
     }
 }
 
-/// A compact 64-bit "manifest pointer": `(segment_id, generation, offset)`
-/// squeezed into a single word.
+/// A compact 64-bit "manifest pointer": `(segment_id, offset)` squeezed into a
+/// single word.
 ///
 /// A full [`ChunkDesc`] is 24 bytes and therefore cannot be packed losslessly
 /// into 64 bits, so no `ChunkDesc::pack` is offered. Artifacts instead store a
@@ -79,22 +79,24 @@ impl ChunkDesc {
 /// with one atomic store. The `len` and `schema_id` are **not** carried here —
 /// they are read from the manifest the packed ref points at.
 ///
-/// # Bit layout (frozen)
+/// # Bit layout (frozen — v0.3, ADR-0003a)
 ///
 /// ```text
-///  63          48 47          32 31                              0
-/// +--------------+--------------+---------------------------------+
-/// | segment_id   | generation   | offset                          |
-/// | 16 bits      | 16 bits      | 32 bits                         |
-/// +--------------+--------------+---------------------------------+
+///  63                            32 31                            0
+/// +--------------------------------+------------------------------+
+/// | segment_id                     | offset                       |
+/// | 32 bits                        | 32 bits                      |
+/// +--------------------------------+------------------------------+
 /// ```
 ///
-/// - `segment_id` must be `< 2^16`.
-/// - `generation` is stored **mod 2^16** (low 16 bits). Generation compares are
-///   still exact within any 65 536-recycle window, which is far beyond the pin
-///   lifetime; the authoritative full-width generation always lives in the
-///   [`ChunkCtrl`](crate::ctrl::ChunkCtrl).
+/// - `segment_id` uses the full 32 bits (matching [`ChunkDesc::segment_id`]);
+///   this lifts the former 2^16 artifact-data-segment-id cap to 2^32.
 /// - `offset` uses the full 32 bits (segments up to 4 GiB).
+///
+/// The `generation` field the previous `[seg:16 | gen:16 | off:32]` packing
+/// carried is **dropped**: the generation's ABA role for the manifest pointer is
+/// subsumed by the manifest's own `{artifact_id, version}` self-validation (a
+/// monotonic, never-reissued pair — see `shm-artifact`'s `VersionManifest`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(transparent)]
 pub struct PackedRef(pub u64);
@@ -104,55 +106,38 @@ unsafe impl SharedPod for PackedRef {}
 
 impl PackedRef {
     const OFFSET_BITS: u32 = 32;
-    const GENERATION_BITS: u32 = 16;
-    const SEGMENT_BITS: u32 = 16;
+    const SEGMENT_BITS: u32 = 32;
 
     const OFFSET_MASK: u64 = (1u64 << Self::OFFSET_BITS) - 1;
-    const GENERATION_MASK: u64 = (1u64 << Self::GENERATION_BITS) - 1;
     const SEGMENT_MASK: u64 = (1u64 << Self::SEGMENT_BITS) - 1;
 
-    const GENERATION_SHIFT: u32 = Self::OFFSET_BITS;
-    const SEGMENT_SHIFT: u32 = Self::OFFSET_BITS + Self::GENERATION_BITS;
+    const SEGMENT_SHIFT: u32 = Self::OFFSET_BITS;
 
-    /// Packs `(segment_id, generation, offset)` into a single word.
-    ///
-    /// `segment_id` is masked to 16 bits and `generation` to its low 16 bits;
-    /// in debug builds an out-of-range `segment_id` trips an assertion.
+    /// Packs `(segment_id, offset)` into a single word. Both fields are 32-bit,
+    /// so the packing is lossless for any `u32` inputs.
     #[inline]
-    pub fn pack(segment_id: u32, generation: u32, offset: u32) -> PackedRef {
-        debug_assert!(
-            u64::from(segment_id) <= Self::SEGMENT_MASK,
-            "segment_id does not fit in 16 bits"
-        );
-        let bits = ((u64::from(segment_id) & Self::SEGMENT_MASK) << Self::SEGMENT_SHIFT)
-            | ((u64::from(generation) & Self::GENERATION_MASK) << Self::GENERATION_SHIFT)
-            | (u64::from(offset) & Self::OFFSET_MASK);
+    pub fn pack(segment_id: u32, offset: u32) -> PackedRef {
+        let bits = (u64::from(segment_id) << Self::SEGMENT_SHIFT) | u64::from(offset);
         PackedRef(bits)
     }
 
-    /// Packs the pointer fields of a [`ChunkDesc`]. `len`/`schema_id` are
-    /// intentionally dropped (they come from the manifest).
+    /// Packs the pointer fields of a [`ChunkDesc`]. `generation`/`len`/`schema_id`
+    /// are intentionally dropped (the manifest self-validates its identity).
     #[inline]
     pub fn from_desc(desc: &ChunkDesc) -> PackedRef {
-        Self::pack(desc.segment_id, desc.generation, desc.offset)
+        Self::pack(desc.segment_id, desc.offset)
     }
 
-    /// Unpacks to `(segment_id, generation, offset)`.
+    /// Unpacks to `(segment_id, offset)`.
     #[inline]
-    pub fn unpack(self) -> (u32, u32, u32) {
-        (self.segment_id(), self.generation(), self.offset())
+    pub fn unpack(self) -> (u32, u32) {
+        (self.segment_id(), self.offset())
     }
 
-    /// The segment id (16 bits).
+    /// The segment id (full 32 bits).
     #[inline]
     pub fn segment_id(self) -> u32 {
         ((self.0 >> Self::SEGMENT_SHIFT) & Self::SEGMENT_MASK) as u32
-    }
-
-    /// The low 16 bits of the generation.
-    #[inline]
-    pub fn generation(self) -> u32 {
-        ((self.0 >> Self::GENERATION_SHIFT) & Self::GENERATION_MASK) as u32
     }
 
     /// The 32-bit offset from the segment base.

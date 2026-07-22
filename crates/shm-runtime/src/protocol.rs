@@ -44,6 +44,10 @@ pub mod tags {
     pub const OPEN_ARTIFACT: u8 = 8;
     /// [`Request::OpenTaskQueue`].
     pub const OPEN_TASK_QUEUE: u8 = 9;
+    /// [`Request::InternSchema`].
+    pub const INTERN_SCHEMA: u8 = 10;
+    /// [`Request::ResolveSchema`].
+    pub const RESOLVE_SCHEMA: u8 = 11;
 
     /// [`Response::Registered`].
     pub const REGISTERED: u8 = 128;
@@ -57,6 +61,10 @@ pub mod tags {
     pub const ARTIFACT_GRANTED: u8 = 132;
     /// [`Response::TaskQueueGranted`].
     pub const TASK_QUEUE_GRANTED: u8 = 133;
+    /// [`Response::SchemaInterned`].
+    pub const SCHEMA_INTERNED: u8 = 134;
+    /// [`Response::SchemaResolved`].
+    pub const SCHEMA_RESOLVED: u8 = 135;
 }
 
 /// A message sent by an actor to the coordinator.
@@ -104,6 +112,22 @@ pub enum Request {
     /// Open the built-in task queue and receive its segment + doorbell fds.
     /// Expects [`Response::TaskQueueGranted`].
     OpenTaskQueue,
+    /// Intern an Arrow schema (serialized to its canonical IPC bytes) at the
+    /// coordinator, receiving its coordinator-issued `schema_id`. Idempotent:
+    /// the same schema always interns to the same id (ADR-0003 item E). Expects
+    /// [`Response::SchemaInterned`].
+    InternSchema {
+        /// The schema's canonical Arrow-IPC bytes (from
+        /// [`shm_arrow::serialize_schema`]).
+        schema_bytes: Vec<u8>,
+    },
+    /// Resolve a coordinator-issued `schema_id` back to its serialized schema
+    /// bytes. Expects [`Response::SchemaResolved`], or [`Response::Error`] if the
+    /// id is unknown.
+    ResolveSchema {
+        /// The coordinator-issued schema id to resolve.
+        schema_id: u32,
+    },
 }
 
 /// A message sent by the coordinator to an actor.
@@ -158,6 +182,18 @@ pub enum Response {
         /// The task-queue region length in bytes (`shm-task` `required_bytes`).
         region_len: u32,
     },
+    /// A schema was interned; carries its coordinator-issued id (stable across
+    /// every interner of the same schema). No fds.
+    SchemaInterned {
+        /// The coordinator-issued `schema_id` (>= 1).
+        schema_id: u32,
+    },
+    /// A schema was resolved; carries its canonical Arrow-IPC bytes. No fds.
+    SchemaResolved {
+        /// The schema's canonical Arrow-IPC bytes (feed to
+        /// [`shm_arrow::deserialize_schema`]).
+        schema_bytes: Vec<u8>,
+    },
 }
 
 /// How many passed fds a decoded [`Response`] requires.
@@ -186,6 +222,15 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
 
 fn put_desc(buf: &mut Vec<u8>, desc: &ChunkDesc) {
     buf.extend_from_slice(&desc_bytes(desc));
+}
+
+/// Write a length-prefixed byte string: a `u32` little-endian length then the
+/// bytes. Used for variable-length blobs (serialized schema IPC bytes) that can
+/// exceed the `u16` cap [`put_str`] uses for short names.
+fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&bytes[..len as usize]);
 }
 
 /// Serialize a `ChunkDesc` to its 24 raw little-endian bytes, in the frozen ABI
@@ -244,6 +289,22 @@ impl<'a> Reader<'a> {
         String::from_utf8(s.to_vec()).map_err(|_| Error::Protocol("invalid utf-8 in string"))
     }
 
+    fn bytes(&mut self) -> Result<Vec<u8>> {
+        let end = self.pos + 4;
+        let lenb = self
+            .buf
+            .get(self.pos..end)
+            .ok_or(Error::Protocol("short read: bytes len"))?;
+        let len = u32::from_le_bytes(lenb.try_into().unwrap()) as usize;
+        self.pos = end;
+        let b = self
+            .buf
+            .get(self.pos..self.pos + len)
+            .ok_or(Error::Protocol("short read: bytes body"))?;
+        self.pos += len;
+        Ok(b.to_vec())
+    }
+
     fn desc(&mut self) -> Result<ChunkDesc> {
         let end = self.pos + 24;
         let b = self
@@ -295,6 +356,14 @@ impl Request {
                 put_str(&mut buf, name);
             }
             Request::OpenTaskQueue => buf.push(tags::OPEN_TASK_QUEUE),
+            Request::InternSchema { schema_bytes } => {
+                buf.push(tags::INTERN_SCHEMA);
+                put_bytes(&mut buf, schema_bytes);
+            }
+            Request::ResolveSchema { schema_id } => {
+                buf.push(tags::RESOLVE_SCHEMA);
+                put_u32(&mut buf, *schema_id);
+            }
         }
         buf
     }
@@ -313,6 +382,12 @@ impl Request {
             tags::BYE => Request::Bye,
             tags::OPEN_ARTIFACT => Request::OpenArtifact { name: r.string()? },
             tags::OPEN_TASK_QUEUE => Request::OpenTaskQueue,
+            tags::INTERN_SCHEMA => Request::InternSchema {
+                schema_bytes: r.bytes()?,
+            },
+            tags::RESOLVE_SCHEMA => Request::ResolveSchema {
+                schema_id: r.u32()?,
+            },
             _ => return Err(Error::Protocol("unknown request tag")),
         })
     }
@@ -366,6 +441,14 @@ impl Response {
                 put_u32(&mut buf, *queue_seg_id);
                 put_u32(&mut buf, *region_len);
             }
+            Response::SchemaInterned { schema_id } => {
+                buf.push(tags::SCHEMA_INTERNED);
+                put_u32(&mut buf, *schema_id);
+            }
+            Response::SchemaResolved { schema_bytes } => {
+                buf.push(tags::SCHEMA_RESOLVED);
+                put_bytes(&mut buf, schema_bytes);
+            }
         }
         buf
     }
@@ -395,6 +478,12 @@ impl Response {
             tags::TASK_QUEUE_GRANTED => Response::TaskQueueGranted {
                 queue_seg_id: r.u32()?,
                 region_len: r.u32()?,
+            },
+            tags::SCHEMA_INTERNED => Response::SchemaInterned {
+                schema_id: r.u32()?,
+            },
+            tags::SCHEMA_RESOLVED => Response::SchemaResolved {
+                schema_bytes: r.bytes()?,
             },
             _ => return Err(Error::Protocol("unknown response tag")),
         })
@@ -434,6 +523,13 @@ mod tests {
             Request::Bye,
             Request::OpenArtifact { name: "cache".into() },
             Request::OpenTaskQueue,
+            Request::InternSchema {
+                schema_bytes: vec![0, 1, 2, 3, 250, 255, 128],
+            },
+            Request::InternSchema {
+                schema_bytes: Vec::new(),
+            },
+            Request::ResolveSchema { schema_id: 7 },
         ];
         for req in cases {
             let body = req.encode();
@@ -468,12 +564,41 @@ mod tests {
                 queue_seg_id: 600,
                 region_len: 40_000,
             },
+            Response::SchemaInterned { schema_id: 9 },
+            Response::SchemaResolved {
+                schema_bytes: vec![9, 8, 7, 0, 255, 42],
+            },
+            Response::SchemaResolved {
+                schema_bytes: Vec::new(),
+            },
         ];
         for resp in cases {
             let body = resp.encode();
             let back = Response::decode(&body).expect("decode");
             assert_eq!(resp, back, "round trip failed for {resp:?}");
         }
+    }
+
+    #[test]
+    fn schema_messages_round_trip_with_binary_bytes() {
+        // The two ADR-0003 item-E message pairs, including arbitrary (non-UTF-8)
+        // schema bytes and an empty payload.
+        let bytes = vec![0u8, 0xff, 0x7f, 0x80, 1, 2, 3, 0, 0];
+        let req = Request::InternSchema {
+            schema_bytes: bytes.clone(),
+        };
+        assert_eq!(Request::decode(&req.encode()).unwrap(), req);
+
+        let req = Request::ResolveSchema { schema_id: 12345 };
+        assert_eq!(Request::decode(&req.encode()).unwrap(), req);
+
+        let resp = Response::SchemaInterned { schema_id: 4242 };
+        assert_eq!(Response::decode(&resp.encode()).unwrap(), resp);
+
+        let resp = Response::SchemaResolved {
+            schema_bytes: bytes,
+        };
+        assert_eq!(Response::decode(&resp.encode()).unwrap(), resp);
     }
 
     #[test]

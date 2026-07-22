@@ -16,9 +16,10 @@ pub enum Error {
 
     /// An error bubbled up from the `shm-artifact` version machinery at
     /// [`commit`](crate::StreamWriter::commit) time — most importantly
-    /// [`shm_artifact::Error::Conflict`] (optimistic race lost) and
+    /// [`shm_artifact::Error::Conflict`] (optimistic race lost),
     /// [`shm_artifact::Error::WriteLocked`] (exclusive lease already held, at
-    /// [`open`](crate::StreamWriter::open)).
+    /// [`open`](crate::StreamWriter::open)), and [`shm_artifact::Error::Fenced`]
+    /// (this exclusive writer was declared dead and its lease fenced — item K).
     #[error(transparent)]
     Artifact(#[from] shm_artifact::Error),
 

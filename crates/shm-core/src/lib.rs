@@ -38,7 +38,10 @@ pub mod segment;
 pub use ctrl::{ChunkCtrl, FREE, LOANED, OWNER_NONE, PUBLISHED};
 pub use desc::{ChunkDesc, PackedRef};
 pub use error::{Error, Result};
-pub use journal::{BorrowJournal, DEFAULT_CAPACITY};
+pub use journal::{
+    BorrowJournal, JournalEntry, JournalRecord, DEFAULT_CAPACITY, ENTRY_ARTIFACT_PIN,
+    ENTRY_CHUNK_PIN, ENTRY_EMPTY, JOURNAL_MAGIC,
+};
 pub use platform::{
     doorbell_pair, doorbell_park, doorbell_ring, DeathDetection, DoorbellPair, Platform,
     PosixPlatform,

@@ -28,8 +28,8 @@ use core::sync::atomic::Ordering;
 
 use shm_artifact::Artifact;
 use shm_core::{
-    doorbell_pair, BorrowJournal, ChunkCtrl, ChunkDesc, DoorbellPair, Pool, Segment, FREE, LOANED,
-    PUBLISHED,
+    doorbell_pair, BorrowJournal, ChunkCtrl, ChunkDesc, DoorbellPair, JournalRecord, Pool, Segment,
+    FREE, LOANED, PUBLISHED,
 };
 use shm_ring::{required_bytes, DoorbellNotifier, Ring};
 use shm_task::{now_nanos, ReapReport, TaskQueue};
@@ -112,10 +112,32 @@ struct CoordState {
     actors: HashMap<u32, ActorEntry>,
     topics: HashMap<String, TopicEntry>,
     artifacts: HashMap<String, ArtifactEntry>,
+    /// Interned artifact `name_id` → artifact name, so a replayed
+    /// [`ArtifactPin`](shm_core::JournalRecord::ArtifactPin) (which carries only
+    /// the id) can be routed back to its hosted [`ArtifactEntry`] (item J).
+    artifact_name_by_id: HashMap<u32, String>,
     last_published: Option<ChunkDesc>,
     armed: bool,
     reclaimed: Vec<ChunkDesc>,
+    /// Count of leaked artifact **version pins** reclaimed by journal replay
+    /// (item J observability).
+    artifact_pins_reclaimed: u64,
+    /// Count of leaked artifact **write leases** force-released by journal replay
+    /// (item K observability).
+    write_leases_reclaimed: u64,
     created_seg_ids: Vec<u32>,
+    /// Master schema catalog (ADR-0003 item E): the process-independent
+    /// [`shm_arrow::schema_content_hash`] → issued `schema_id`. The coordinator
+    /// is the *authoritative* registry; nodes cache their learned mappings
+    /// locally. Interning is by content hash, so an equal schema submitted by any
+    /// process converges on one id — no identical seeding required.
+    schema_ids: HashMap<u64, u32>,
+    /// The reverse map `schema_id` → serialized schema bytes, answering
+    /// [`ResolveSchema`](crate::protocol::Request::ResolveSchema).
+    schema_bytes: HashMap<u32, Vec<u8>>,
+    /// Next schema id to issue (monotonic, starts at 1; 0 is
+    /// [`RAW_SCHEMA_ID`](shm_arrow::RAW_SCHEMA_ID) and never issued).
+    next_schema_id: u32,
 }
 
 /// State shared across the accept thread, handler threads, and lease monitor.
@@ -210,10 +232,16 @@ impl Coordinator {
                 actors: HashMap::new(),
                 topics: HashMap::new(),
                 artifacts: HashMap::new(),
+                artifact_name_by_id: HashMap::new(),
                 last_published: None,
                 armed: false,
                 reclaimed: Vec::new(),
+                artifact_pins_reclaimed: 0,
+                write_leases_reclaimed: 0,
                 created_seg_ids: vec![payload_id, task_queue_id],
+                schema_ids: HashMap::new(),
+                schema_bytes: HashMap::new(),
+                next_schema_id: 1,
             }),
             running: AtomicBool::new(true),
         });
@@ -368,6 +396,62 @@ impl Coordinator {
         Some((0..pool.num_classes()).map(|c| pool.free_count(c)).sum())
     }
 
+    /// The live pin count on a hosted artifact's slot for `version`, or `None`
+    /// if the artifact is unknown or no live slot tracks that version (never
+    /// committed, or already reclaimed). Lets a test prove a leaked version pin
+    /// was decremented by crash replay (item J).
+    pub fn artifact_slot_pins(&self, name: &str, version: u64) -> Option<u32> {
+        let (name_id, head, data) = {
+            let st = self.shared.state.lock().unwrap();
+            let a = st.artifacts.get(name)?;
+            (a.name_id, a.head_seg.clone(), a.data_seg.clone())
+        };
+        Artifact::attach(name_id, head, data)
+            .ok()
+            .and_then(|a| a.version_pin_count(version))
+    }
+
+    /// Count of leaked artifact **version pins** reclaimed by lease-driven
+    /// journal replay so far (item J observability).
+    pub fn artifact_pins_reclaimed(&self) -> u64 {
+        self.shared.state.lock().unwrap().artifact_pins_reclaimed
+    }
+
+    /// Count of leaked artifact **write leases** force-released by lease-driven
+    /// journal replay so far (item K observability).
+    pub fn write_leases_reclaimed(&self) -> u64 {
+        self.shared.state.lock().unwrap().write_leases_reclaimed
+    }
+
+    /// The current exclusive write-lease owner actor id on a hosted artifact, or
+    /// `None` if the artifact is unknown. `0` means the lease is free. Lets a test
+    /// prove a dead exclusive writer's lease was force-released by crash replay
+    /// (item K).
+    pub fn artifact_write_lease_owner(&self, name: &str) -> Option<u32> {
+        let (name_id, head, data) = {
+            let st = self.shared.state.lock().unwrap();
+            let a = st.artifacts.get(name)?;
+            (a.name_id, a.head_seg.clone(), a.data_seg.clone())
+        };
+        Artifact::attach(name_id, head, data)
+            .ok()
+            .map(|a| a.write_lease_owner())
+    }
+
+    /// Intern serialized schema bytes directly in the coordinator's master
+    /// catalog (ADR-0003 item E), returning the stable id. Exposes the exact
+    /// interning path a node's `InternSchema` request drives, for deterministic
+    /// same-process tests of the idempotency contract.
+    pub fn intern_schema_bytes(&self, schema_bytes: &[u8]) -> u32 {
+        intern_schema(&self.shared, schema_bytes)
+    }
+
+    /// Resolve a coordinator-issued `schema_id` back to its serialized schema
+    /// bytes (test/observability), or `None` if never interned.
+    pub fn resolve_schema_bytes(&self, schema_id: u32) -> Option<Vec<u8>> {
+        resolve_schema_bytes(&self.shared, schema_id)
+    }
+
     /// Drive one task-queue [`reap`](TaskQueue::reap) sweep at `now_nanos`,
     /// returning what it did. Exposes the exact lease-driven requeue path the
     /// monitor runs, for deterministic same-process tests.
@@ -471,6 +555,20 @@ fn handle_connection(shared: Arc<CoordShared>, stream: UnixStream) -> Result<()>
             }
             Request::OpenTaskQueue => {
                 grant_task_queue(&shared, &stream)?;
+            }
+            Request::InternSchema { schema_bytes } => {
+                let schema_id = intern_schema(&shared, &schema_bytes);
+                let resp = Response::SchemaInterned { schema_id };
+                send_frame(&stream, &resp.encode(), &[])?;
+            }
+            Request::ResolveSchema { schema_id } => {
+                let resp = match resolve_schema_bytes(&shared, schema_id) {
+                    Some(schema_bytes) => Response::SchemaResolved { schema_bytes },
+                    None => Response::Error {
+                        message: format!("unknown schema_id {schema_id}"),
+                    },
+                };
+                send_frame(&stream, &resp.encode(), &[])?;
             }
             Request::Bye => {
                 if let Some(id) = actor_id {
@@ -651,6 +749,7 @@ fn grant_artifact(shared: &Arc<CoordShared>, name: &str, stream: &UnixStream) ->
             let data_fd = data_seg.as_raw_fd();
             st.created_seg_ids.push(head_seg_id);
             st.created_seg_ids.push(data_seg_id);
+            st.artifact_name_by_id.insert(name_id, name.to_string());
             st.artifacts.insert(
                 name.into(),
                 ArtifactEntry {
@@ -694,6 +793,42 @@ fn grant_task_queue(shared: &Arc<CoordShared>, stream: &UnixStream) -> Result<()
     ];
     send_frame(stream, &resp.encode(), &fds)?;
     Ok(())
+}
+
+// ---- Schema coordinator (ADR-0003 item E) ----
+
+/// Intern a serialized Arrow schema in the coordinator's master catalog,
+/// returning its stable coordinator-issued id.
+///
+/// Interning is keyed by the process-independent
+/// [`shm_arrow::schema_content_hash`] of the received bytes, so the operation is
+/// **idempotent**: the same schema (from the same or a *different* process)
+/// always yields the same id, while a never-seen schema mints the next monotonic
+/// id (>= 1; `0` is reserved for raw bytes). The coordinator stores the bytes
+/// verbatim for a later [`resolve_schema_bytes`] — it never needs to deserialize.
+fn intern_schema(shared: &Arc<CoordShared>, schema_bytes: &[u8]) -> u32 {
+    let hash = shm_arrow::schema_content_hash(schema_bytes);
+    let mut st = shared.state.lock().unwrap();
+    if let Some(&id) = st.schema_ids.get(&hash) {
+        return id;
+    }
+    let id = st.next_schema_id;
+    st.next_schema_id += 1;
+    st.schema_ids.insert(hash, id);
+    st.schema_bytes.insert(id, schema_bytes.to_vec());
+    id
+}
+
+/// Resolve a coordinator-issued `schema_id` back to its serialized schema bytes,
+/// or `None` if the id was never interned.
+fn resolve_schema_bytes(shared: &Arc<CoordShared>, schema_id: u32) -> Option<Vec<u8>> {
+    shared
+        .state
+        .lock()
+        .unwrap()
+        .schema_bytes
+        .get(&schema_id)
+        .cloned()
 }
 
 /// Handle a consumer's `Pinned`: the chunk now has a live shared pin, so it is
@@ -763,14 +898,22 @@ fn lease_monitor(shared: Arc<CoordShared>) {
     }
 }
 
-/// Replay a dead actor's borrow journal and reclaim every chunk it held —
-/// across **every** pool the coordinator hosts.
+/// Replay a dead actor's borrow journal and reclaim everything it held: every
+/// pinned **chunk** (across every pool the coordinator hosts), every leaked
+/// artifact **version pin** (item J), **and** every leaked exclusive **write
+/// lease** (item K, force-released with a fence bump).
 ///
 /// A dead actor's journal can name chunks in more than one segment: shared-pin
 /// chunks in the payload pool (v0.1) **and** a producer's staged stream chunks
 /// in an artifact's *data* pool (v0.2 stage C). Because [`Pool::ctrl`] locates a
-/// chunk by `offset` alone (ignoring `segment_id`), each descriptor must be
-/// reclaimed against the pool of its own segment; this routes by `segment_id`.
+/// chunk by `offset` alone (ignoring `segment_id`), each chunk descriptor must
+/// be reclaimed against the pool of its own segment; this routes by
+/// `segment_id`. An [`ArtifactPin`](JournalRecord::ArtifactPin) is instead
+/// routed by `artifact_id` to its hosted artifact, whose per-version pin count
+/// is decremented through the same retire path a clean pin drop would take.
+///
+/// Returns the chunk descriptors that were reclaimed (recycled + freed);
+/// artifact-pin reclamations are counted into `artifact_pins_reclaimed`.
 fn reclaim_dead(
     shared: &Arc<CoordShared>,
     actor_id: u32,
@@ -781,7 +924,8 @@ fn reclaim_dead(
         Err(_) => return Vec::new(),
     };
     // Every segment whose pool could hold a chunk this actor journaled: the
-    // shared payload pool plus every hosted artifact's data pool.
+    // shared payload pool plus every hosted artifact's data pool. `segs` must
+    // outlive `pools` (each `Pool` borrows its `Segment`).
     let segs: Vec<Arc<Segment>> = {
         let st = shared.state.lock().unwrap();
         let mut v = vec![shared.payload_seg.clone()];
@@ -794,33 +938,83 @@ fn reclaim_dead(
         .iter()
         .filter_map(|s| Pool::attach(s).ok().map(|p| (s.id(), p)))
         .collect();
-    replay_and_reclaim_segmented(&pools, &journal, actor_id)
-}
 
-/// Reclaim a dead actor's journal against a set of `(segment_id, pool)` pools,
-/// routing each descriptor to the pool of its own segment.
-fn replay_and_reclaim_segmented(
-    pools: &[(u32, Pool)],
-    journal: &BorrowJournal,
-    actor_id: u32,
-) -> Vec<ChunkDesc> {
     let mut reclaimed = Vec::new();
-    for desc in journal.replay() {
-        if let Some((_, pool)) = pools.iter().find(|(id, _)| *id == desc.segment_id) {
-            if let Some(d) = reclaim_one(pool, &desc, actor_id) {
-                reclaimed.push(d);
+    let mut artifact_pins = 0u64;
+    let mut write_leases = 0u64;
+    for rec in journal.replay() {
+        match rec {
+            JournalRecord::ChunkPin(desc) => {
+                if let Some((_, pool)) = pools.iter().find(|(id, _)| *id == desc.segment_id) {
+                    if let Some(d) = reclaim_one(pool, &desc, actor_id) {
+                        reclaimed.push(d);
+                    }
+                }
+            }
+            JournalRecord::ArtifactPin {
+                artifact_id,
+                version,
+            } => {
+                if reclaim_artifact_pin(shared, artifact_id, version) {
+                    artifact_pins += 1;
+                }
+            }
+            JournalRecord::WriteLease { artifact_id, .. } => {
+                if reclaim_write_lease(shared, artifact_id) {
+                    write_leases += 1;
+                }
             }
         }
+    }
+    if artifact_pins > 0 || write_leases > 0 {
+        let mut st = shared.state.lock().unwrap();
+        st.artifact_pins_reclaimed += artifact_pins;
+        st.write_leases_reclaimed += write_leases;
     }
     reclaimed
 }
 
-/// The single-pool reclaim core, factored out so it can be unit-tested in
-/// isolation (and reused by the segmented path).
+/// Reclaim one leaked artifact **version pin** (item J): route `artifact_id` to
+/// its hosted artifact and decrement its per-version pin count through the same
+/// retire path a clean [`VersionPin`](shm_artifact::VersionPin) drop takes, so a
+/// leaked pin's version is retired (and its chunks reclaimed) exactly as if the
+/// reader had dropped it. Returns `true` iff a live slot was decremented.
+fn reclaim_artifact_pin(shared: &Arc<CoordShared>, artifact_id: u32, version: u64) -> bool {
+    match attach_artifact_by_id(shared, artifact_id) {
+        Some(art) => art.release_leaked_pin(version).unwrap_or(false),
+        None => false,
+    }
+}
+
+/// Reclaim one leaked artifact **write lease** (item K): route `artifact_id` to
+/// its hosted artifact and force-release its fenced exclusive write lease (with a
+/// fence bump), so a dead exclusive writer no longer wedges the artifact and its
+/// late commit is fenced out. Returns `true` iff a lease was actually held.
+fn reclaim_write_lease(shared: &Arc<CoordShared>, artifact_id: u32) -> bool {
+    match attach_artifact_by_id(shared, artifact_id) {
+        Some(art) => art.release_leaked_write_lease(),
+        None => false,
+    }
+}
+
+/// Route an interned `artifact_id` back to its hosted artifact and attach a
+/// handle onto it (shared by the item-J and item-K reclaim paths).
+fn attach_artifact_by_id(shared: &Arc<CoordShared>, artifact_id: u32) -> Option<Artifact> {
+    let (name_id, head, data) = {
+        let st = shared.state.lock().unwrap();
+        let name = st.artifact_name_by_id.get(&artifact_id)?.clone();
+        let a = st.artifacts.get(&name)?;
+        (a.name_id, a.head_seg.clone(), a.data_seg.clone())
+    };
+    Artifact::attach(name_id, head, data).ok()
+}
+
+/// The single-pool **chunk** reclaim core, factored out so it can be unit-tested
+/// in isolation (and reused by the segmented path).
 ///
-/// For every descriptor a dead actor still had journaled, release the hold it
-/// represents and, if that recycles the chunk to `FREE`, return it to the pool.
-/// Returns the descriptors that were actually reclaimed (recycled + freed).
+/// For every chunk descriptor a dead actor still had journaled, release the hold
+/// it represents and, if that recycles the chunk to `FREE`, return it to the
+/// pool. Returns the descriptors that were actually reclaimed (recycled + freed).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn replay_and_reclaim(
     pool: &Pool,
@@ -829,7 +1023,10 @@ pub(crate) fn replay_and_reclaim(
 ) -> Vec<ChunkDesc> {
     journal
         .replay()
-        .filter_map(|desc| reclaim_one(pool, &desc, actor_id))
+        .filter_map(|rec| match rec {
+            JournalRecord::ChunkPin(desc) => reclaim_one(pool, &desc, actor_id),
+            JournalRecord::ArtifactPin { .. } | JournalRecord::WriteLease { .. } => None,
+        })
         .collect()
 }
 
@@ -893,12 +1090,13 @@ fn journal_segment_size(capacity: usize) -> usize {
     shm_core::segment::HEADER_SIZE + 4096 + capacity * 32
 }
 
-/// Allocate a process-unique **16-bit** segment id for an artifact's data
-/// segment.
+/// Allocate a process-unique segment id for an artifact's data segment.
 ///
-/// A data segment backs chunks whose manifest [`PackedRef`](shm_core::PackedRef)
-/// packs `segment_id` into 16 bits, so the id must be `< 2^16`. A process-global
-/// counter guarantees uniqueness among artifacts created by one coordinator
+/// Since v0.3 (ADR-0003a) a manifest [`PackedRef`](shm_core::PackedRef) carries a
+/// full 32-bit `segment_id`, so ids are no longer capped at 2^16; this allocator
+/// still hands them out from a modest range purely for shm-name-space hygiene. A
+/// process-global counter guarantees uniqueness among artifacts created by one
+/// coordinator
 /// process (only the coordinator ever *creates* these segments; actors attach by
 /// fd); a randomized per-process base keeps the small shared shm-name space from
 /// clashing with a prior crashed run's leftovers. `create_segment`'s
@@ -921,7 +1119,8 @@ fn alloc_artifact_data_id() -> u32 {
         1 + (((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 50_000) as u32
     });
     let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-    // Stay within the 16-bit id space; never hand out 0 (the ZERO sentinel).
+    // Keep ids in a modest range for shm-name-space hygiene; never hand out 0
+    // (the ZERO sentinel). The 2^16 ABI cap was lifted in v0.3 (ADR-0003a).
     (base.wrapping_add(n) % 65_536).max(1)
 }
 

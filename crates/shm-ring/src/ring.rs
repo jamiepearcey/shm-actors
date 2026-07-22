@@ -43,7 +43,7 @@ pub const RELIABLE_UNUSED: u64 = u64::MAX;
 /// | `mask`      | `u32`                   | `capacity - 1`                    |
 /// | `head`      | `AtomicU64`             | next sequence to publish (= count)|
 /// | `waiters`   | `AtomicU32`             | parked subscriber count           |
-/// | `_pad`      | `u32`                   | reserved, zero                    |
+/// | `doorbell_seq` | `AtomicU32`          | reserved for v0.4 futex doorbell  |
 /// | `reliable`  | `[AtomicU64; MAX_RELIABLE]` | reliable subscriber cursors  |
 #[repr(C)]
 pub struct RingHeader {
@@ -58,8 +58,10 @@ pub struct RingHeader {
     pub head: AtomicU64,
     /// Number of subscribers currently parked (a publish wakes them iff `> 0`).
     pub waiters: AtomicU32,
-    /// Reserved padding to keep the reliable table 8-aligned.
-    pub _pad: u32,
+    /// **Reserved for v0.4's futex-based doorbell (ADR-0003).** Unused in v0.3:
+    /// initialized to `0` and never read or written on the hot path. It consumes
+    /// the former `_pad` word, so the header size and slot offsets are unchanged.
+    pub doorbell_seq: AtomicU32,
     /// Fixed table of reliable-subscriber cursors; [`RELIABLE_UNUSED`] == free.
     pub reliable: [AtomicU64; MAX_RELIABLE],
 }
@@ -157,7 +159,7 @@ impl Ring {
                 mask: capacity - 1,
                 head: AtomicU64::new(0),
                 waiters: AtomicU32::new(0),
-                _pad: 0,
+                doorbell_seq: AtomicU32::new(0),
                 reliable: core::array::from_fn(|_| AtomicU64::new(RELIABLE_UNUSED)),
             });
             let slots = base.add(slots_offset()).cast::<Slot>();

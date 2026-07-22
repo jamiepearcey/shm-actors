@@ -14,6 +14,11 @@ use crate::error::Result;
 ///   bytes whose payload is 64-byte aligned (as `shm-core` guarantees).
 /// - [`resolve`](ChunkAllocator::resolve) maps a descriptor produced by this
 ///   allocator to a writable pointer to the chunk's first byte.
+/// - [`max_chunk_size`](ChunkAllocator::max_chunk_size) is the largest single
+///   chunk `alloc` can return — the per-chunk packing capacity the multi-chunk
+///   write path splits a large batch against.
+/// - [`free`](ChunkAllocator::free) returns a freshly allocated but still-`FREE`
+///   chunk to the pool (used to roll back a partial multi-chunk allocation).
 pub trait ChunkAllocator {
     /// Allocate a chunk of at least `size` bytes.
     fn alloc(&self, size: usize) -> Result<ChunkDesc>;
@@ -23,6 +28,20 @@ pub trait ChunkAllocator {
     /// The pointer is valid for `desc.len` bytes for as long as the underlying
     /// segment stays mapped and the chunk is not recycled.
     fn resolve(&self, desc: &ChunkDesc) -> *mut u8;
+
+    /// The largest chunk size (bytes) [`alloc`](Self::alloc) can return.
+    ///
+    /// The multi-chunk writer packs Arrow buffers against this capacity: an
+    /// individual buffer that exceeds it cannot be stored contiguously in one
+    /// chunk and is rejected with [`Error::Unsupported`](crate::Error::Unsupported).
+    fn max_chunk_size(&self) -> usize;
+
+    /// Return a chunk obtained from [`alloc`](Self::alloc) — that was **never
+    /// loaned** (its control word is still `FREE`) — to the pool's free list.
+    ///
+    /// Used only to unwind a partially allocated multi-chunk batch so a failed
+    /// [`write_batch_chunks`](crate::write_batch_chunks) leaks nothing.
+    fn free(&self, desc: &ChunkDesc);
 }
 
 /// A [`ChunkAllocator`] over a `shm-core` [`Pool`] living in a [`Segment`].
@@ -68,5 +87,15 @@ impl ChunkAllocator for PoolAllocator<'_> {
         // the mapping. It is only dereferenced by the caller under the loan's
         // exclusive-write discipline.
         unsafe { self.segment.base_ptr().add(desc.offset as usize) }
+    }
+
+    fn max_chunk_size(&self) -> usize {
+        self.pool.max_chunk_size() as usize
+    }
+
+    fn free(&self, desc: &ChunkDesc) {
+        // The chunk is still `FREE` (never loaned); `Pool::free` only re-links it
+        // into the free list, so no control-word transition is needed.
+        let _ = self.pool.free(desc);
     }
 }

@@ -92,7 +92,7 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 /// | `waiters_work` | `AtomicU32` | idle workers parked on the work doorbell   |
 /// | `waiters_done` | `AtomicU32` | requesters parked on the done doorbell     |
 /// | `max_retries`  | `u32`       | reap retry cap                             |
-/// | `_pad`         | `u32`       | reserved, zero                             |
+/// | `doorbell_seq` | `AtomicU32` | reserved for v0.4 futex doorbell           |
 #[repr(C)]
 pub struct TaskQueueHeader {
     /// Must equal [`TASK_MAGIC`].
@@ -111,8 +111,10 @@ pub struct TaskQueueHeader {
     pub waiters_done: AtomicU32,
     /// Retry cap consulted by [`TaskQueue::reap`].
     pub max_retries: u32,
-    /// Reserved padding to keep the slot array 8-aligned.
-    pub _pad: u32,
+    /// **Reserved for v0.4's futex-based doorbell (ADR-0003).** Unused in v0.3:
+    /// initialized to `0` and never read or written on the hot path. It consumes
+    /// the former `_pad` word, so the header size and slot offsets are unchanged.
+    pub doorbell_seq: AtomicU32,
 }
 
 const _: () = assert!(core::mem::size_of::<TaskQueueHeader>() == 40);
@@ -304,7 +306,7 @@ impl TaskQueue {
                 waiters_work: AtomicU32::new(0),
                 waiters_done: AtomicU32::new(0),
                 max_retries,
-                _pad: 0,
+                doorbell_seq: AtomicU32::new(0),
             });
             let slots = base.add(slots_offset()).cast::<TaskSlot>();
             for i in 0..capacity as usize {

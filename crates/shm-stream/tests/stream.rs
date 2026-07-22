@@ -99,7 +99,13 @@ fn col(b: &RecordBatch) -> Vec<i64> {
 /// it still held. Returns the descriptors actually recycled + freed.
 fn replay_and_reclaim(pool: &Pool, journal: &BorrowJournal, actor_id: u32) -> Vec<ChunkDesc> {
     let mut reclaimed = Vec::new();
-    for desc in journal.replay() {
+    for rec in journal.replay() {
+        // A stream only ever journals chunk pins; ignore any other entry kind.
+        let desc = match rec {
+            shm_core::JournalRecord::ChunkPin(d) => d,
+            shm_core::JournalRecord::ArtifactPin { .. }
+            | shm_core::JournalRecord::WriteLease { .. } => continue,
+        };
         let ctrl = match pool.ctrl(&desc) {
             Ok(c) => c,
             Err(_) => continue,
@@ -480,4 +486,96 @@ fn patch_stream_rejected_at_open() {
     ));
     // Rejecting at open takes no lease.
     assert!(art.open_exclusive(8).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0003 item F — multi-chunk batches through the stream.
+// ---------------------------------------------------------------------------
+
+/// A wide Int64 batch that serializes past the fixture pool's 4 KiB max chunk,
+/// so one appended batch stages several chunks.
+fn wide_batch(cols: usize, rows: usize) -> (RecordBatch, SchemaRef) {
+    let mut fields = Vec::new();
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::new();
+    for c in 0..cols {
+        fields.push(Field::new(format!("c{c}"), DataType::Int64, false));
+        let vals: Vec<i64> = (0..rows as i64).map(|r| r + (c as i64) * 100_000).collect();
+        columns.push(Arc::new(Int64Array::from(vals)));
+    }
+    let schema: SchemaRef = Arc::new(Schema::new(fields));
+    (RecordBatch::try_new(schema.clone(), columns).unwrap(), schema)
+}
+
+/// Total free chunks across every size class of the data pool.
+fn free_all(pool: &Pool) -> usize {
+    (0..pool.num_classes()).map(|c| pool.free_count(c)).sum()
+}
+
+#[test]
+fn multi_chunk_batch_commits_and_reads_equal() {
+    let fx = Fixture::new();
+    let art = fx.artifact(20);
+    let (b, schema) = wide_batch(6, 200);
+    let reg = SchemaRegistry::with_schemas(std::slice::from_ref(&schema));
+    let journal = fx.journal();
+
+    let mut stream = StreamWriter::open(
+        &art,
+        &fx.data_seg,
+        &journal,
+        &reg,
+        7,
+        Commit::Replace,
+        Coordination::Exclusive,
+    )
+    .unwrap();
+    // One append of a wide batch stages SEVERAL chunks (one batch).
+    stream.append_batch(&b).unwrap();
+    assert!(stream.staged_len() >= 2, "a multi-chunk batch stages >= 2 chunks");
+    assert_eq!(stream.commit().unwrap(), 1);
+
+    let pin = art.pin().unwrap();
+    let m = pin.manifest();
+    assert!(m.chunks.len() >= 2, "committed batch spans >= 2 chunks");
+    assert_eq!(m.batch_spans, vec![m.chunks.len() as u32], "one batch spanning all chunks");
+    assert_eq!(&pin.as_arrow(&reg).unwrap(), &b, "multi-chunk stream commit reads equal");
+    assert!(journal.is_empty(), "journal slots released after commit");
+}
+
+#[test]
+fn crash_replay_frees_every_chunk_of_a_multi_chunk_batch() {
+    let fx = Fixture::new();
+    let art = fx.artifact(21);
+    let (b, schema) = wide_batch(6, 200);
+    let reg = SchemaRegistry::with_schemas(std::slice::from_ref(&schema));
+    let journal = fx.journal();
+    let pool = Pool::attach(&fx.data_seg).unwrap();
+    let free_before = free_all(&pool);
+    let owner = 7u32;
+
+    let mut stream = StreamWriter::open(
+        &art,
+        &fx.data_seg,
+        &journal,
+        &reg,
+        owner,
+        Commit::Replace,
+        Coordination::Optimistic { expect_version: 0 },
+    )
+    .unwrap();
+    stream.append_batch(&b).unwrap();
+    let staged_chunks = stream.staged_len();
+    assert!(staged_chunks >= 2, "the batch staged >= 2 chunks");
+    // EVERY chunk of the multi-chunk batch is journaled (not just the first).
+    assert_eq!(journal.len(), staged_chunks, "every staged chunk is journaled");
+    assert_eq!(free_before - free_all(&pool), staged_chunks, "all staged chunks loaned");
+
+    // Simulate the writer dying mid-stage: no Drop, no abort, no commit.
+    std::mem::forget(stream);
+
+    // Journal replay must free ALL of the batch's chunks, not just the primary.
+    let reclaimed = replay_and_reclaim(&pool, &journal, owner);
+    assert_eq!(reclaimed.len(), staged_chunks, "replay freed every staged chunk");
+    assert_eq!(art.current_version(), 0, "no version ever published");
+    assert_eq!(free_all(&pool), free_before, "every staged chunk returned to the pool");
 }

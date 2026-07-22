@@ -1,186 +1,326 @@
-//! The write path: serialize a `RecordBatch`'s buffers into one loaned chunk.
+//! The write path: serialize a `RecordBatch`'s buffers into one or more chunks.
+//!
+//! The batch is copied **once** into shared memory ("one copy in, zero after").
+//! Nested (`Struct`/`List`/…) columns are serialized by a schema-driven pre-order
+//! walk; sliced columns are normalized to offset `0` during the copy; a batch
+//! whose buffers exceed one chunk is packed across multiple chunks. See
+//! [`crate::layout`] for the exact byte layout.
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
+use arrow_data::ArrayData;
+use arrow_schema::DataType;
 
 use crate::alloc::ChunkAllocator;
 use crate::error::{Error, Result};
 use crate::layout::{
-    align_up, buffers_offset, columns_offset, payload_start, BatchHeader, BufferEntry, ColumnEntry,
-    BATCH_MAGIC, BUFFER_ALIGN,
+    align_up, buffers_offset, nodes_offset, payload_start, BatchHeader, BufferEntry, NodeEntry,
+    BATCH_FORMAT, BATCH_MAGIC, BUFFER_ALIGN,
 };
 use crate::schema::SchemaRegistry;
 use shm_core::ChunkDesc;
 
-/// Per-column plan gathered from the source batch.
-///
-/// Buffers are held as owned [`Buffer`] handles (an `Arc` bump over the source
-/// allocation — **no** payload copy); the bytes are copied into shared memory
-/// exactly once, later, in the write step.
-struct PlannedColumn {
-    len: u32,
-    null_count: u32,
-    validity: Option<Buffer>,
-    data: Vec<Buffer>,
+/// The flattened, normalized plan of a batch: the pre-order node table, the
+/// ordered physical buffers, and the row count. Buffer handles are held as owned
+/// [`Buffer`] clones (`Arc` bumps — **no** payload copy) so their bytes stay
+/// valid until copied into shared memory.
+struct Plan {
+    nodes: Vec<NodeEntry>,
+    buffers: Vec<Buffer>,
+    row_count: usize,
+    /// Normalized column arrays kept alive so every `buffers` handle stays valid
+    /// (a `concat`-materialized array owns buffers the clones point into).
+    _keepalive: Vec<ArrayRef>,
 }
 
-/// Serialize `batch` into a single chunk obtained from `alloc`, returning the
-/// descriptor (with `schema_id` set) to be published by the caller.
+/// The chunk assignment of every buffer, plus the used byte length of each chunk.
+struct Packing {
+    /// `(chunk_index, offset_in_chunk)` for each buffer, parallel to `Plan::buffers`.
+    locs: Vec<(u32, u32)>,
+    /// High-water end offset (== bytes needed) of each chunk.
+    chunk_used: Vec<usize>,
+}
+
+/// Serialize `batch` into **exactly one** loaned chunk from `alloc`, returning
+/// its descriptor (with `schema_id` set).
 ///
-/// The batch is written **once**; everything downstream moves the returned
-/// 24-byte [`ChunkDesc`]. See [`crate::layout`] for the exact byte layout.
-///
-/// # v0.1 limitations
-///
-/// - **Single chunk.** The whole batch must fit in one allocated chunk;
-///   otherwise [`Error::ChunkTooSmall`] is returned. Multi-chunk batches (a
-///   descriptor list) are a documented v0.2 extension.
-/// - **Unsliced input.** Columns (and their null buffers) must have offset `0`.
-///   A sliced array returns [`Error::Unsupported`]; callers should
-///   materialize with `arrow`'s compute kernels first.
-/// - **Flat columns.** Primitive and variable-length (`Utf8`/`Binary`) columns
-///   are supported; nested types (`List`/`Struct`) that carry child data are a
-///   v0.2 extension and also surface as [`Error::Unsupported`].
+/// This is the convenience entry point for the single-chunk case (the pub/sub
+/// data path, small artifact commits): nested and sliced columns are supported,
+/// but the whole serialized batch must fit in one chunk. A batch that would span
+/// multiple chunks returns [`Error::ChunkTooSmall`]; use
+/// [`write_batch_chunks`] for those.
 pub fn write_batch<A: ChunkAllocator>(
     alloc: &A,
     registry: &SchemaRegistry,
     batch: &RecordBatch,
 ) -> Result<ChunkDesc> {
+    let chunks = write_batch_chunks(alloc, registry, batch)?;
+    if chunks.len() == 1 {
+        Ok(chunks[0])
+    } else {
+        // Roll back every allocated (still-`FREE`) chunk and report the fit.
+        for c in &chunks {
+            alloc.free(c);
+        }
+        Err(Error::ChunkTooSmall {
+            need: serialized_len(batch).unwrap_or(usize::MAX),
+            have: alloc.max_chunk_size(),
+        })
+    }
+}
+
+/// Serialize `batch` into one or more loaned chunks, returning their descriptors
+/// (each with `schema_id` set). `chunks[0]` is the **primary** chunk (it holds
+/// the [`BatchHeader`] + tables); `chunks[1..]` are continuations.
+///
+/// The batch is written **once**. Every returned chunk is `FREE` (freshly popped
+/// from the pool, never loaned); the caller loans + publishes them (and lists
+/// them all in the version manifest so every chunk is reclaimed).
+///
+/// # Supported inputs
+///
+/// - **Nested** columns (`Struct`, `List`, `LargeList`, `FixedSizeList`, and
+///   their recursive children) with correct validity/offset/child buffers.
+/// - **Sliced** columns (`offset != 0` at any depth) — normalized to offset `0`
+///   during the copy.
+/// - **Multi-chunk** batches — buffers packed across chunks (each buffer stays
+///   contiguous within one chunk).
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] for a Dictionary/Union/Map/RunEndEncoded type, or for
+///   a single buffer larger than `alloc.max_chunk_size()`.
+/// - [`Error::ChunkTooSmall`] if even the header + tables exceed one chunk.
+/// - Pool exhaustion / overflow bubble up from `alloc`.
+pub fn write_batch_chunks<A: ChunkAllocator>(
+    alloc: &A,
+    registry: &SchemaRegistry,
+    batch: &RecordBatch,
+) -> Result<Vec<ChunkDesc>> {
     let schema_id = registry.intern(&batch.schema());
-    let columns = plan_columns(batch)?;
+    let plan = plan_batch(batch)?;
 
-    // ---- Layout: assign each buffer a 64-byte-aligned chunk offset. ----
-    let column_count = columns.len();
-    let buffer_count: usize = columns
-        .iter()
-        .map(|c| usize::from(c.validity.is_some()) + c.data.len())
-        .sum();
+    let cap = alloc.max_chunk_size();
+    let packing = pack(&plan, cap)?;
+    let chunk_count = packing.chunk_used.len();
 
-    let mut cursor = payload_start(column_count, buffer_count);
-    let mut buffer_entries: Vec<BufferEntry> = Vec::with_capacity(buffer_count);
-    let mut ordered_buffers: Vec<&Buffer> = Vec::with_capacity(buffer_count);
-    let mut column_entries: Vec<ColumnEntry> = Vec::with_capacity(column_count);
+    let row_count = u32::try_from(plan.row_count)
+        .map_err(|_| Error::Unsupported("row count exceeds u32"))?;
+    let node_count = u32::try_from(plan.nodes.len())
+        .map_err(|_| Error::Unsupported("node count exceeds u32"))?;
+    let buffer_count = u32::try_from(plan.buffers.len())
+        .map_err(|_| Error::Unsupported("buffer count exceeds u32"))?;
 
-    for c in &columns {
-        if let Some(v) = &c.validity {
-            cursor = align_up(cursor, BUFFER_ALIGN);
-            buffer_entries.push(BufferEntry { offset: cursor as u32, len: v.len() as u32 });
-            ordered_buffers.push(v);
-            cursor += v.len();
+    // ---- Allocate every chunk up front; roll back partial allocation. ----
+    let mut chunks: Vec<ChunkDesc> = Vec::with_capacity(chunk_count);
+    for (i, &used) in packing.chunk_used.iter().enumerate() {
+        match alloc.alloc(used) {
+            Ok(mut desc) => {
+                if (desc.len as usize) < used {
+                    // The allocator returned a smaller chunk than requested.
+                    alloc.free(&desc);
+                    for c in &chunks {
+                        alloc.free(c);
+                    }
+                    return Err(Error::ChunkTooSmall { need: used, have: desc.len as usize });
+                }
+                desc.schema_id = schema_id;
+                chunks.push(desc);
+            }
+            Err(e) => {
+                for c in &chunks {
+                    alloc.free(c);
+                }
+                let _ = i;
+                return Err(e);
+            }
         }
-        for d in &c.data {
-            cursor = align_up(cursor, BUFFER_ALIGN);
-            buffer_entries.push(BufferEntry { offset: cursor as u32, len: d.len() as u32 });
-            ordered_buffers.push(d);
-            cursor += d.len();
-        }
-        column_entries.push(ColumnEntry {
-            len: c.len,
-            null_count: c.null_count,
-            has_validity: u32::from(c.validity.is_some()),
-            data_buffers: c.data.len() as u32,
-        });
     }
 
-    let total_bytes = cursor;
+    // Resolve each chunk's writable base pointer.
+    let bases: Vec<*mut u8> = chunks.iter().map(|d| alloc.resolve(d)).collect();
 
-    // ---- Allocate and write. ----
-    let mut desc = alloc.alloc(total_bytes)?;
-    if (desc.len as usize) < total_bytes {
-        // Allocator returned a smaller chunk than requested — treat as a fit
-        // failure rather than corrupting memory.
-        return Err(Error::ChunkTooSmall { need: total_bytes, have: desc.len as usize });
-    }
-
-    let base = alloc.resolve(&desc);
     let header = BatchHeader {
         magic: BATCH_MAGIC,
+        format: BATCH_FORMAT,
         schema_id,
-        row_count: u32::try_from(batch.num_rows())
-            .map_err(|_| Error::Unsupported("row count exceeds u32"))?,
-        column_count: column_count as u32,
-        buffer_count: buffer_count as u32,
+        row_count,
+        node_count,
+        buffer_count,
+        chunk_count: chunk_count as u32,
     };
 
-    // SAFETY: `base` points at a loaned chunk of `desc.len >= total_bytes`
-    // exclusively owned by the caller (LOANED state). Every offset written
-    // below is `< total_bytes`, so all writes stay within the chunk. The
-    // records are `#[repr(C)]` PODs written unaligned to be layout-agnostic.
+    // SAFETY: `bases[0]` points at the loaned primary chunk of `chunks[0].len`
+    // bytes (>= `chunk_used[0]`), exclusively owned by the caller. The header,
+    // node table, and buffer table all land at offsets `< payload_start` (<=
+    // `chunk_used[0]`), so every write stays within the primary chunk. Each
+    // payload buffer is copied to `bases[chunk_index] + offset`, a region of
+    // `len` bytes verified by `pack` to lie inside that chunk. Records are
+    // `#[repr(C)]` PODs written unaligned to stay layout-agnostic.
     unsafe {
-        base.cast::<BatchHeader>().write_unaligned(header);
+        let primary = bases[0];
+        primary.cast::<BatchHeader>().write_unaligned(header);
 
-        let col_ptr = base.add(columns_offset()).cast::<ColumnEntry>();
-        for (i, entry) in column_entries.iter().enumerate() {
-            col_ptr.add(i).write_unaligned(*entry);
+        let node_ptr = primary.add(nodes_offset()).cast::<NodeEntry>();
+        for (i, n) in plan.nodes.iter().enumerate() {
+            node_ptr.add(i).write_unaligned(*n);
         }
 
-        let buf_ptr = base.add(buffers_offset(column_count)).cast::<BufferEntry>();
-        for (i, entry) in buffer_entries.iter().enumerate() {
-            buf_ptr.add(i).write_unaligned(*entry);
+        let buf_ptr = primary
+            .add(buffers_offset(plan.nodes.len()))
+            .cast::<BufferEntry>();
+        for (i, ((chunk_index, offset), buffer)) in
+            packing.locs.iter().zip(plan.buffers.iter()).enumerate()
+        {
+            buf_ptr.add(i).write_unaligned(BufferEntry {
+                chunk_index: *chunk_index,
+                offset: *offset,
+                len: buffer.len() as u32,
+            });
         }
 
-        for (entry, buffer) in buffer_entries.iter().zip(ordered_buffers.iter()) {
+        for ((chunk_index, offset), buffer) in packing.locs.iter().zip(plan.buffers.iter()) {
             let bytes = buffer.as_slice();
-            let dst = base.add(entry.offset as usize);
+            let dst = bases[*chunk_index as usize].add(*offset as usize);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         }
     }
 
-    desc.schema_id = schema_id;
-    Ok(desc)
+    Ok(chunks)
 }
 
-/// Gather each column's owned buffers, rejecting sliced/nested input.
-fn plan_columns(batch: &RecordBatch) -> Result<Vec<PlannedColumn>> {
-    let mut columns = Vec::with_capacity(batch.num_columns());
+/// Flatten `batch` into its normalized pre-order plan (nodes + buffers).
+fn plan_batch(batch: &RecordBatch) -> Result<Plan> {
+    let mut nodes = Vec::new();
+    let mut buffers = Vec::new();
+    let mut keepalive = Vec::with_capacity(batch.num_columns());
     for array in batch.columns() {
-        let data = array.to_data();
-        if data.offset() != 0 {
-            return Err(Error::Unsupported("sliced column (array offset != 0)"));
-        }
-        if !data.child_data().is_empty() {
-            return Err(Error::Unsupported("nested column with child data"));
-        }
-
-        let validity = match data.nulls() {
-            Some(nulls) => {
-                if nulls.offset() != 0 {
-                    return Err(Error::Unsupported("sliced validity buffer"));
-                }
-                Some(nulls.buffer().clone())
-            }
-            None => None,
-        };
-
-        columns.push(PlannedColumn {
-            len: u32::try_from(data.len())
-                .map_err(|_| Error::Unsupported("column length exceeds u32"))?,
-            null_count: u32::try_from(data.null_count())
-                .map_err(|_| Error::Unsupported("null count exceeds u32"))?,
-            validity,
-            data: data.buffers().to_vec(),
-        });
+        let normalized = normalize(array)?;
+        plan_node(&normalized.to_data(), &mut nodes, &mut buffers)?;
+        keepalive.push(normalized);
     }
-    Ok(columns)
+    Ok(Plan {
+        nodes,
+        buffers,
+        row_count: batch.num_rows(),
+        _keepalive: keepalive,
+    })
 }
 
-/// The serialized byte length of `batch` under this crate's on-chunk layout —
-/// enough to size an arena without a dry-run write. Returns `None` on an
-/// unsupported (sliced/nested) input.
+/// Append one `ArrayData` node (and, recursively, its children) to the flattened
+/// pre-order plan. `data` must already be normalized (offset `0` at every depth).
+fn plan_node(data: &ArrayData, nodes: &mut Vec<NodeEntry>, buffers: &mut Vec<Buffer>) -> Result<()> {
+    ensure_supported(data.data_type())?;
+
+    let len = u32::try_from(data.len()).map_err(|_| Error::Unsupported("array length exceeds u32"))?;
+    let null_count =
+        u32::try_from(data.null_count()).map_err(|_| Error::Unsupported("null count exceeds u32"))?;
+    let has_validity = data.nulls().is_some();
+    let data_buffers = data.buffers().len();
+    let child_count = data.child_data().len();
+
+    nodes.push(NodeEntry {
+        len,
+        null_count,
+        has_validity: u32::from(has_validity),
+        data_buffers: u32::try_from(data_buffers)
+            .map_err(|_| Error::Unsupported("too many data buffers in a node"))?,
+        child_count: u32::try_from(child_count)
+            .map_err(|_| Error::Unsupported("too many children in a node"))?,
+        _pad: 0,
+    });
+
+    // Validity first, then data buffers, matching the read-side consume order.
+    if let Some(nulls) = data.nulls() {
+        buffers.push(nulls.buffer().clone());
+    }
+    for b in data.buffers() {
+        buffers.push(b.clone());
+    }
+    for child in data.child_data() {
+        plan_node(child, nodes, buffers)?;
+    }
+    Ok(())
+}
+
+/// Reject types this layout does not round-trip (their child/buffer conventions
+/// differ from the generic node model). The supported nested set is
+/// `Struct`/`List`/`LargeList`/`FixedSizeList`; everything else must be flat.
+fn ensure_supported(dt: &DataType) -> Result<()> {
+    match dt {
+        DataType::Dictionary(_, _) => Err(Error::Unsupported("dictionary type not supported")),
+        DataType::Union(_, _) => Err(Error::Unsupported("union type not supported")),
+        DataType::Map(_, _) => Err(Error::Unsupported("map type not supported")),
+        DataType::RunEndEncoded(_, _) => Err(Error::Unsupported("run-end-encoded type not supported")),
+        _ => Ok(()),
+    }
+}
+
+/// Normalize `array` so its (and every descendant's) `ArrayData::offset()` is `0`.
+///
+/// Returns the array unchanged when it is already normalized; otherwise compacts
+/// it with a single-input `concat`, which materializes fresh, offset-`0`,
+/// tightly-sized buffers at every nesting level.
+fn normalize(array: &ArrayRef) -> Result<ArrayRef> {
+    if is_normalized(&array.to_data()) {
+        Ok(array.clone())
+    } else {
+        Ok(arrow_select::concat::concat(&[array.as_ref()])?)
+    }
+}
+
+/// Whether `data` (recursively) has offset `0` and an offset-`0` validity buffer.
+fn is_normalized(data: &ArrayData) -> bool {
+    data.offset() == 0
+        && data.nulls().is_none_or(|n| n.offset() == 0)
+        && data.child_data().iter().all(is_normalized)
+}
+
+/// Assign every buffer to a chunk, opening a new continuation chunk whenever the
+/// next buffer would overflow the current one.
+///
+/// `cap` is the per-chunk capacity (the pool's max chunk size). Fails with
+/// [`Error::Unsupported`] if a single buffer (or the header + tables) exceeds
+/// `cap` — such a buffer cannot be stored contiguously in any chunk.
+fn pack(plan: &Plan, cap: usize) -> Result<Packing> {
+    let start = payload_start(plan.nodes.len(), plan.buffers.len());
+    if start > cap {
+        return Err(Error::ChunkTooSmall { need: start, have: cap });
+    }
+
+    let mut locs = Vec::with_capacity(plan.buffers.len());
+    let mut chunk_used = vec![start];
+    let mut cur = 0usize;
+    let mut cursor = start;
+
+    for buffer in &plan.buffers {
+        let blen = buffer.len();
+        if blen > cap {
+            return Err(Error::Unsupported("buffer exceeds max chunk size"));
+        }
+        let mut off = align_up(cursor, BUFFER_ALIGN);
+        if off + blen > cap {
+            // Overflow: open a fresh continuation chunk (offset 0 is 64-aligned).
+            cur += 1;
+            chunk_used.push(0);
+            off = 0;
+        }
+        locs.push((cur as u32, off as u32));
+        cursor = off + blen;
+        chunk_used[cur] = cursor;
+    }
+
+    Ok(Packing { locs, chunk_used })
+}
+
+/// The serialized byte length of `batch` if it fit in a **single** chunk — enough
+/// to size an arena without a dry-run write. Returns `None` on an unsupported
+/// (e.g. Dictionary/Union) input.
 pub fn serialized_len(batch: &RecordBatch) -> Option<usize> {
-    let columns = plan_columns(batch).ok()?;
-    let buffer_count: usize = columns
-        .iter()
-        .map(|c| usize::from(c.validity.is_some()) + c.data.len())
-        .sum();
-    let mut cursor = payload_start(columns.len(), buffer_count);
-    for c in &columns {
-        if let Some(v) = &c.validity {
-            cursor = align_up(cursor, BUFFER_ALIGN) + v.len();
-        }
-        for d in &c.data {
-            cursor = align_up(cursor, BUFFER_ALIGN) + d.len();
-        }
+    let plan = plan_batch(batch).ok()?;
+    let mut cursor = payload_start(plan.nodes.len(), plan.buffers.len());
+    for b in &plan.buffers {
+        cursor = align_up(cursor, BUFFER_ALIGN) + b.len();
     }
     Some(cursor)
 }
