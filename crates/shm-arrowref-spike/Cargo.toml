@@ -1,0 +1,28 @@
+# v0.4 stage Q — the ArrowRef task-fabric integration SPIKE (ADR-0004, ADR-0005).
+#
+# This is an EXAMPLE / SPIKE crate, not a shipped library. It maps ONE ArrowRef
+# surface — the descriptor-only task fabric — onto shm-actors' published API to
+# surface concrete API gaps for a stable ArrowRef rewrite.
+#
+# CLEAN-ROOM: it depends ONLY on shm-actors crates (+ arrow) and a small
+# hand-written MOCK of ArrowRef's task contract (see `src/arrowref_mock.rs`).
+# It does NOT depend on the real ArrowRef / query-cache crate, ever.
+[package]
+name = "shm-arrowref-spike"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+shm-core = { workspace = true }
+shm-arrow = { workspace = true }
+shm-task = { workspace = true }
+shm-artifact = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+
+[[bin]]
+name = "arrowref-spike"
+path = "src/main.rs"

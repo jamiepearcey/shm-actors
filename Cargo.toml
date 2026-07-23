@@ -9,6 +9,7 @@ members = [
     "crates/shm-stream",
     "crates/shm-runtime",
     "crates/shm-bench",
+    "crates/shm-arrowref-spike",
 ]
 # The cargo-fuzz harnesses (v0.4 stage N) are a separate nightly-only crate with
 # their own detached workspace; keep them out of the pinned-stable workspace so
