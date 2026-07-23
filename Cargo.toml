@@ -8,6 +8,7 @@ members = [
     "crates/shm-artifact",
     "crates/shm-stream",
     "crates/shm-runtime",
+    "crates/shm-bench",
 ]
 
 [workspace.package]
