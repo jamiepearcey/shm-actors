@@ -19,6 +19,9 @@
 #     the syscall-free unit tests run here (see `--skip` list + the crate set).
 #   * tsan — ThreadSanitizer over the concurrency-relevant crates' tests, to
 #     catch data races the loom model (stage L) can't (real threads, real time).
+#   * loom — model-checks the four lock-free cores under `--cfg loom` (stage L):
+#     the pin hazard handshake, the Treiber free-list, the task-claim CAS, and RCU
+#     install/read. loom is on stable, so this is an ordinary (non-nightly) job.
 #   * fuzz-smoke — builds all cargo-fuzz targets and runs each for a bounded
 #     time so a regression that reintroduces a parser panic fails CI fast.
 
@@ -132,6 +135,35 @@ jobs:
           for c in shm-core shm-ring shm-task shm-artifact; do
             cargo +nightly test -Zbuild-std -p "$c" --target "$host"
           done
+
+  # ---- loom: exhaustively model-check the four lock-free cores (stage L). ----
+  loom:
+    name: loom (stable)
+    runs-on: ubuntu-latest
+    env:
+      # The one switch that swaps the `substrate` newtypes onto loom's atomics and
+      # activates every `#[cfg(loom)]` harness. Applied to the whole build so
+      # shm-core (and its dependents) compile against the loom twin.
+      RUSTFLAGS: "--cfg loom"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # Each harness is a `#![cfg(loom)]` integration test; `--test <name>` compiles
+      # only that binary + the lib (under loom), so no segment-backed unit test is
+      # run. Each model is minimal (2 threads, 1–2 ops) and explored EXHAUSTIVELY —
+      # no `LOOM_MAX_PREEMPTIONS` bound is needed. `--nocapture` surfaces the
+      # per-harness interleaving counts in the log.
+      - name: loom — Treiber free-list (shm-core, core 2)
+        run: cargo test -p shm-core --test loom_treiber -- --nocapture
+      - name: loom — pin hazard handshake (shm-artifact, core 1)
+        run: cargo test -p shm-artifact --test loom_pin -- --nocapture
+      - name: loom — RCU install vs. read (shm-artifact, core 4)
+        run: cargo test -p shm-artifact --test loom_rcu -- --nocapture
+      - name: loom — task-claim CAS (shm-task, core 3)
+        run: cargo test -p shm-task --test loom_task -- --nocapture
 
   # ---- Fuzz smoke: build all targets, run each briefly so a parser regression
   #      (reintroduced panic / OOB on untrusted bytes) fails CI fast. ----

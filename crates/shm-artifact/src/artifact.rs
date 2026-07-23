@@ -57,7 +57,7 @@ use shm_core::{BorrowJournal, ChunkCtrl, ChunkDesc, PackedRef, Pool, PoolConfig,
 
 use crate::error::{Error, Result};
 use crate::event::{CommitKind, VersionEvent};
-use crate::head::{ArtifactHead, NO_VERSION, OWNER_NONE, SLOT_FREE, SLOT_FREEING, SLOT_LIVE};
+use crate::head::{ArtifactHead, NO_VERSION, OWNER_NONE};
 use crate::manifest::{read_manifest, read_manifest_checked, write_manifest, Manifest};
 
 /// How a commit relates the new version to its predecessor.
@@ -626,15 +626,16 @@ impl Artifact {
             // (2) Publish the pin: SeqCst fetch_add. This only ever *adds* then
             // (on failure) *subtracts* the same slot, so pin counts are never
             // under-counted — a chunk is never freed under a live reader.
-            slot.pins.fetch_add(1, SeqCst);
+            slot.publish_pin();
 
             // (3) Re-validate the slot is still {version == v, state == LIVE}
             // with SeqCst loads — the reader half of the hazard handshake. If it
             // flipped to SLOT_FREEING (a reclaimer won the election) or the
             // version moved, back off and retry. The `state` load is SeqCst and
             // ordered after the SeqCst bump: this is the Dekker pairing against
-            // the reclaimer's `FREEING`-store-then-pins-scan.
-            if slot.state.load(SeqCst) != SLOT_LIVE || slot.version.load(SeqCst) != v {
+            // the reclaimer's `FREEING`-store-then-pins-scan. (Both loads live in
+            // `PinSlot::accept_pin`, the loom-checked reader half — ADR-0004 L.)
+            if !slot.accept_pin(v) {
                 undo_pin(head, &self.data_seg, idx);
                 backoff(&mut spins);
                 continue;
@@ -720,7 +721,7 @@ impl Artifact {
             None => return Ok(false),
         };
         let slot = &head.pins[idx];
-        let prev = slot.pins.fetch_sub(1, SeqCst);
+        let prev = slot.unpin();
         if prev == 1 && head.current.load(SeqCst) != version {
             try_retire_version(head, &self.data_seg, version)?;
         }
@@ -856,7 +857,7 @@ fn release_chunk(pool: &Pool<'_>, desc: &ChunkDesc) {
 /// the slot tracks if this released its last pin while it is non-current.
 fn undo_pin(head: &ArtifactHead, data_seg: &Segment, idx: usize) {
     let slot = &head.pins[idx];
-    let prev = slot.pins.fetch_sub(1, SeqCst);
+    let prev = slot.unpin();
     if prev == 1 {
         let sv = slot.version.load(Acquire);
         if sv != 0 && head.current.load(SeqCst) != sv {
@@ -909,20 +910,18 @@ fn try_retire_version(head: &ArtifactHead, data_seg: &Segment, version: u64) -> 
         }
         // Elect the single reclaimer AND publish the `FREEING` hazard flag with a
         // SeqCst store, all in one CAS — this must precede the pin scan below.
-        if slot
-            .state
-            .compare_exchange(SLOT_LIVE, SLOT_FREEING, SeqCst, Acquire)
-            .is_err()
-        {
+        // (`elect_freeing`/`pin_scan`/`revert_live` are the loom-checked reclaimer
+        // half of the hazard handshake — ADR-0004 stage L.)
+        if !slot.elect_freeing() {
             return Ok(()); // someone else is reclaiming (or slot changed)
         }
 
         // Scan pins AFTER publishing FREEING (the handshake ordering).
-        if slot.pins.load(SeqCst) != 0 {
+        if slot.pin_scan() != 0 {
             // A reader is live (or a racing reader is mid-protocol). Do NOT free.
             // Revert so a later retire can proceed.
-            slot.state.store(SLOT_LIVE, SeqCst);
-            if slot.pins.load(SeqCst) != 0 {
+            slot.revert_live();
+            if slot.pin_scan() != 0 {
                 // A genuine live pin remains; its drop re-runs retire.
                 return Ok(());
             }
@@ -959,9 +958,7 @@ fn try_retire_version(head: &ArtifactHead, data_seg: &Segment, version: u64) -> 
         release_chunk(&pool, &manifest_chunk);
 
         // Return the slot to the free pool (FREEING -> FREE).
-        slot.version.store(0, Release);
-        slot.manifest.store(0, Release);
-        slot.state.store(SLOT_FREE, SeqCst);
+        slot.store_free();
         return Ok(());
     }
 }
@@ -1146,7 +1143,7 @@ impl Drop for PinState {
         let slot = &head.pins[self.slot_idx];
         // We hold a live pin, so the slot still tracks our version and cannot be
         // reclaimed/reused underneath us.
-        let prev = slot.pins.fetch_sub(1, SeqCst);
+        let prev = slot.unpin();
         if prev == 1 {
             // Last pin gone: reclaim if this version is no longer current.
             if head.current.load(SeqCst) != self.version {

@@ -41,7 +41,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use shm_core::ChunkDesc;
+use shm_core::{ChunkDesc, ShmU32, ShmU64};
 use shm_ring::{NoopNotifier, Notifier, Parker};
 
 use crate::error::{Error, Result};
@@ -142,26 +142,80 @@ const _: () = assert!(core::mem::align_of::<TaskQueueHeader>() == 8);
 #[repr(C)]
 pub struct TaskSlot {
     /// Lifecycle state (see the module state machine).
-    pub state: AtomicU32,
+    pub state: ShmU32,
     /// Exclusive owner worker id, or `0` when unclaimed.
-    pub owner: AtomicU32,
+    pub owner: ShmU32,
     /// Incarnation counter; bumped on every fresh submit, stable across reaps.
-    pub seq: AtomicU64,
+    pub seq: ShmU64,
     /// Absolute lease deadline in nanoseconds (same clock domain as `reap`'s
     /// `now`); a `CLAIMED` slot past its deadline is reaped.
-    pub deadline: AtomicU64,
+    pub deadline: ShmU64,
     /// Number of times a lapsed claim has been requeued.
-    pub retry: AtomicU32,
+    pub retry: ShmU32,
     /// Cooperative cancel flag: nonzero asks the owning worker to abort.
-    pub cancel: AtomicU32,
+    pub cancel: ShmU32,
     /// The submitted request descriptor (guarded by `state`).
     pub request: ChunkDesc,
     /// The worker's result descriptor, valid once `state == DONE`.
     pub result: ChunkDesc,
 }
 
+// 80-byte frozen ABI. Gated on `not(loom)`: the atomic fields are
+// `#[repr(transparent)]` substrate newtypes (byte-identical to the bare atomics in
+// production, loom's fat twin under `--cfg loom`); the loom build reconstructs the
+// claim state machine in ordinary memory and never overlays these bytes on shm.
+#[cfg(not(loom))]
 const _: () = assert!(core::mem::size_of::<TaskSlot>() == 80);
+#[cfg(not(loom))]
 const _: () = assert!(core::mem::align_of::<TaskSlot>() == 8);
+
+impl TaskSlot {
+    /// **The single claim arbitration point.** CAS `QUEUED → CLAIMED`; `true` iff
+    /// this caller won the task. The CAS makes claiming **exactly-once**: at most
+    /// one worker transitions any given `QUEUED` slot, so a second concurrent
+    /// claimer of the same slot always sees `false`. Extracted so the production
+    /// [`TaskQueue::claim`] path and the loom harness (ADR-0004 stage L, core 3)
+    /// run the *same* CAS body.
+    #[inline]
+    pub fn try_claim(&self) -> bool {
+        self.state
+            .compare_exchange(QUEUED, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// **Completer's exclusive-publish election.** CAS `CLAIMED → COMPLETING`;
+    /// `true` iff this worker won the right to publish its result. Races the reaper
+    /// out of `CLAIMED` — whichever CAS wins is the *sole* transition, so a task is
+    /// never both completed and requeued/failed. (Model-checked in core 3.)
+    #[inline]
+    pub fn try_begin_complete(&self) -> bool {
+        self.state
+            .compare_exchange(CLAIMED, COMPLETING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// **Reaper's requeue election.** CAS `CLAIMED → RESERVED` (a lapsed lease's
+    /// exclusive requeue reservation); `true` iff the reaper won. Loses to a
+    /// concurrent [`try_begin_complete`](Self::try_begin_complete) — the single-
+    /// transition guarantee.
+    #[inline]
+    pub fn try_begin_reap_requeue(&self) -> bool {
+        self.state
+            .compare_exchange(CLAIMED, RESERVED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// **Terminal-fail election.** CAS `CLAIMED → FAILED` — used both by a worker
+    /// giving up ([`ClaimedTask::fail`]) and by the reaper when the retry cap is
+    /// exhausted; `true` iff this caller won. Loses to a concurrent completer, so a
+    /// task is never both failed and completed.
+    #[inline]
+    pub fn try_fail(&self) -> bool {
+        self.state
+            .compare_exchange(CLAIMED, FAILED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
 
 /// Round `x` up to a multiple of `a` (a power of two).
 #[inline]
@@ -311,12 +365,12 @@ impl TaskQueue {
             let slots = base.add(slots_offset()).cast::<TaskSlot>();
             for i in 0..capacity as usize {
                 slots.add(i).write(TaskSlot {
-                    state: AtomicU32::new(EMPTY),
-                    owner: AtomicU32::new(OWNER_NONE),
-                    seq: AtomicU64::new(0),
-                    deadline: AtomicU64::new(0),
-                    retry: AtomicU32::new(0),
-                    cancel: AtomicU32::new(0),
+                    state: ShmU32::new(EMPTY),
+                    owner: ShmU32::new(OWNER_NONE),
+                    seq: ShmU64::new(0),
+                    deadline: ShmU64::new(0),
+                    retry: ShmU32::new(0),
+                    cancel: ShmU32::new(0),
                     request: ChunkDesc::ZERO,
                     result: ChunkDesc::ZERO,
                 });
@@ -525,11 +579,7 @@ impl TaskQueue {
             if slot.state.load(Ordering::Acquire) != QUEUED {
                 continue;
             }
-            if slot
-                .state
-                .compare_exchange(QUEUED, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
+            if !slot.try_claim() {
                 continue; // another worker claimed it first.
             }
             slot.owner.store(worker_id, Ordering::Release);
@@ -749,22 +799,14 @@ impl TaskQueue {
             let retry = slot.retry.load(Ordering::Acquire);
             if retry >= max_retries {
                 // Retry cap exhausted → terminal failure.
-                if slot
-                    .state
-                    .compare_exchange(CLAIMED, FAILED, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
+                if slot.try_fail() {
                     report.failed += 1;
                 }
                 continue;
             }
             // Requeue via an exclusive reservation so a new claimer cannot set
             // `owner` before we clear it (which would otherwise be clobbered).
-            if slot
-                .state
-                .compare_exchange(CLAIMED, RESERVED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
+            if slot.try_begin_reap_requeue() {
                 slot.retry.store(retry + 1, Ordering::Release);
                 slot.owner.store(OWNER_NONE, Ordering::Release);
                 // Keep `seq` — the correlation id must survive the retry.
@@ -849,11 +891,7 @@ impl ClaimedTask {
         }
         // Win the exclusive right to publish. Only one worker (and never the
         // reaper, which CASes `CLAIMED→RESERVED/FAILED`) can win this.
-        if slot
-            .state
-            .compare_exchange(CLAIMED, COMPLETING, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if !slot.try_begin_complete() {
             return Err(Error::Lost);
         }
         // SAFETY: we hold the exclusive `COMPLETING` reservation, so no other
@@ -876,11 +914,7 @@ impl ClaimedTask {
         if slot.seq.load(Ordering::Acquire) != self.seq {
             return Err(Error::StaleHandle);
         }
-        if slot
-            .state
-            .compare_exchange(CLAIMED, FAILED, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if !slot.try_fail() {
             return Err(Error::Lost);
         }
         self.queue.notify_done_if_waiters();

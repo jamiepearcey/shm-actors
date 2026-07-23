@@ -14,3 +14,15 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# loom (ADR-0004 stage L) is pulled in ONLY under `--cfg loom`, so production
+# builds never see it. `[target.'cfg(loom)'.dependencies]` (not dev-dependencies)
+# makes it available to the library too — the `substrate` module's loom twin lives
+# in the lib, not just the harnesses.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+# ADR-0004 stage L: `loom` is a first-class cfg (set via `RUSTFLAGS=--cfg loom`),
+# not a Cargo feature; register it so `-D warnings` does not trip on it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

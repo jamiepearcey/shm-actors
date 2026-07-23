@@ -1,9 +1,10 @@
 //! Per-chunk control words and the cross-process borrow state machine.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::desc::ChunkDesc;
 use crate::error::{Error, Result};
+use crate::substrate::ShmU32;
 
 /// Chunk is unowned and available for allocation.
 pub const FREE: u32 = 0;
@@ -54,17 +55,23 @@ pub const OWNER_NONE: u32 = 0;
 #[repr(C)]
 pub struct ChunkCtrl {
     /// Lifecycle state: [`FREE`], [`LOANED`], or [`PUBLISHED`].
-    pub state: AtomicU32,
+    pub state: ShmU32,
     /// Number of live shared `Sample` pins (only meaningful when `PUBLISHED`).
-    pub refcount: AtomicU32,
+    pub refcount: ShmU32,
     /// Exclusive owner actor id, or [`OWNER_NONE`] when unowned/released.
-    pub owner_actor: AtomicU32,
+    pub owner_actor: ShmU32,
     /// Recycle generation; bumped whenever the chunk transitions back to `FREE`.
-    pub generation: AtomicU32,
+    pub generation: ShmU32,
 }
 
-// The 16-byte size / 4-byte alignment is part of the frozen ABI.
+// The 16-byte size / 4-byte alignment is part of the frozen ABI. Gated on
+// `not(loom)` because each field is a `#[repr(transparent)]` [`ShmU32`] over the
+// real `AtomicU32` (byte-identical in production) but over loom's fat instrumented
+// twin under `--cfg loom`; the loom build reconstructs the algorithm in ordinary
+// memory and never overlays these bytes on shm, so the ABI size is immaterial there.
+#[cfg(not(loom))]
 const _: () = assert!(core::mem::size_of::<ChunkCtrl>() == 16);
+#[cfg(not(loom))]
 const _: () = assert!(core::mem::align_of::<ChunkCtrl>() == 4);
 
 impl ChunkCtrl {
@@ -81,10 +88,10 @@ impl ChunkCtrl {
         // the atomic wrapper values is well-defined.
         unsafe {
             ptr.write(ChunkCtrl {
-                state: AtomicU32::new(FREE),
-                refcount: AtomicU32::new(0),
-                owner_actor: AtomicU32::new(OWNER_NONE),
-                generation: AtomicU32::new(generation),
+                state: ShmU32::new(FREE),
+                refcount: ShmU32::new(0),
+                owner_actor: ShmU32::new(OWNER_NONE),
+                generation: ShmU32::new(generation),
             });
         }
     }

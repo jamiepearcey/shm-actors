@@ -6,7 +6,11 @@
 //! it is built entirely from atomics and placed into shared memory **by hand**
 //! (it is deliberately not `SharedPod`).
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
+use core::sync::atomic::Ordering::{Acquire, SeqCst};
+
+use shm_core::substrate::fence;
+use shm_core::{ShmU32, ShmU64};
 
 /// Head magic: little-endian bytes of `b"SHMAHEA2"`.
 ///
@@ -56,7 +60,18 @@ pub const fn lease_fence(packed: u64) -> u32 {
 /// prompt reclamation the number of *simultaneously* live versions is bounded
 /// by the number of versions any reader still pins, so this is generous for
 /// v0.1; exhaustion surfaces as [`Error::Unsupported`](crate::Error::Unsupported).
+#[cfg(not(loom))]
 pub const MAX_LIVE_VERSIONS: usize = 64;
+
+/// Under `--cfg loom` the pin table is shrunk to two slots so a whole
+/// [`ArtifactHead`] (which a core-1/core-4 harness reconstructs in ordinary
+/// memory and shares across `loom::thread`s) holds only a handful of loom atoms
+/// — keeping the model's state space tractable. The claim/find/retire logic is
+/// bounded by this constant, so the *same* code runs; only the table width, which
+/// is irrelevant to the modeled handshake, differs. It has no on-shm ABI meaning
+/// under loom (the size asserts are `not(loom)`-gated).
+#[cfg(loom)]
+pub const MAX_LIVE_VERSIONS: usize = 2;
 
 /// Pin-slot lifecycle: the slot is unused and claimable.
 pub const SLOT_FREE: u32 = 0;
@@ -95,17 +110,103 @@ pub const SLOT_RETIRED: u32 = SLOT_FREEING;
 #[repr(C)]
 pub struct PinSlot {
     /// The version this slot currently tracks; `0` when the slot is free.
-    pub version: AtomicU64,
+    pub version: ShmU64,
     /// Packed [`PackedRef`](shm_core::PackedRef) to this version's manifest chunk.
-    pub manifest: AtomicU64,
+    pub manifest: ShmU64,
     /// Count of live pins on this version (readers freezing it).
-    pub pins: AtomicU32,
+    pub pins: ShmU32,
     /// Slot lifecycle state; gates single-winner reclamation.
-    pub state: AtomicU32,
+    pub state: ShmU32,
 }
 
+// 24-byte frozen ABI. Gated on `not(loom)`: each field is a
+// `#[repr(transparent)]` substrate newtype (byte-identical to the bare atomic in
+// production, loom's fat twin under `--cfg loom`); the loom build reconstructs the
+// handshake in ordinary memory and never overlays these bytes on shm.
+#[cfg(not(loom))]
 const _: () = assert!(core::mem::size_of::<PinSlot>() == 24);
+#[cfg(not(loom))]
 const _: () = assert!(core::mem::align_of::<PinSlot>() == 8);
+
+impl PinSlot {
+    /// **Reader, hazard-handshake step 2 — publish the pin.** A `SeqCst`
+    /// `fetch_add` on the pin count, ordered before [`accept_pin`](Self::accept_pin)'s
+    /// revalidation. Publishing before revalidating is the reader half of the
+    /// Dekker handshake against the reclaimer's `FREEING`-store-before-scan.
+    #[inline]
+    pub fn publish_pin(&self) {
+        self.pins.fetch_add(1, SeqCst);
+    }
+
+    /// **Reader, hazard-handshake step 3 — revalidate.** After
+    /// [`publish_pin`](Self::publish_pin), accept the pin iff the slot still tracks
+    /// `{version == v, state == SLOT_LIVE}` (both `SeqCst` loads). A `false` means
+    /// a reclaimer won the `SLOT_FREEING` election or the version moved, so the
+    /// caller must undo its bump ([`unpin`](Self::unpin)) and retry.
+    ///
+    /// Opens with a `fence(SeqCst)`: the **StoreLoad barrier** ordering the
+    /// preceding pin publish before these loads. This is the reader half of the
+    /// Dekker handshake (paired with the reclaimer's fence in
+    /// [`pin_scan`](Self::pin_scan)); see [`fence`] for why it is explicit.
+    #[inline]
+    pub fn accept_pin(&self, v: u64) -> bool {
+        fence(SeqCst);
+        self.state.load(SeqCst) == SLOT_LIVE && self.version.load(SeqCst) == v
+    }
+
+    /// Undo a speculative [`publish_pin`](Self::publish_pin) — a `SeqCst`
+    /// `fetch_sub`, returning the previous pin count (so a caller can detect it
+    /// released the last pin and drive reclamation).
+    #[inline]
+    pub fn unpin(&self) -> u32 {
+        self.pins.fetch_sub(1, SeqCst)
+    }
+
+    /// **Reclaimer, step 1 — elect + publish the hazard flag.** One `SeqCst` CAS
+    /// `SLOT_LIVE → SLOT_FREEING`; `true` means this caller is the sole elected
+    /// reclaimer and has published `FREEING` **before** the pin scan. Ordered
+    /// before [`pin_scan`](Self::pin_scan): the store-before-scan is the reclaimer
+    /// half of the Dekker handshake.
+    #[inline]
+    pub fn elect_freeing(&self) -> bool {
+        self.state
+            .compare_exchange(SLOT_LIVE, SLOT_FREEING, SeqCst, Acquire)
+            .is_ok()
+    }
+
+    /// **Reclaimer, step 2 — scan pins.** A `SeqCst` load of the pin count,
+    /// ordered *after* [`elect_freeing`](Self::elect_freeing). `0` ⇒ safe to free;
+    /// `> 0` ⇒ a reader is (or may be) live, so revert.
+    ///
+    /// Opens with a `fence(SeqCst)`: the **StoreLoad barrier** ordering the
+    /// `SLOT_FREEING` store (published by `elect_freeing`) before this scan. This
+    /// is the reclaimer half of the Dekker handshake (paired with the reader's
+    /// fence in [`accept_pin`](Self::accept_pin)); see [`fence`] for why it is
+    /// explicit.
+    #[inline]
+    pub fn pin_scan(&self) -> u32 {
+        fence(SeqCst);
+        self.pins.load(SeqCst)
+    }
+
+    /// **Reclaimer — revert.** `SeqCst` store `SLOT_FREEING → SLOT_LIVE` when the
+    /// scan saw a live pin; only the elected reclaimer leaves `FREEING`, so this
+    /// needs no CAS.
+    #[inline]
+    pub fn revert_live(&self) {
+        self.state.store(SLOT_LIVE, SeqCst);
+    }
+
+    /// **Reclaimer — free.** Clear `version`/`manifest` and store `SLOT_FREE`
+    /// (`SeqCst`), returning the slot to the claimable pool once the version's
+    /// chunks have been released.
+    #[inline]
+    pub fn store_free(&self) {
+        self.version.store(0, Ordering::Release);
+        self.manifest.store(0, Ordering::Release);
+        self.state.store(SLOT_FREE, SeqCst);
+    }
+}
 
 /// The atomic RCU/MVCC control block for one artifact.
 ///
@@ -168,20 +269,20 @@ const _: () = assert!(core::mem::align_of::<PinSlot>() == 8);
 #[repr(C)]
 pub struct ArtifactHead {
     /// Must equal [`HEAD_MAGIC`] once initialised.
-    pub magic: AtomicU64,
+    pub magic: ShmU64,
     /// The current (latest installed) version number; [`NO_VERSION`] until the
     /// first commit.
-    pub current: AtomicU64,
+    pub current: ShmU64,
     /// Packed [`PackedRef`](shm_core::PackedRef) to the current version's
     /// manifest chunk.
-    pub manifest_desc: AtomicU64,
+    pub manifest_desc: ShmU64,
     /// The **fenced** exclusive write lease: `pack_lease(owner, fence)`. `owner ==
     /// OWNER_NONE` (0) means free; `fence` is a monotonic generation bumped on
     /// every release. See the type-level docs for the acquire/release protocol.
-    pub write_lease: AtomicU64,
+    pub write_lease: ShmU64,
     /// The interned Arrow schema id of the artifact's data (set on first commit;
     /// informational — the authoritative id is in each manifest).
-    pub schema_id: AtomicU32,
+    pub schema_id: ShmU32,
     /// Fixed table of live-version pin counters for reclamation.
     pub pins: [PinSlot; MAX_LIVE_VERSIONS],
 }
@@ -191,6 +292,29 @@ impl ArtifactHead {
     /// segment's payload must be at least this large.
     pub const fn region_bytes() -> usize {
         core::mem::size_of::<ArtifactHead>()
+    }
+
+    /// Build a fresh head **by value**: magic set, no version, no writer, every
+    /// pin slot free.
+    ///
+    /// Factored out of [`init_at`](Self::init_at) so a loom harness (ADR-0004
+    /// stage L) can construct a real `ArtifactHead` in ordinary heap memory and
+    /// share it across `loom::thread`s, exercising the *same* RCU install / pin /
+    /// retire code the production overlay runs.
+    pub fn fresh() -> ArtifactHead {
+        ArtifactHead {
+            magic: ShmU64::new(HEAD_MAGIC),
+            current: ShmU64::new(NO_VERSION),
+            manifest_desc: ShmU64::new(0),
+            write_lease: ShmU64::new(pack_lease(OWNER_NONE, 0)),
+            schema_id: ShmU32::new(0),
+            pins: core::array::from_fn(|_| PinSlot {
+                version: ShmU64::new(0),
+                manifest: ShmU64::new(0),
+                pins: ShmU32::new(0),
+                state: ShmU32::new(SLOT_FREE),
+            }),
+        }
     }
 
     /// Initialise a fresh head in place: magic set, no version, no writer, every
@@ -206,19 +330,7 @@ impl ArtifactHead {
         // owned for this initialising write. Atomics are `#[repr(C)]` over their
         // integer, so an in-place `write` of the struct is well-defined.
         unsafe {
-            ptr.write(ArtifactHead {
-                magic: AtomicU64::new(HEAD_MAGIC),
-                current: AtomicU64::new(NO_VERSION),
-                manifest_desc: AtomicU64::new(0),
-                write_lease: AtomicU64::new(pack_lease(OWNER_NONE, 0)),
-                schema_id: AtomicU32::new(0),
-                pins: core::array::from_fn(|_| PinSlot {
-                    version: AtomicU64::new(0),
-                    manifest: AtomicU64::new(0),
-                    pins: AtomicU32::new(0),
-                    state: AtomicU32::new(SLOT_FREE),
-                }),
-            });
+            ptr.write(ArtifactHead::fresh());
         }
     }
 

@@ -233,12 +233,12 @@ fn pool_treiber_aba_safety() {
 
 #[test]
 fn chunkctrl_state_machine() {
-    use core::sync::atomic::AtomicU32;
+    use shm_core::ShmU32;
     let ctrl = ChunkCtrl {
-        state: AtomicU32::new(FREE),
-        refcount: AtomicU32::new(0),
-        owner_actor: AtomicU32::new(0),
-        generation: AtomicU32::new(0),
+        state: ShmU32::new(FREE),
+        refcount: ShmU32::new(0),
+        owner_actor: ShmU32::new(0),
+        generation: ShmU32::new(0),
     };
 
     // FREE -> LOANED
@@ -273,12 +273,12 @@ fn chunkctrl_state_machine() {
 
 #[test]
 fn chunkctrl_drop_loan_bumps_generation() {
-    use core::sync::atomic::AtomicU32;
+    use shm_core::ShmU32;
     let ctrl = ChunkCtrl {
-        state: AtomicU32::new(FREE),
-        refcount: AtomicU32::new(0),
-        owner_actor: AtomicU32::new(0),
-        generation: AtomicU32::new(5),
+        state: ShmU32::new(FREE),
+        refcount: ShmU32::new(0),
+        owner_actor: ShmU32::new(0),
+        generation: ShmU32::new(5),
     };
     ctrl.try_loan(1).unwrap();
     ctrl.drop_loan().unwrap();

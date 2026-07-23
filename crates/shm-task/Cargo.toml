@@ -13,3 +13,12 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# loom (ADR-0004 stage L): pulled in ONLY under `--cfg loom` (see shm-core).
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+# ADR-0004 stage L: `loom` is a first-class cfg (set via `RUSTFLAGS=--cfg loom`),
+# not a Cargo feature; register it so `-D warnings` does not trip on it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

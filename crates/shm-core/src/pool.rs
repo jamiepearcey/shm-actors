@@ -21,12 +21,13 @@
 //! [`Pool::alloc`] mints the descriptor's generation from that control word, so
 //! a descriptor always carries the generation the chunk had when handed out.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 use crate::ctrl::ChunkCtrl;
 use crate::desc::ChunkDesc;
 use crate::error::{Error, Result};
 use crate::segment::{Segment, HEADER_SIZE};
+use crate::substrate::ShmU64;
 
 /// Magic for a pool header: little-endian `b"SHMPOOL1"`.
 pub const POOL_MAGIC: u64 = u64::from_le_bytes(*b"SHMPOOL1");
@@ -101,8 +102,11 @@ struct PoolHeader {
 /// On-segment per-class header. `#[repr(C)]`. Free-list head is atomic.
 #[repr(C)]
 struct ClassHeader {
-    /// `(tag << 32) | slot`; `slot == EMPTY` means the free list is empty.
-    head: AtomicU64,
+    /// `(tag << 32) | slot`; `slot == EMPTY` means the free list is empty. A
+    /// [`ShmU64`] (`#[repr(transparent)]` over `AtomicU64`), so this header's
+    /// on-shm layout is unchanged while the Treiber CAS loop it drives can be
+    /// model-checked under loom (ADR-0004 stage L).
+    head: ShmU64,
     chunk_size: u32,
     chunk_count: u32,
     base_index: u32, // global chunk index of local chunk 0
@@ -119,6 +123,60 @@ fn head_pack(tag: u32, slot: u32) -> u64 {
 #[inline]
 fn head_unpack(v: u64) -> (u32, u32) {
     ((v >> 32) as u32, (v & 0xffff_ffff) as u32)
+}
+
+/// Treiber-stack **pop** on a tagged free-list `head`, returning the popped slot
+/// (or `None` when the list is empty).
+///
+/// This is the pure ABA-safe pop algorithm, factored out of [`Pool::alloc`] so it
+/// can be model-checked under loom (ADR-0004 stage L) against the *same* bytes the
+/// production allocator runs. `read_next(slot)` yields the intrusive next-link
+/// stored in `slot`'s node; in production that link lives in the chunk's payload
+/// (resolved by pointer arithmetic in the addressing layer), while a loom harness
+/// supplies an ordinary in-memory link table — the CAS loop itself is identical.
+///
+/// Each successful pop bumps the 32-bit generation **tag** in the head's high
+/// half, so a stale CAS whose slot came back via an intervening pop/push (the
+/// classic ABA sequence) fails on the moved tag and retries.
+#[inline]
+pub fn treiber_pop<R: Fn(u32) -> u32>(head: &ShmU64, read_next: R) -> Option<u32> {
+    loop {
+        let cur = head.load(Ordering::Acquire);
+        let (tag, slot) = head_unpack(cur);
+        if slot == EMPTY {
+            return None;
+        }
+        let next = read_next(slot);
+        let new = head_pack(tag.wrapping_add(1), next);
+        if head
+            .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(slot);
+        }
+    }
+}
+
+/// Treiber-stack **push** of `slot` onto a tagged free-list `head`.
+///
+/// The pure ABA-safe push algorithm, factored out of [`Pool::free`] for loom
+/// model-checking (see [`treiber_pop`]). `write_next(slot, next)` records the
+/// intrusive next-link into `slot`'s node before the head CAS publishes it; the
+/// head's tag is bumped on every push, matching the pop side.
+#[inline]
+pub fn treiber_push<W: Fn(u32, u32)>(head: &ShmU64, slot: u32, write_next: W) {
+    loop {
+        let cur = head.load(Ordering::Acquire);
+        let (tag, old_head) = head_unpack(cur);
+        write_next(slot, old_head);
+        let new = head_pack(tag.wrapping_add(1), slot);
+        if head
+            .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
 }
 
 /// A handle to a size-class pool laid out inside a [`Segment`].
@@ -213,7 +271,7 @@ impl<'s> Pool<'s> {
                 }
                 let head_slot = if c.chunk_count > 0 { 0 } else { EMPTY };
                 ch.write(ClassHeader {
-                    head: AtomicU64::new(head_pack(0, head_slot)),
+                    head: ShmU64::new(head_pack(0, head_slot)),
                     chunk_size: c.chunk_size,
                     chunk_count: c.chunk_count,
                     base_index: layout.base_indices[i],
@@ -329,23 +387,15 @@ impl<'s> Pool<'s> {
             .ok_or(Error::LayoutOverflow("allocation exceeds largest size class"))?;
         let class = self.class(class_idx);
 
-        // Treiber pop.
-        let local = loop {
-            let cur = class.head.load(Ordering::Acquire);
-            let (tag, slot) = head_unpack(cur);
-            if slot == EMPTY {
-                return Err(Error::PoolExhausted);
-            }
+        // Treiber pop (the ABA-safe CAS loop lives in `treiber_pop`; the closure
+        // is the addressing layer resolving a slot's intrusive next-link out of
+        // the chunk payload — the only per-node pointer arithmetic).
+        let local = match treiber_pop(&class.head, |slot| {
             // SAFETY: `slot < chunk_count`; the first 4 bytes hold the next link.
-            let next = unsafe { *self.chunk_ptr(class, slot).cast::<u32>() };
-            let new = head_pack(tag.wrapping_add(1), next);
-            if class
-                .head
-                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                break slot;
-            }
+            unsafe { *self.chunk_ptr(class, slot).cast::<u32>() }
+        }) {
+            Some(slot) => slot,
+            None => return Err(Error::PoolExhausted),
         };
 
         let global = class.base_index as usize + local as usize;
@@ -372,23 +422,16 @@ impl<'s> Pool<'s> {
         let (class_idx, local, _global) = self.locate(desc.offset)?;
         let class = self.class(class_idx);
 
-        // Treiber push.
-        loop {
-            let cur = class.head.load(Ordering::Acquire);
-            let (tag, slot) = head_unpack(cur);
-            // SAFETY: `local < chunk_count`; write the next link into the chunk.
+        // Treiber push (the ABA-safe CAS loop lives in `treiber_push`; the closure
+        // is the addressing layer writing the freed node's next-link into the
+        // chunk payload).
+        treiber_push(&class.head, local, |slot, next| {
+            // SAFETY: `slot < chunk_count`; write the next link into the chunk.
             unsafe {
-                *self.chunk_ptr(class, local).cast::<u32>() = slot;
+                *self.chunk_ptr(class, slot).cast::<u32>() = next;
             }
-            let new = head_pack(tag.wrapping_add(1), local);
-            if class
-                .head
-                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
+        });
+        Ok(())
     }
 
     /// Resolve a segment-base `offset` to `(class_idx, local_idx, global_idx)`.

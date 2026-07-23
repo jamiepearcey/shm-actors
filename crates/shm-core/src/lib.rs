@@ -34,6 +34,7 @@ pub mod platform;
 pub mod pod;
 pub mod pool;
 pub mod segment;
+pub mod substrate;
 
 pub use ctrl::{ChunkCtrl, FREE, LOANED, OWNER_NONE, PUBLISHED};
 pub use desc::{ChunkDesc, PackedRef};
@@ -49,3 +50,4 @@ pub use platform::{
 pub use pod::SharedPod;
 pub use pool::{Pool, PoolConfig, SizeClass};
 pub use segment::{Segment, SegmentHeader, LAYOUT_VERSION, SEGMENT_MAGIC};
+pub use substrate::{ShmU32, ShmU64};
