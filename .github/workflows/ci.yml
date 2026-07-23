@@ -71,6 +71,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       # Per-crate tests: the whole-workspace test run serializes shm segment
       # setup/teardown and is slower + noisier than testing crate-by-crate.
+      #
+      # The v0.4 stage O adversarial-timing suites live under shm-runtime and run
+      # here automatically: `crash_matrix` (kill-at-every-transition), `coordinator_
+      # death`, and `torn_write` are hard CI gates, and `churn_soak` runs its short
+      # (~4 s) default variant. Set `SHM_SOAK_SECS` (e.g. 60) to opt into a longer
+      # soak locally; it is intentionally NOT lengthened in CI to keep the gate fast.
       - name: Test (per crate)
         run: |
           for c in shm-core shm-arrow shm-ring shm-task shm-artifact shm-stream shm-runtime; do

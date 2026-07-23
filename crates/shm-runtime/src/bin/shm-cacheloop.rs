@@ -11,7 +11,20 @@
 //! shm-cacheloop worker-hang   --uds <path> --result <file> [--lease-ms <n>]  # claims, hangs
 //! shm-cacheloop worker-pin-hang --uds <path> --result <file>  # journal-pins a version, hangs
 //! shm-cacheloop writer-hang   --uds <path> --result <file>   # takes the exclusive lease, hangs
+//! shm-cacheloop kill-at       --uds <path> --result <file> --kill-at <point> [--art <name>]
+//! shm-cacheloop churn         --uds <path> --seed <n> [--art <name>]
 //! ```
+//!
+//! The v0.4 stage O roles (`tests/crash_matrix.rs`, `tests/churn_soak.rs`):
+//!
+//! - `kill-at` drives one primitive to a precise, reclaimable shared state
+//!   (`--kill-at` = `stage-1`|`stage-2`|`lease-only`|`lease-stage`|`art-pin`|
+//!   `payload-pin`|`task-claim`|`task-submit`; also `SHM_KILL_AT`), writes a
+//!   `READY` marker, then `std::process::abort()`s — dying with the resource held
+//!   and no destructor run, so only the coordinator's journal replay can reclaim
+//!   it.
+//! - `churn` runs a deterministic (`--seed`) loop of reclaimable operations until
+//!   the driver `kill -9`s it, for the churn-soak zero-leak census.
 //!
 //! The `--nested` flag (ADR-0003 S5 "hostile cache loop") routes the
 //! `producer`, `worker-pin-hang`, and `writer-hang` roles at the **nested
@@ -35,12 +48,13 @@
 //! `worker-hang` / `producer-hang` drive the two crash scenarios.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use shm_arrow::SchemaRegistry;
 use shm_core::ChunkDesc;
+use shm_ring::Msg;
 use shm_runtime::demo::{
-    demo_batch, demo_derive, demo_schema, nested_batch, nested_schema, CACHE_ARTIFACT,
+    demo_batch, demo_derive, demo_schema, nested_batch, nested_schema, CACHE_ARTIFACT, DEMO_TOPIC,
     NESTED_ARTIFACT,
 };
 use shm_runtime::{Coordinator, Node, RuntimeConfig};
@@ -61,10 +75,15 @@ fn main() {
         "worker-hang" => run_worker(&opts, /*hang=*/ true),
         "worker-pin-hang" => run_pin_hang(&opts),
         "writer-hang" => run_writer_hang(&opts),
+        // v0.4 stage O: self-aborting fault injection at a specific transition.
+        "kill-at" => run_kill_at(&opts),
+        // v0.4 stage O: seeded churn-soak worker (registers/publishes/pins/
+        // commits/submits in a deterministic loop until the driver kills it).
+        "churn" => run_churn(&opts),
         other => {
             eprintln!(
                 "unknown role {other:?}; expected coordinator|producer|producer-hang|\
-                 watcher|worker|worker-hang|worker-pin-hang|writer-hang"
+                 watcher|worker|worker-hang|worker-pin-hang|writer-hang|kill-at|churn"
             );
             2
         }
@@ -81,6 +100,14 @@ struct Opts {
     /// S5: operate on the nested Struct/List multi-chunk artifact under its
     /// coordinator-negotiated schema, rather than the flat demo one.
     nested: bool,
+    /// v0.4/O: the fault-injection point the `kill-at` role drives to before
+    /// `std::process::abort()`ing (also readable from `SHM_KILL_AT`).
+    kill_at: Option<String>,
+    /// v0.4/O: the artifact name a `kill-at`/`churn` actor operates on (defaults
+    /// to the flat cache artifact; lets each matrix point use an isolated name).
+    art: Option<String>,
+    /// v0.4/O: deterministic PRNG seed for the `churn` role.
+    seed: u64,
 }
 
 impl Opts {
@@ -90,6 +117,9 @@ impl Opts {
         let mut seg_base = 1u32;
         let mut lease_ms = 500u64;
         let mut nested = false;
+        let mut kill_at = None;
+        let mut art = None;
+        let mut seed = 0u64;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
@@ -113,6 +143,18 @@ impl Opts {
                     nested = true;
                     i += 1;
                 }
+                "--kill-at" => {
+                    kill_at = args.get(i + 1).cloned();
+                    i += 2;
+                }
+                "--art" => {
+                    art = args.get(i + 1).cloned();
+                    i += 2;
+                }
+                "--seed" => {
+                    seed = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                    i += 2;
+                }
                 _ => i += 1,
             }
         }
@@ -122,6 +164,9 @@ impl Opts {
             seg_base,
             lease_ms,
             nested,
+            kill_at,
+            art,
+            seed,
         }
     }
 }
@@ -521,6 +566,356 @@ fn run_writer_hang(opts: &Opts) -> i32 {
     println!("writer-hang holds the exclusive lease (no commit)");
     loop {
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// The churn-soak artifact name (v0.4 stage O §4).
+pub const CHURN_ARTIFACT: &str = "churn";
+
+/// v0.4 stage O §1 — **kill at a specific state transition**.
+///
+/// The actor connects, drives one primitive to a precise, *reclaimable* shared
+/// state (a staged stream chunk, a held write lease, a held artifact/chunk pin, a
+/// claimed/submitted task), writes a `READY` marker so the driving test knows the
+/// state was reached, and then `std::process::abort()`s — dying with the resource
+/// still held and **no destructor run**, exactly as a `kill -9` would. Because
+/// `abort()` never unwinds, every in-scope guard (the `StreamWriter`, `Committer`,
+/// `VersionPin`, `Pin`, `ClaimedTask`) leaks its shm state rather than releasing
+/// it, so the coordinator's lease-monitor journal replay is the only thing that
+/// can reclaim it — which is the whole point.
+///
+/// The point is selected by `--kill-at <point>` or the `SHM_KILL_AT` env var; the
+/// artifact it operates on is `--art <name>` (default the flat cache artifact).
+/// See `tests/crash_matrix.rs` for the transition ⇄ census assertion mapping.
+fn run_kill_at(opts: &Opts) -> i32 {
+    let point = match opts
+        .kill_at
+        .clone()
+        .or_else(|| std::env::var("SHM_KILL_AT").ok())
+    {
+        Some(p) => p,
+        None => {
+            eprintln!("kill-at: no injection point (pass --kill-at <point> or SHM_KILL_AT)");
+            return 2;
+        }
+    };
+    let art = opts.art.as_deref().unwrap_or(CACHE_ARTIFACT);
+    let name = format!("kill-at-{point}");
+    // The v0.1 payload broadcast path (`payload-pin`) has no coordinator schema
+    // resolve, so its consumer seeds the demo schema identically (the v0.1
+    // contract); every other point negotiates the id through the coordinator
+    // (item E) and so starts from an empty local cache.
+    let reg = if point == "payload-pin" {
+        Arc::new(SchemaRegistry::with_schemas(&[demo_schema()]))
+    } else {
+        registry()
+    };
+    let mut node = match Node::connect(&opts.uds, &name, reg) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{name} connect failed: {e}");
+            return 1;
+        }
+    };
+    node.start_heartbeat(Duration::from_millis(150));
+
+    // Points that stage/commit an artifact need its schema negotiated first.
+    let ready = |extra: &str| write_result(opts, &format!("READY {point}{extra}\n"));
+
+    match point.as_str() {
+        // --- Stream staging (artifact data pool): staged chunk(s) LOANED +
+        //     journalled, never committed. Journal replay frees them. ---
+        "stage-1" | "stage-2" => {
+            if let Err(e) = open_and_intern(&mut node, art, opts) {
+                eprintln!("{name} setup failed: {e}");
+                return 1;
+            }
+            let expect = node.artifact(art).map(|a| a.current_version()).unwrap_or(0);
+            let stream = node.stream(art).expect("stream");
+            let mut writer = stream
+                .writer(Commit::Replace, Coordination::Optimistic { expect_version: expect })
+                .expect("optimistic writer");
+            writer.append_batch(&art_batch(opts)).expect("append 1");
+            if point == "stage-2" {
+                writer.append_batch(&art_batch(opts)).expect("append 2");
+            }
+            ready(&format!(" staged={}", writer.staged_len()));
+            // `writer` is still in scope → abort() leaks the staged loans.
+            std::process::abort();
+        }
+
+        // --- Exclusive write lease held, NOTHING staged (item K, lease only). ---
+        "lease-only" => {
+            if let Err(e) = open_and_intern(&mut node, art, opts) {
+                eprintln!("{name} setup failed: {e}");
+                return 1;
+            }
+            let stream = node.stream(art).expect("stream");
+            let _writer = stream
+                .writer(Commit::Replace, Coordination::Exclusive)
+                .expect("exclusive writer (lease held)");
+            ready("");
+            std::process::abort();
+        }
+
+        // --- Exclusive write lease held AND a batch staged (item K + stream). ---
+        "lease-stage" => {
+            if let Err(e) = open_and_intern(&mut node, art, opts) {
+                eprintln!("{name} setup failed: {e}");
+                return 1;
+            }
+            let stream = node.stream(art).expect("stream");
+            let mut writer = stream
+                .writer(Commit::Replace, Coordination::Exclusive)
+                .expect("exclusive writer");
+            writer.append_batch(&art_batch(opts)).expect("append");
+            ready("");
+            std::process::abort();
+        }
+
+        // --- Artifact version pin held on a (soon-superseded) version (item J).
+        //     Waits until the driver supersedes the pinned version so the crash
+        //     reclaim genuinely retires a NON-current pinned version. ---
+        "art-pin" => {
+            if let Err(e) = node.open_artifact(art) {
+                eprintln!("{name} open_artifact failed: {e}");
+                return 1;
+            }
+            let pin = loop {
+                match node.pin_artifact(art) {
+                    Ok(p) => break p,
+                    Err(_) => std::thread::sleep(Duration::from_millis(15)),
+                }
+            };
+            let pinned = pin.version();
+            ready(&format!(" v={pinned}"));
+            // Hold the pin (heartbeating) until the driver commits a newer version,
+            // so at abort time the pinned version is non-current → its reclaim
+            // must retire it. Bounded so a stuck driver never hangs the actor.
+            let start = Instant::now();
+            while node.artifact(art).map(|a| a.current_version()).unwrap_or(pinned) <= pinned {
+                if start.elapsed() > Duration::from_secs(30) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            // `pin` is still in scope → abort() leaks its ArtifactPin journal entry.
+            let _ = &pin;
+            std::process::abort();
+        }
+
+        // --- Payload shared pin held (v0.1 path). Subscribe, receive the driver's
+        //     published batch, journal-pin it zero-copy, then abort holding it. ---
+        "payload-pin" => {
+            let mut sub = match node.subscribe(DEMO_TOPIC) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{name} subscribe failed: {e}");
+                    return 1;
+                }
+            };
+            let desc = loop {
+                match sub.recv() {
+                    Msg::Sample(d) => break d,
+                    Msg::Lagged(_) => continue,
+                }
+            };
+            let pin = match node.pin_and_read(&desc) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{name} pin_and_read failed: {e}");
+                    return 1;
+                }
+            };
+            ready(&format!(" off={}", pin.desc.offset));
+            // `pin` in scope → abort() leaks the journalled shared pin.
+            let _ = &pin;
+            std::process::abort();
+        }
+
+        // --- Task claimed, never completed (worker death). Reap requeues it. ---
+        "task-claim" => {
+            let queue = match node.task_queue() {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("{name} task_queue failed: {e}");
+                    return 1;
+                }
+            };
+            let lease = Duration::from_millis(opts.lease_ms).as_nanos() as u64;
+            let task = match queue.claim_blocking(lease) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("{name} claim failed: {e}");
+                    return 1;
+                }
+            };
+            let id = task.task_id();
+            ready(&format!(" {} {}", id.slot_idx, id.seq));
+            let _ = &task;
+            std::process::abort();
+        }
+
+        // --- Task submitted, submitter dies before any worker claims. The task
+        //     must stay claimable (a dead submitter wedges nothing). ---
+        "task-submit" => {
+            let queue = match node.task_queue() {
+                Ok(q) => q,
+                Err(e) => {
+                    eprintln!("{name} task_queue failed: {e}");
+                    return 1;
+                }
+            };
+            let request = ChunkDesc {
+                schema_id: 7,
+                ..ChunkDesc::ZERO
+            };
+            let deadline = now_nanos() + Duration::from_secs(3600).as_nanos() as u64;
+            let handle = match queue.submit(request, deadline) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("{name} submit failed: {e}");
+                    return 1;
+                }
+            };
+            ready(&format!(" {} {}", handle.slot_idx, handle.seq));
+            std::process::abort();
+        }
+
+        other => {
+            eprintln!("kill-at: unknown point {other:?}");
+            2
+        }
+    }
+}
+
+/// Open `art` and negotiate its schema id with the coordinator (empty local
+/// registry, item E) — the setup a staging/lease injection point needs.
+fn open_and_intern(node: &mut Node, art: &str, opts: &Opts) -> shm_runtime::Result<()> {
+    node.open_artifact(art)?;
+    node.intern_schema(&art_schema(opts))?;
+    Ok(())
+}
+
+/// A tiny deterministic xorshift64* PRNG so the churn soak is reproducible from a
+/// fixed seed (no external `rand` dependency in this substrate).
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Rng {
+        // Avoid the zero fixed-point; still fully seed-determined.
+        Rng(seed ^ 0x9E37_79B9_7F4A_7C15 | 1)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n.max(1)
+    }
+}
+
+/// v0.4 stage O §4 — a **churn-soak worker**.
+///
+/// Registers against the coordinator and runs a deterministic (seeded) loop of
+/// reclaimable operations against the shared churn artifact + task queue: commit a
+/// version (optimistic or exclusive), take + drop a journalled version pin, submit
+/// a task, claim + (maybe) complete a task. Every hold is journalled, so whenever
+/// the driver `kill -9`s this worker mid-operation the coordinator's replay
+/// reclaims it. Runs until killed; the driver's periodic census asserts the pool
+/// never trends downward and returns to baseline at quiescence.
+fn run_churn(opts: &Opts) -> i32 {
+    let art = opts.art.as_deref().unwrap_or(CHURN_ARTIFACT);
+    let name = format!("churn-{}", opts.seed);
+    let mut node = match Node::connect(&opts.uds, &name, registry()) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("{name} connect failed: {e}");
+            return 1;
+        }
+    };
+    node.start_heartbeat(Duration::from_millis(150));
+    if let Err(e) = node.open_artifact(art) {
+        eprintln!("{name} open_artifact failed: {e}");
+        return 1;
+    }
+    if let Err(e) = node.intern_schema(&art_schema(opts)) {
+        eprintln!("{name} intern_schema failed: {e}");
+        return 1;
+    }
+    if let Err(e) = node.open_task_queue() {
+        eprintln!("{name} open_task_queue failed: {e}");
+        return 1;
+    }
+
+    let mut rng = Rng::new(opts.seed);
+    write_result(opts, "CHURNING\n");
+    loop {
+        let op = rng.below(6);
+        match op {
+            0 | 1 => {
+                // Optimistic commit (Replace) over the current version. Concurrent
+                // committers race; the loser rolls back cleanly (freeing staged).
+                let expect = node.artifact(art).map(|a| a.current_version()).unwrap_or(0);
+                if let Ok(stream) = node.stream(art) {
+                    if let Ok(mut w) = stream
+                        .writer(Commit::Replace, Coordination::Optimistic { expect_version: expect })
+                    {
+                        if w.append_batch(&art_batch(opts)).is_ok() {
+                            let _ = w.commit();
+                        }
+                    }
+                }
+            }
+            2 => {
+                // Exclusive commit; most callers see WriteLocked and back off.
+                if let Ok(stream) = node.stream(art) {
+                    if let Ok(mut w) = stream.writer(Commit::Replace, Coordination::Exclusive) {
+                        if w.append_batch(&art_batch(opts)).is_ok() {
+                            let _ = w.commit();
+                        }
+                    }
+                }
+            }
+            3 => {
+                // Take a journalled pin and hold it briefly, then drop it (a clean
+                // retire path). A crash while holding it is reclaimed by replay.
+                if let Ok(pin) = node.pin_artifact(art) {
+                    std::thread::sleep(Duration::from_millis(rng.below(8)));
+                    drop(pin);
+                }
+            }
+            4 => {
+                // Submit a short-lived task (reaped if unclaimed by its deadline).
+                if let Ok(queue) = node.task_queue() {
+                    let deadline = now_nanos()
+                        + Duration::from_millis(200 + rng.below(200)).as_nanos() as u64;
+                    let _ = queue.submit(
+                        ChunkDesc {
+                            schema_id: 1,
+                            ..ChunkDesc::ZERO
+                        },
+                        deadline,
+                    );
+                }
+            }
+            _ => {
+                // Claim a task if one is queued; complete it half the time (the
+                // rest are dropped, exercising the lease-driven reap/requeue).
+                if let Ok(queue) = node.task_queue() {
+                    if let Some(task) = queue.claim(Duration::from_millis(300).as_nanos() as u64) {
+                        if rng.below(2) == 0 {
+                            let _ = task.complete(ChunkDesc::ZERO);
+                        }
+                    }
+                }
+            }
+        }
+        // Small deterministic jitter so workers interleave rather than lockstep.
+        std::thread::sleep(Duration::from_millis(rng.below(6)));
     }
 }
 
