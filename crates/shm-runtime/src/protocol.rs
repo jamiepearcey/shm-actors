@@ -669,4 +669,99 @@ mod tests {
             5
         );
     }
+
+    /// Deterministic xorshift PRNG — committed, seed-stable fuzz stand-in.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next_u64() & 0xff) as u8
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    const REQ_TAGS: [u8; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    const RESP_TAGS: [u8; 8] = [128, 129, 130, 131, 132, 133, 134, 135];
+
+    /// Property-fuzz the two decoders: many deterministic iterations of random
+    /// bytes and mutated-valid frames must each return `Ok`/`Err`, never panic,
+    /// never read out of bounds. Every decoded `Ok` must also re-encode (no
+    /// decode can produce a value the encoder rejects). Seed-stable for CI.
+    #[test]
+    fn decoders_never_panic_on_arbitrary_bytes() {
+        let mut rng = Rng(0x5eed_c0de_0000_0003);
+        // miri interprets ~100x slower; 2k iterations still cover every branch.
+        let iters = if cfg!(miri) { 2_000 } else { 200_000 };
+        for _ in 0..iters {
+            // Bias the first byte toward a real tag so we exercise field decoding.
+            let len = rng.below(64);
+            let mut b: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+            if !b.is_empty() && rng.below(2) == 0 {
+                b[0] = REQ_TAGS[rng.below(REQ_TAGS.len())];
+            }
+            if let Ok(req) = Request::decode(&b) {
+                // Anything we decode must round-trip back to a decodable frame.
+                let _ = Request::decode(&req.encode()).expect("re-decode of decoded request");
+            }
+
+            let len = rng.below(64);
+            let mut b: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+            if !b.is_empty() && rng.below(2) == 0 {
+                b[0] = RESP_TAGS[rng.below(RESP_TAGS.len())];
+            }
+            if let Ok(resp) = Response::decode(&b) {
+                let _ = Response::decode(&resp.encode()).expect("re-decode of decoded response");
+                let _ = response_fd_count(&resp);
+            }
+        }
+    }
+
+    /// Encode → truncate at every prefix → decode: never panics, and a decode
+    /// that succeeds on a truncation must equal the original (fixed-width frames)
+    /// — a structured stress of the short-read paths.
+    #[test]
+    fn truncated_valid_frames_never_panic() {
+        let reqs = [
+            Request::Register { name: "abc".into() },
+            Request::InternSchema {
+                schema_bytes: vec![1, 2, 3, 4, 5],
+            },
+            Request::ResolveSchema { schema_id: 42 },
+            Request::Published { desc: sample_desc() },
+            Request::OpenTaskQueue,
+        ];
+        for r in reqs {
+            let body = r.encode();
+            for n in 0..=body.len() {
+                let _ = Request::decode(&body[..n]);
+            }
+        }
+        let resps = [
+            Response::Error {
+                message: "why".into(),
+            },
+            Response::SchemaResolved {
+                schema_bytes: vec![9, 8, 7],
+            },
+            Response::TaskQueueGranted {
+                queue_seg_id: 1,
+                region_len: 2,
+            },
+        ];
+        for r in resps {
+            let body = r.encode();
+            for n in 0..=body.len() {
+                let _ = Response::decode(&body[..n]);
+            }
+        }
+    }
 }

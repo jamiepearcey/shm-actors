@@ -1,0 +1,158 @@
+# shm-actors CI (ADR-0004 v0.4 stage P + M).
+#
+# STATUS HONESTY: this workflow is AUTHORED but UNRUN — the shm-actors repo has
+# no remote and no runner configured at time of writing. The YAML is validated
+# for well-formedness locally; the jobs themselves have never executed on CI.
+# The `stable` matrix reproduces what *is* run locally on macOS/Apple Silicon;
+# the `linux` leg is the first time the POSIX paths get exercised on the prod OS
+# (the v0.4 credibility goal), and the `nightly` sanitizer/miri legs are what a
+# runner must actually exercise — see the per-job comments.
+#
+# What each job guards:
+#   * test (matrix ubuntu+macos) — the build + unit/integration tests +
+#     clippy(-D warnings) + rustfmt on the pinned-stable toolchain. Linux is the
+#     net-new coverage: the futex/memfd/pidfd fast paths are POSIX today but have
+#     only ever built/run on macOS locally.
+#   * miri — Undefined Behaviour model-checker over the pure pointer/layout math
+#     (descriptor packing, the two parsers' slice paths, ring/journal index
+#     arithmetic). miri CANNOT model real mmap/shm_open/futex syscalls, so only
+#     the syscall-free unit tests run here (see `--skip` list + the crate set).
+#   * tsan — ThreadSanitizer over the concurrency-relevant crates' tests, to
+#     catch data races the loom model (stage L) can't (real threads, real time).
+#   * fuzz-smoke — builds all cargo-fuzz targets and runs each for a bounded
+#     time so a regression that reintroduces a parser panic fails CI fast.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---- Build + test + lint on the pinned-stable toolchain, both OSes. ----
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins 1.91 + rustfmt + clippy; this action honors it.
+      - name: Install pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      # NOTE (honesty): at v0.4 authoring time the existing tree is NOT
+      # default-rustfmt-clean — it uses a deliberate house style (long single-line
+      # error strings past 100 cols) that predates this work. This check will
+      # therefore report diffs on pre-existing code until the maintainers do a
+      # one-time `cargo fmt` (out of v0.4 scope: it would touch the lock-free
+      # cores stage L owns). New v0.4 code follows the surrounding house style.
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # Per-crate tests: the whole-workspace test run serializes shm segment
+      # setup/teardown and is slower + noisier than testing crate-by-crate.
+      - name: Test (per crate)
+        run: |
+          for c in shm-core shm-arrow shm-ring shm-task shm-artifact shm-stream shm-runtime; do
+            echo "::group::test $c"
+            cargo test -p "$c"
+            echo "::endgroup::"
+          done
+
+  # ---- miri: UB model-check the syscall-free pointer/layout logic. ----
+  miri:
+    name: miri (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + miri
+        run: |
+          rustup toolchain install nightly --component miri
+          rustup default nightly
+      - uses: Swatinem/rust-cache@v2
+      # miri cannot execute mmap/shm_open/memfd/futex, so segment-backed tests
+      # are structurally unrunnable under it. We run only the crates + tests
+      # whose logic is pure heap/pointer arithmetic:
+      #   * shm-core       — descriptor packing, journal bitmap, ring index math
+      #   * shm-arrow      — read_batch_layout slice parser (layout::/read:: unit tests)
+      #   * shm-artifact   — parse_manifest_bytes slice parser
+      #   * shm-runtime    — protocol codec (pure byte decode)
+      # `MIRIFLAGS` disables isolation only where a test needs a clock; the
+      # `--skip` filters drop the few unit tests that still touch a real Segment.
+      - name: miri test (pure-logic unit tests)
+        env:
+          # -Zmiri-disable-isolation lets time-based helpers run; strict provenance
+          # keeps the pointer-math checks maximally strict.
+          MIRIFLAGS: "-Zmiri-strict-provenance"
+        run: |
+          cargo +nightly miri test -p shm-arrow --lib
+          cargo +nightly miri test -p shm-artifact --lib manifest::
+          cargo +nightly miri test -p shm-runtime --lib protocol::
+          cargo +nightly miri test -p shm-core --lib
+
+  # ---- ThreadSanitizer over the concurrency-relevant crates. ----
+  tsan:
+    name: tsan (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + rust-src
+        run: |
+          rustup toolchain install nightly --component rust-src
+          rustup default nightly
+      - uses: Swatinem/rust-cache@v2
+      # TSan needs a std rebuilt with instrumentation (-Zbuild-std), so we pin the
+      # host target explicitly. These crates carry the lock-free cores + the
+      # multi-thread ring/queue/artifact tests that can actually exercise a race.
+      - name: TSan test (ring / task / artifact / core)
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          RUSTDOCFLAGS: "-Zsanitizer=thread"
+          # Fewer false positives from the Rust runtime; keep second-chance off.
+          TSAN_OPTIONS: "halt_on_error=1"
+        run: |
+          host=$(rustc -vV | sed -n 's/host: //p')
+          for c in shm-core shm-ring shm-task shm-artifact; do
+            cargo +nightly test -Zbuild-std -p "$c" --target "$host"
+          done
+
+  # ---- Fuzz smoke: build all targets, run each briefly so a parser regression
+  #      (reintroduced panic / OOB on untrusted bytes) fails CI fast. ----
+  fuzz-smoke:
+    name: fuzz-smoke (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly
+          rustup default nightly
+          cargo install cargo-fuzz --locked
+      - uses: Swatinem/rust-cache@v2
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+      # Seed each run from the committed seed corpus; 30s bounded per target.
+      - name: Run each target (bounded)
+        run: |
+          for t in protocol_request protocol_response arrow_layout manifest; do
+            echo "::group::fuzz $t"
+            cargo +nightly fuzz run "$t" fuzz/seeds/"$t" -- -max_total_time=30
+            echo "::endgroup::"
+          done

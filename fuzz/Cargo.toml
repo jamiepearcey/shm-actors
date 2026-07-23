@@ -1,0 +1,57 @@
+# cargo-fuzz harnesses for shm-actors' two untrusted-input parsers (ADR-0004
+# stage N). This crate is intentionally **detached** from the parent workspace
+# (empty `[workspace]` below) so it can build on `nightly` with the sanitizer
+# instrumentation cargo-fuzz needs, without dragging the pinned-stable workspace
+# onto nightly. It is also listed in the root `Cargo.toml` `exclude` list.
+#
+# Build/run only via `cargo +nightly fuzz run <target>` from the repo root.
+[package]
+name = "shm-actors-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+shm-runtime = { path = "../crates/shm-runtime" }
+shm-arrow = { path = "../crates/shm-arrow" }
+shm-artifact = { path = "../crates/shm-artifact" }
+
+[[bin]]
+name = "protocol_request"
+path = "fuzz_targets/protocol_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_response"
+path = "fuzz_targets/protocol_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arrow_layout"
+path = "fuzz_targets/arrow_layout.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+# Keep some debug info so a crash symbolizes; optimize so fuzzing is fast.
+[profile.release]
+debug = 1
+
+# Detach from the parent workspace: fuzzing runs on nightly, the workspace is
+# pinned to stable 1.91.
+[workspace]

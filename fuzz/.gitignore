@@ -1,0 +1,6 @@
+# cargo-fuzz build + runtime artifacts — never commit these.
+/target
+/corpus
+/artifacts
+/coverage
+Cargo.lock

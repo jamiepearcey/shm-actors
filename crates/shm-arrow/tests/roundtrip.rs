@@ -415,3 +415,45 @@ fn nested_sliced_combined_round_trips() {
         .unwrap();
     assert_eq!(got.len(), 3);
 }
+
+/// Regression (v0.4 stage N): a corrupt node table whose `data_buffers` count
+/// exceeds the buffer table must be rejected with a clean `Err`, never panic.
+///
+/// Before the fix, `make_buffer(idx)` indexed `entries[idx]` directly, so a
+/// node claiming more buffers than `buffer_count` triggered an out-of-bounds
+/// index panic mid-walk (before the end-of-walk consistency check could fire).
+#[test]
+fn corrupt_node_buffer_count_is_rejected_not_paniced() {
+    let fx = Fixture::new(1 << 20);
+    let pool = Pool::create(&fx.segment, &PoolConfig::power_of_two(1024, 1 << 16, 8)).unwrap();
+    let alloc = PoolAllocator::new(&pool, &fx.segment);
+
+    // Single non-nullable Int64 column: node_count = 1, buffer_count = 1.
+    let schema: SchemaRef =
+        Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
+    let registry = SchemaRegistry::with_schemas(std::slice::from_ref(&schema));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))])
+            .unwrap();
+
+    let desc = write_batch(&alloc, &registry, &batch).unwrap();
+    let ctrl = pool.ctrl(&desc).unwrap();
+    ctrl.try_loan(7).unwrap();
+    ctrl.publish().unwrap();
+
+    // Corrupt the single NodeEntry's `data_buffers` field (4th u32 of the 24-byte
+    // node, which sits at chunk offset 32) to demand 99 buffers.
+    let base = fx.segment.resolve(desc.offset, desc.len).unwrap();
+    // node table starts at size_of::<BatchHeader>() == 32; data_buffers at +12.
+    unsafe {
+        base.add(32 + 12).cast::<u32>().write_unaligned(99u32);
+    }
+
+    let ctrl = pool.ctrl(&desc).unwrap();
+    let pin = Arc::new(PinGuard::new(fx.segment.clone()));
+    let out = read_batch_chunks(pin, std::slice::from_ref(&desc), &[ctrl], &registry);
+    assert!(
+        matches!(out, Err(shm_arrow::Error::Layout(_))),
+        "corrupt node table must be a clean Layout error, got {out:?}"
+    );
+}

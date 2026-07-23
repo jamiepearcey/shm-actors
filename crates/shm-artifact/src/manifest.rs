@@ -219,24 +219,77 @@ pub fn read_manifest(segment: &Segment, mref: PackedRef) -> Result<Manifest> {
     let batch_count = header.batch_count as usize;
     let total = manifest_len(chunk_count, batch_count);
     let total = u32::try_from(total).map_err(|_| Error::VersionGone)?;
-    // Bounds-check the whole record (header + descriptor array + span array).
+    // Bounds-check the whole record (header + descriptor array + span array),
+    // then parse it out of the now-validated byte region. Sharing
+    // [`parse_manifest_bytes`] keeps the real (segment-backed) path and the
+    // fuzzed/slice path on identical validation logic.
     let base = segment.resolve(offset, total)?;
+    // SAFETY: `resolve` verified `[offset, offset + total)` is mapped, so `base`
+    // is valid for `total` bytes; the slice does not outlive this call.
+    let bytes = unsafe { core::slice::from_raw_parts(base, total as usize) };
+    parse_manifest_bytes(bytes)
+}
+
+/// Parse and validate a manifest **purely over its chunk bytes** — the
+/// untrusted-input boundary a corrupt or recycled manifest chunk reaches across.
+///
+/// `bytes` are the raw bytes of the manifest chunk (starting at the
+/// [`VersionManifest`] header). Every count is untrusted, so this function:
+///
+/// - rejects a `bytes` shorter than the 32-byte header ([`Error::VersionGone`]);
+/// - checks the magic ([`Error::BadMagic`]);
+/// - computes the full `header + [ChunkDesc; chunk_count] + [u32; batch_count]`
+///   length with **checked** arithmetic and rejects any input that does not hold
+///   the whole record ([`Error::VersionGone`]).
+///
+/// It never panics and never reads out of bounds for **any** input — see the
+/// `fuzz_manifest` target and the `manifest_parser_*` property tests.
+///
+/// [`read_manifest`] calls this after `Segment::resolve` has already proven the
+/// region is mapped; exposing it lets the fuzzer exercise the exact same
+/// validation without a real shared-memory segment.
+pub fn parse_manifest_bytes(bytes: &[u8]) -> Result<Manifest> {
+    use core::mem::size_of;
+
+    if bytes.len() < size_of::<VersionManifest>() {
+        return Err(Error::VersionGone);
+    }
+    // SAFETY: length checked above; `VersionManifest` is an all-integer POD.
+    let header: VersionManifest = unsafe { read_pod(bytes, 0) };
+    if header.magic != MANIFEST_MAGIC {
+        return Err(Error::BadMagic);
+    }
+
+    let chunk_count = header.chunk_count as usize;
+    let batch_count = header.batch_count as usize;
+
+    // Whole-record extent with checked math (attacker counts are ~4e9 each).
+    let chunk_bytes = chunk_count
+        .checked_mul(size_of::<ChunkDesc>())
+        .ok_or(Error::VersionGone)?;
+    let spans_off = chunks_offset()
+        .checked_add(chunk_bytes)
+        .ok_or(Error::VersionGone)?;
+    let span_bytes = batch_count
+        .checked_mul(size_of::<u32>())
+        .ok_or(Error::VersionGone)?;
+    let total = spans_off.checked_add(span_bytes).ok_or(Error::VersionGone)?;
+    debug_assert_eq!(total, manifest_len(chunk_count, batch_count));
+    if total > bytes.len() {
+        return Err(Error::VersionGone);
+    }
 
     let mut chunks = Vec::with_capacity(chunk_count);
+    for i in 0..chunk_count {
+        // SAFETY: `total <= bytes.len()` proved the descriptor array is in bounds.
+        chunks.push(unsafe {
+            read_pod::<ChunkDesc>(bytes, chunks_offset() + i * size_of::<ChunkDesc>())
+        });
+    }
     let mut batch_spans = Vec::with_capacity(batch_count);
-    // SAFETY: `resolve` verified the full `total`-byte region is mapped; the
-    // descriptor array begins at `chunks_offset()` (`chunk_count` 24-byte PODs)
-    // and the span array at `spans_offset(chunk_count)` (`batch_count` `u32`s),
-    // all within that region. Reads are unaligned-safe.
-    unsafe {
-        let arr = base.add(chunks_offset()).cast::<ChunkDesc>();
-        for i in 0..chunk_count {
-            chunks.push(arr.add(i).read_unaligned());
-        }
-        let spans = base.add(spans_offset(chunk_count)).cast::<u32>();
-        for i in 0..batch_count {
-            batch_spans.push(spans.add(i).read_unaligned());
-        }
+    for i in 0..batch_count {
+        // SAFETY: as above; the span array sits at `spans_off < total`.
+        batch_spans.push(unsafe { read_pod::<u32>(bytes, spans_off + i * size_of::<u32>()) });
     }
 
     Ok(Manifest {
@@ -246,6 +299,27 @@ pub fn read_manifest(segment: &Segment, mref: PackedRef) -> Result<Manifest> {
         chunks,
         batch_spans,
     })
+}
+
+/// Copy a fixed-size POD `T` out of `buf` at byte `off`, unaligned.
+///
+/// # Safety
+///
+/// The caller must guarantee `off + size_of::<T>() <= buf.len()` and that every
+/// bit pattern is a valid `T` (true for the all-integer POD records here).
+#[inline]
+unsafe fn read_pod<T: Copy>(buf: &[u8], off: usize) -> T {
+    debug_assert!(off + core::mem::size_of::<T>() <= buf.len());
+    let mut v = core::mem::MaybeUninit::<T>::uninit();
+    // SAFETY: bounds guaranteed by the caller; regions don't overlap.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            buf.as_ptr().add(off),
+            v.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<T>(),
+        );
+        v.assume_init()
+    }
 }
 
 /// Read the manifest `mref` points at and validate it self-identifies as
@@ -273,4 +347,124 @@ pub fn read_manifest_checked(
         return Err(Error::StaleManifest);
     }
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic xorshift PRNG — committed, seed-stable fuzz stand-in.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next_u64() & 0xff) as u8
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+    }
+
+    /// A well-formed manifest byte image with `chunk_count`/`batch_count` entries
+    /// laid into a buffer of `len` bytes (as a mutation seed).
+    fn valid_manifest(chunk_count: u32, batch_count: u32, len: usize) -> Vec<u8> {
+        let mut b = vec![0u8; len];
+        if len >= 32 {
+            b[0..8].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
+            b[8..16].copy_from_slice(&5u64.to_le_bytes()); // version
+            b[16..20].copy_from_slice(&7u32.to_le_bytes()); // artifact_id
+            b[20..24].copy_from_slice(&1u32.to_le_bytes()); // schema_id
+            b[24..28].copy_from_slice(&chunk_count.to_le_bytes());
+            b[28..32].copy_from_slice(&batch_count.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn manifest_parser_rejects_oversized_counts_no_oob() {
+        // The threat: a huge chunk_count/batch_count must not walk off the buffer.
+        let mut b = valid_manifest(0, 0, 64);
+        b[24..28].copy_from_slice(&u32::MAX.to_le_bytes()); // chunk_count
+        assert!(matches!(parse_manifest_bytes(&b), Err(Error::VersionGone)));
+
+        let mut b = valid_manifest(0, 0, 64);
+        b[28..32].copy_from_slice(&u32::MAX.to_le_bytes()); // batch_count
+        assert!(matches!(parse_manifest_bytes(&b), Err(Error::VersionGone)));
+
+        // A count that fits the u32 length cap but overruns the actual bytes.
+        let mut b = valid_manifest(0, 0, 64);
+        b[24..28].copy_from_slice(&3u32.to_le_bytes()); // 3 * 24 = 72 > 64-32
+        assert!(matches!(parse_manifest_bytes(&b), Err(Error::VersionGone)));
+    }
+
+    #[test]
+    fn manifest_parser_rejects_short_and_bad_magic() {
+        for n in 0..32usize {
+            assert!(matches!(
+                parse_manifest_bytes(&vec![0u8; n]),
+                Err(Error::VersionGone)
+            ));
+        }
+        assert!(matches!(
+            parse_manifest_bytes(&[0u8; 64]),
+            Err(Error::BadMagic)
+        ));
+    }
+
+    #[test]
+    fn manifest_parser_round_trips_a_valid_image() {
+        // 2 chunks in 2 single-chunk batches: total = 32 + 2*24 + 2*4 = 88.
+        let total = manifest_len(2, 2);
+        let mut b = valid_manifest(2, 2, total);
+        // Fill the two ChunkDesc entries + spans with recognizable values.
+        for i in 0..2u32 {
+            let at = 32 + i as usize * 24;
+            b[at..at + 4].copy_from_slice(&(100 + i).to_le_bytes()); // segment_id
+            b[at + 12..at + 16].copy_from_slice(&4096u32.to_le_bytes()); // len
+        }
+        let sp = 32 + 2 * 24;
+        b[sp..sp + 4].copy_from_slice(&1u32.to_le_bytes());
+        b[sp + 4..sp + 8].copy_from_slice(&1u32.to_le_bytes());
+        let m = parse_manifest_bytes(&b).expect("valid manifest parses");
+        assert_eq!(m.chunks.len(), 2);
+        assert_eq!(m.batch_spans, vec![1, 1]);
+        assert_eq!(m.chunks[0].segment_id, 100);
+        assert_eq!(m.artifact_id, 7);
+        assert_eq!(m.version, 5);
+    }
+
+    /// Property-fuzz: many deterministic iterations of random + mutated-valid
+    /// bytes must never panic and never read out of bounds.
+    #[test]
+    fn manifest_parser_never_panics_on_arbitrary_bytes() {
+        let mut rng = Rng(0x5eed_dead_beef_0002);
+        // miri interprets ~100x slower; 2k iterations still cover every branch.
+        let iters = if cfg!(miri) { 2_000 } else { 200_000 };
+        for _ in 0..iters {
+            let b: Vec<u8> = if rng.below(2) == 0 {
+                let len = rng.below(128);
+                (0..len).map(|_| rng.byte()).collect()
+            } else {
+                let cc = rng.below(6) as u32;
+                let bc = rng.below(6) as u32;
+                let len = 32 + rng.below(160);
+                let mut b = valid_manifest(cc, bc, len);
+                for _ in 0..rng.below(8) {
+                    if !b.is_empty() {
+                        let i = rng.below(b.len());
+                        b[i] ^= rng.byte();
+                    }
+                }
+                b
+            };
+            let _ = parse_manifest_bytes(&b);
+        }
+    }
 }

@@ -10,6 +10,10 @@ members = [
     "crates/shm-runtime",
     "crates/shm-bench",
 ]
+# The cargo-fuzz harnesses (v0.4 stage N) are a separate nightly-only crate with
+# their own detached workspace; keep them out of the pinned-stable workspace so
+# `cargo build/test --workspace` never touches them.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

@@ -70,6 +70,7 @@ pub use error::{Error, Result};
 pub use event::{CommitKind, VersionEvent, ARTIFACTS_TOPIC, EVENT_MAGIC};
 pub use head::{ArtifactHead, PinSlot, MAX_LIVE_VERSIONS};
 pub use manifest::{
-    manifest_len, read_manifest, read_manifest_checked, write_manifest, Manifest, VersionManifest,
+    manifest_len, parse_manifest_bytes, read_manifest, read_manifest_checked, write_manifest,
+    Manifest, VersionManifest,
     MANIFEST_MAGIC,
 };

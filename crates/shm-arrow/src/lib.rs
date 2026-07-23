@@ -43,7 +43,7 @@ pub mod write;
 pub use alloc::{ChunkAllocator, PoolAllocator};
 pub use error::{Error, Result};
 pub use layout::{BatchHeader, BufferEntry, NodeEntry, BATCH_FORMAT, BATCH_MAGIC, BUFFER_ALIGN};
-pub use read::{read_batch, read_batch_chunks, PinGuard, SegmentBase};
+pub use read::{read_batch, read_batch_chunks, read_batch_layout, PinGuard, SegmentBase};
 pub use schema::{
     deserialize_schema, schema_content_hash, serialize_schema, SchemaRegistry, RAW_SCHEMA_ID,
 };
