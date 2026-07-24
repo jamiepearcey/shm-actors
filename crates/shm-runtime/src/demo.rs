@@ -63,6 +63,35 @@ pub fn demo_batch() -> RecordBatch {
     .expect("demo batch is well formed")
 }
 
+/// The G1 result schema: a single derived scalar `(sum: Int64)` (ADR-0007 G1).
+///
+/// A G1 worker resolves a dispatched [`TypedRef`](shm_store::TypedRef) to a
+/// dataset, derives [`DEMO_ID_SUM`] from it, and commits this one-row batch as a
+/// `Result`-kind keyed entry the requester then reads back.
+pub fn result_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new("sum", DataType::Int64, false)]))
+}
+
+/// Build the one-row [`result_schema`] batch carrying the derived `sum`.
+pub fn result_batch(sum: i64) -> RecordBatch {
+    RecordBatch::try_new(result_schema(), vec![Arc::new(Int64Array::from(vec![sum]))])
+        .expect("result batch is well formed")
+}
+
+/// Read the single `sum` scalar back from a reconstructed [`result_batch`], or an
+/// error string if the shape is wrong.
+pub fn result_value(batch: &RecordBatch) -> std::result::Result<i64, String> {
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or("result column 0 is not Int64")?;
+    if col.len() != 1 {
+        return Err(format!("result batch has {} rows, expected 1", col.len()));
+    }
+    Ok(col.value(0))
+}
+
 /// The nested cache-loop artifact name (item-F walking-skeleton half).
 pub const NESTED_ARTIFACT: &str = "cache-nested";
 

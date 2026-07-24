@@ -23,24 +23,32 @@
 //! segments, interns keys, and — via the catalog it also maps — routes a dead
 //! actor's leaked entry pins / write leases back to their `ArtifactHead` on crash.
 //!
-//! # G1 readiness
+//! # G1: the typed-ref envelope
 //!
-//! This is G3 only; the typed-ref envelope (G1) is the next stage. The key
-//! interning and store APIs it will call are in place, and [`SCHEMA_TYPED_REF`] +
-//! [`FIRST_USER_SCHEMA_ID`] fix the reserved system-schema-id convention now so G1
-//! can rely on it (ADR-0007 §ABI).
+//! On top of G3, the [`typed_ref`] module adds the ADR-0007 **G1** envelope: a
+//! 56-byte [`TypedRef`] POD carried inside a chunk (tagged by
+//! [`SCHEMA_TYPED_REF`]) that a front dispatches and a worker resolves against
+//! this store. [`write_typed_ref`]/[`read_typed_ref`] move the envelope through a
+//! chunk, and [`KeyedStore::resolve_and_pin`](store::KeyedStore::resolve_and_pin)
+//! turns one into a journaled pin + zero-copy batch. [`FIRST_USER_SCHEMA_ID`]
+//! keeps user schema ids clear of the reserved system id (ADR-0007 §ABI).
 
 #![deny(missing_docs)]
 
 pub mod catalog;
 pub mod error;
 pub mod store;
+pub mod typed_ref;
 
 pub use catalog::{
     Catalog, CatalogSlot, RefKind, CATALOG_MAGIC, SLOT_FREE, SLOT_LIVE, SLOT_TOMBSTONE,
 };
 pub use error::{Error, Result};
 pub use store::{Entry, KeyResolver, KeyedStore, MAX_KEY_LEN};
+pub use typed_ref::{
+    read_typed_ref, resolve_path, write_typed_ref, ResolvePath, TypedRef, TYPED_REF_ABI_VERSION,
+    TYPED_REF_MAGIC, TYPED_REF_SIZE,
+};
 
 /// Reserved system schema id for the G1 typed-ref envelope (ADR-0007 §ABI).
 ///

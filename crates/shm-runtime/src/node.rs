@@ -20,7 +20,7 @@ use arrow_schema::SchemaRef;
 use shm_arrow::{read_batch, write_batch, PinGuard, PoolAllocator, SchemaRegistry};
 use shm_artifact::{Artifact, VersionEvent, ARTIFACTS_TOPIC};
 use shm_core::{BorrowJournal, ChunkDesc, Pool, Segment};
-use shm_store::{KeyResolver, KeyedStore};
+use shm_store::{read_typed_ref, write_typed_ref, KeyResolver, KeyedStore, TypedRef};
 use shm_ring::{DoorbellNotifier, DoorbellParker, Msg, Publisher, Ring, Subscriber};
 use shm_stream::{Commit, Coordination, StreamWriter};
 use shm_task::{
@@ -346,6 +346,68 @@ impl Node {
             this.actor_id,
             this,
         ))
+    }
+
+    // ---- v0.5 G1: typed-ref envelope dispatch + resolve (ADR-0007) ----
+
+    /// Write a [`TypedRef`] envelope into a chunk of the **shared store data
+    /// pool** and return its [`ChunkDesc`] (tagged with `SCHEMA_TYPED_REF`), so
+    /// the descriptor is resolvable by any actor that has mapped the store
+    /// (ADR-0007 G1). The store must already be open (see
+    /// [`open_store`](Self::open_store)); each actor's own payload segment is
+    /// *not* shared, so an envelope destined for another process must live in the
+    /// store's shared pool.
+    pub fn write_ref_chunk(&self, tref: &TypedRef) -> Result<ChunkDesc> {
+        let m = self.store.as_ref().ok_or(Error::NotFound("store not open"))?;
+        let pool = Pool::attach(&m.data_seg)?;
+        let alloc = PoolAllocator::new(&pool, &m.data_seg);
+        Ok(write_typed_ref(&alloc, tref)?)
+    }
+
+    /// Read + validate the [`TypedRef`] envelope the descriptor `desc` names from
+    /// the shared store data pool (ADR-0007 G1). Errors if `desc` is not tagged
+    /// `SCHEMA_TYPED_REF` or fails envelope validation. The store must be open.
+    pub fn read_ref_chunk(&self, desc: &ChunkDesc) -> Result<TypedRef> {
+        let m = self.store.as_ref().ok_or(Error::NotFound("store not open"))?;
+        let guard = PinGuard::new(m.data_seg.clone());
+        Ok(read_typed_ref(&guard, desc)?)
+    }
+
+    /// Read the [`TypedRef`] envelope a claimed task's `request` descriptor points
+    /// at — the ergonomic worker-side accessor (ADR-0007 G1). Equivalent to
+    /// `node.read_ref_chunk(&claimed.request())`; provided so a worker gets the
+    /// envelope from its claim without touching the store pool directly.
+    pub fn task_ref(&self, claimed: &ClaimedTask) -> Result<TypedRef> {
+        self.read_ref_chunk(&claimed.request())
+    }
+
+    /// Return an envelope chunk (allocated by [`write_ref_chunk`](Self::write_ref_chunk))
+    /// to the shared store data pool's free list. The chunk was never loaned, so
+    /// this simply re-links it; call it once the envelope is no longer needed
+    /// (e.g. by the requester after reading a result, or by the worker that
+    /// completed a task) to keep the store data-pool census leak-free.
+    pub fn free_ref_chunk(&self, desc: &ChunkDesc) -> Result<()> {
+        let m = self.store.as_ref().ok_or(Error::NotFound("store not open"))?;
+        let pool = Pool::attach(&m.data_seg)?;
+        let _ = pool.free(desc);
+        Ok(())
+    }
+
+    /// Dispatch a [`TypedRef`] through the built-in task queue (ADR-0007 G1): write
+    /// the envelope into a shared store-pool chunk, then submit its 24-byte
+    /// `ChunkDesc` as the task request with an absolute `deadline_nanos` (in
+    /// [`now_nanos`]'s clock domain). Control stays a descriptor; the referent is
+    /// never copied. Returns the correlation [`TaskHandle`].
+    ///
+    /// Maps both the store (for the envelope chunk) and the task queue on first
+    /// use. A worker claims the task, reads the envelope with
+    /// [`task_ref`](Self::task_ref), and resolves it via
+    /// [`store()`](Self::store)`.resolve_and_pin(..)`.
+    pub fn submit_typed_task(&mut self, tref: &TypedRef, deadline_nanos: u64) -> Result<TaskHandle> {
+        self.open_store()?;
+        self.open_task_queue()?;
+        let desc = self.write_ref_chunk(tref)?;
+        self.task_queue()?.submit(desc, deadline_nanos)
     }
 
     /// The actor id assigned by the coordinator.

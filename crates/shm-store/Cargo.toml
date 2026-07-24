@@ -12,4 +12,5 @@ shm-arrow.workspace = true
 shm-artifact.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
+bytemuck = { workspace = true }
 thiserror.workspace = true

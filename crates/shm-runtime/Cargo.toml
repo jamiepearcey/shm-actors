@@ -37,3 +37,7 @@ path = "src/bin/shm-cacheloop.rs"
 [[bin]]
 name = "shm-store-skeleton"
 path = "src/bin/shm-store-skeleton.rs"
+
+[[bin]]
+name = "shm-g1-skeleton"
+path = "src/bin/shm-g1-skeleton.rs"

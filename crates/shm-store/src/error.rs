@@ -25,9 +25,42 @@ pub enum Error {
     #[error("unknown ref kind {0}")]
     BadKind(u16),
 
+    /// A [`TypedRef`](crate::TypedRef) envelope failed validation: its `magic` or
+    /// `abi_version` did not match, or the chunk was too small to hold one
+    /// (ADR-0007 G1).
+    #[error("typed-ref envelope failed validation (bad magic/abi_version or too short)")]
+    BadEnvelope,
+
+    /// A [`ChunkDesc`](shm_core::ChunkDesc) handed to
+    /// [`read_typed_ref`](crate::read_typed_ref) was not tagged with
+    /// [`SCHEMA_TYPED_REF`](crate::SCHEMA_TYPED_REF): it is raw payload, not an
+    /// envelope.
+    #[error("descriptor is not a typed-ref envelope (schema_id {0} != SCHEMA_TYPED_REF)")]
+    NotEnvelope(u32),
+
+    /// A [`TypedRef`](crate::TypedRef) whose `kind` is
+    /// [`RefKind::RawChunk`](crate::RefKind::RawChunk) (or otherwise carries no
+    /// key) cannot be resolved against the keyed store (ADR-0007 G1).
+    #[error("typed ref is not resolvable against the keyed store (raw / no key)")]
+    NotResolvable,
+
+    /// A [`resolve_and_pin`](crate::KeyedStore::resolve_and_pin) asked for a
+    /// specific version that is not the entry's pinned current version.
+    #[error("version mismatch: expected {expected}, entry is at {actual}")]
+    VersionMismatch {
+        /// The version the [`TypedRef`](crate::TypedRef) demanded.
+        expected: u64,
+        /// The version actually pinned (the entry's current version).
+        actual: u64,
+    },
+
     /// An error bubbled up from `shm-core`.
     #[error(transparent)]
     Core(#[from] shm_core::Error),
+
+    /// An error bubbled up from `shm-arrow` (the envelope allocate/read seam).
+    #[error(transparent)]
+    Arrow(#[from] shm_arrow::Error),
 
     /// An error bubbled up from `shm-artifact`.
     #[error(transparent)]

@@ -18,6 +18,7 @@ use shm_core::{BorrowJournal, Segment};
 
 use crate::catalog::{Catalog, RefKind};
 use crate::error::{Error, Result};
+use crate::typed_ref::{resolve_path, ResolvePath, TypedRef};
 
 /// The key-interning seam: opaque key bytes → coordinator-interned `key_id`
 /// (`0` reserved for none). Injected by the runtime (the [`Node`] implements it
@@ -196,6 +197,64 @@ impl<'a> KeyedStore<'a> {
         )?;
         artifact.evict_all()?;
         Ok(())
+    }
+
+    // ---- G1: resolve a typed-ref envelope (ADR-0007) ----
+
+    /// Resolve a [`TypedRef`] to its live [`Entry`] by its authoritative
+    /// `key_id` (ADR-0007 G1×G3). A [`RefKind::RawChunk`] envelope (no key) is
+    /// [`Error::NotResolvable`]; any other kind opens the entry via
+    /// [`open_id`](Self::open_id) (a pure catalog scan — no UDS), or
+    /// [`Error::NotFound`] if no live entry tracks the key.
+    pub fn resolve(&self, tref: &TypedRef) -> Result<Entry> {
+        if tref.kind()? == RefKind::RawChunk {
+            return Err(Error::NotResolvable);
+        }
+        self.open_id(tref.key_id)
+    }
+
+    /// Which path [`resolve_and_pin`](Self::resolve_and_pin) will take for `tref`
+    /// (ADR-0007 G1): the pre-resolved [`ResolvePath::FastPath`] when the envelope
+    /// carries a valid `locator`, else [`ResolvePath::ByKey`]. Pure (no store
+    /// access), so a caller can log/branch on the decision.
+    #[inline]
+    pub fn resolve_path(&self, tref: &TypedRef) -> ResolvePath {
+        resolve_path(tref)
+    }
+
+    /// Resolve a [`TypedRef`], pin the entry through the actor's borrow journal,
+    /// check its `version`, and reconstruct the referent **zero-copy** (ADR-0007
+    /// G1×G3). Returns the owned `(Entry, VersionPin, RecordBatch)` — the pin
+    /// keeps the version (and the batch's shared-memory buffers) alive until
+    /// dropped, and a `kill -9` mid-pin is crash-reclaimed by the coordinator.
+    ///
+    /// # Fast-path vs by-key
+    ///
+    /// [`resolve_path`](Self::resolve_path) documents which path a peer *would*
+    /// take. A crash-safe read must hold a **journaled** pin the coordinator can
+    /// reclaim, and a journaled pin is only obtainable through the entry's
+    /// `ArtifactHead` (reached by `key_id` → catalog slot). So the *pin* is always
+    /// taken by key (authoritative); when a valid `locator`/`manifest` fast path
+    /// is present it is used only to skip re-deriving the referent, and the read
+    /// still flows through the pinned manifest. The `key_id` therefore governs
+    /// correctness; the fast path is a latency hint, never a trust boundary.
+    ///
+    /// # Version
+    ///
+    /// `version == 0` pins the entry's **current** version; otherwise the pinned
+    /// current version must equal `version`, else [`Error::VersionMismatch`]
+    /// (the G3 entry exposes only its current version to pin).
+    pub fn resolve_and_pin(&self, tref: &TypedRef) -> Result<(Entry, VersionPin, RecordBatch)> {
+        let entry = self.resolve(tref)?;
+        let pin = entry.pin()?;
+        if tref.version != 0 && pin.version() != tref.version {
+            return Err(Error::VersionMismatch {
+                expected: tref.version,
+                actual: pin.version(),
+            });
+        }
+        let batch = pin.as_arrow(&self.registry)?;
+        Ok((entry, pin, batch))
     }
 }
 
