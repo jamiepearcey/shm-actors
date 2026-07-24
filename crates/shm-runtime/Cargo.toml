@@ -13,6 +13,7 @@ shm-ring = { workspace = true }
 shm-task = { workspace = true }
 shm-artifact = { workspace = true }
 shm-stream = { workspace = true }
+shm-store = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
@@ -32,3 +33,7 @@ path = "src/bin/shm-skeleton.rs"
 [[bin]]
 name = "shm-cacheloop"
 path = "src/bin/shm-cacheloop.rs"
+
+[[bin]]
+name = "shm-store-skeleton"
+path = "src/bin/shm-store-skeleton.rs"

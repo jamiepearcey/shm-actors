@@ -48,6 +48,12 @@ pub mod tags {
     pub const INTERN_SCHEMA: u8 = 10;
     /// [`Request::ResolveSchema`].
     pub const RESOLVE_SCHEMA: u8 = 11;
+    /// [`Request::InternKey`] (ADR-0007 G3).
+    pub const INTERN_KEY: u8 = 12;
+    /// [`Request::ResolveKey`] (ADR-0007 G3).
+    pub const RESOLVE_KEY: u8 = 13;
+    /// [`Request::OpenStore`] (ADR-0007 G3).
+    pub const OPEN_STORE: u8 = 14;
 
     /// [`Response::Registered`].
     pub const REGISTERED: u8 = 128;
@@ -65,6 +71,12 @@ pub mod tags {
     pub const SCHEMA_INTERNED: u8 = 134;
     /// [`Response::SchemaResolved`].
     pub const SCHEMA_RESOLVED: u8 = 135;
+    /// [`Response::KeyInterned`] (ADR-0007 G3).
+    pub const KEY_INTERNED: u8 = 136;
+    /// [`Response::KeyResolved`] (ADR-0007 G3).
+    pub const KEY_RESOLVED: u8 = 137;
+    /// [`Response::StoreGranted`] (ADR-0007 G3).
+    pub const STORE_GRANTED: u8 = 138;
 }
 
 /// A message sent by an actor to the coordinator.
@@ -128,6 +140,22 @@ pub enum Request {
         /// The coordinator-issued schema id to resolve.
         schema_id: u32,
     },
+    /// Intern an opaque store **key** (≤ 1024 B) at the coordinator, receiving its
+    /// stable `key_id` (ADR-0007 G3). Idempotent: the same bytes always intern to
+    /// the same id. Expects [`Response::KeyInterned`].
+    InternKey {
+        /// The opaque key bytes.
+        key_bytes: Vec<u8>,
+    },
+    /// Resolve a coordinator-issued `key_id` back to its key bytes. Expects
+    /// [`Response::KeyResolved`], or [`Response::Error`] if the id is unknown.
+    ResolveKey {
+        /// The key id to resolve.
+        key_id: u32,
+    },
+    /// Open the built-in keyed store and receive its catalog + head + data segment
+    /// fds (ADR-0007 G3). Expects [`Response::StoreGranted`].
+    OpenStore,
 }
 
 /// A message sent by the coordinator to an actor.
@@ -194,6 +222,34 @@ pub enum Response {
         /// [`shm_arrow::deserialize_schema`]).
         schema_bytes: Vec<u8>,
     },
+    /// A key was interned; carries its coordinator-issued `key_id` (>= 1, stable
+    /// across every interner of the same bytes). No fds.
+    KeyInterned {
+        /// The coordinator-issued `key_id`.
+        key_id: u32,
+    },
+    /// A key was resolved; carries its opaque bytes. No fds.
+    KeyResolved {
+        /// The key's opaque bytes.
+        key_bytes: Vec<u8>,
+    },
+    /// The built-in keyed store was granted; carries **three** fds in this order:
+    /// the catalog segment, then the head (management) segment, then the data
+    /// (shared pool) segment. The body carries each segment's id + payload length.
+    StoreGranted {
+        /// The catalog segment id.
+        catalog_seg_id: u32,
+        /// The catalog segment's payload length in bytes.
+        catalog_len: u32,
+        /// The head (management) segment id.
+        head_seg_id: u32,
+        /// The head segment's payload length in bytes.
+        head_len: u32,
+        /// The data (shared pool) segment id.
+        data_seg_id: u32,
+        /// The data segment's payload length in bytes.
+        data_len: u32,
+    },
 }
 
 /// How many passed fds a decoded [`Response`] requires.
@@ -203,6 +259,7 @@ pub fn response_fd_count(resp: &Response) -> usize {
         Response::Granted { .. } => 2,
         Response::ArtifactGranted { .. } => 2,
         Response::TaskQueueGranted { .. } => 5,
+        Response::StoreGranted { .. } => 3,
         _ => 0,
     }
 }
@@ -364,6 +421,15 @@ impl Request {
                 buf.push(tags::RESOLVE_SCHEMA);
                 put_u32(&mut buf, *schema_id);
             }
+            Request::InternKey { key_bytes } => {
+                buf.push(tags::INTERN_KEY);
+                put_bytes(&mut buf, key_bytes);
+            }
+            Request::ResolveKey { key_id } => {
+                buf.push(tags::RESOLVE_KEY);
+                put_u32(&mut buf, *key_id);
+            }
+            Request::OpenStore => buf.push(tags::OPEN_STORE),
         }
         buf
     }
@@ -388,6 +454,11 @@ impl Request {
             tags::RESOLVE_SCHEMA => Request::ResolveSchema {
                 schema_id: r.u32()?,
             },
+            tags::INTERN_KEY => Request::InternKey {
+                key_bytes: r.bytes()?,
+            },
+            tags::RESOLVE_KEY => Request::ResolveKey { key_id: r.u32()? },
+            tags::OPEN_STORE => Request::OpenStore,
             _ => return Err(Error::Protocol("unknown request tag")),
         })
     }
@@ -449,6 +520,30 @@ impl Response {
                 buf.push(tags::SCHEMA_RESOLVED);
                 put_bytes(&mut buf, schema_bytes);
             }
+            Response::KeyInterned { key_id } => {
+                buf.push(tags::KEY_INTERNED);
+                put_u32(&mut buf, *key_id);
+            }
+            Response::KeyResolved { key_bytes } => {
+                buf.push(tags::KEY_RESOLVED);
+                put_bytes(&mut buf, key_bytes);
+            }
+            Response::StoreGranted {
+                catalog_seg_id,
+                catalog_len,
+                head_seg_id,
+                head_len,
+                data_seg_id,
+                data_len,
+            } => {
+                buf.push(tags::STORE_GRANTED);
+                put_u32(&mut buf, *catalog_seg_id);
+                put_u32(&mut buf, *catalog_len);
+                put_u32(&mut buf, *head_seg_id);
+                put_u32(&mut buf, *head_len);
+                put_u32(&mut buf, *data_seg_id);
+                put_u32(&mut buf, *data_len);
+            }
         }
         buf
     }
@@ -484,6 +579,18 @@ impl Response {
             },
             tags::SCHEMA_RESOLVED => Response::SchemaResolved {
                 schema_bytes: r.bytes()?,
+            },
+            tags::KEY_INTERNED => Response::KeyInterned { key_id: r.u32()? },
+            tags::KEY_RESOLVED => Response::KeyResolved {
+                key_bytes: r.bytes()?,
+            },
+            tags::STORE_GRANTED => Response::StoreGranted {
+                catalog_seg_id: r.u32()?,
+                catalog_len: r.u32()?,
+                head_seg_id: r.u32()?,
+                head_len: r.u32()?,
+                data_seg_id: r.u32()?,
+                data_len: r.u32()?,
             },
             _ => return Err(Error::Protocol("unknown response tag")),
         })
@@ -530,6 +637,14 @@ mod tests {
                 schema_bytes: Vec::new(),
             },
             Request::ResolveSchema { schema_id: 7 },
+            Request::InternKey {
+                key_bytes: b"dataset/X".to_vec(),
+            },
+            Request::InternKey {
+                key_bytes: Vec::new(),
+            },
+            Request::ResolveKey { key_id: 3 },
+            Request::OpenStore,
         ];
         for req in cases {
             let body = req.encode();
@@ -570,6 +685,18 @@ mod tests {
             },
             Response::SchemaResolved {
                 schema_bytes: Vec::new(),
+            },
+            Response::KeyInterned { key_id: 5 },
+            Response::KeyResolved {
+                key_bytes: b"dataset/X".to_vec(),
+            },
+            Response::StoreGranted {
+                catalog_seg_id: 8192,
+                catalog_len: 5208,
+                head_seg_id: 8193,
+                head_len: 409_600,
+                data_seg_id: 8194,
+                data_len: 1 << 20,
             },
         ];
         for resp in cases {
@@ -689,8 +816,8 @@ mod tests {
         }
     }
 
-    const REQ_TAGS: [u8; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-    const RESP_TAGS: [u8; 8] = [128, 129, 130, 131, 132, 133, 134, 135];
+    const REQ_TAGS: [u8; 14] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+    const RESP_TAGS: [u8; 11] = [128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138];
 
     /// Property-fuzz the two decoders: many deterministic iterations of random
     /// bytes and mutated-valid frames must each return `Ok`/`Err`, never panic,

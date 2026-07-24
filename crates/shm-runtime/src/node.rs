@@ -20,6 +20,7 @@ use arrow_schema::SchemaRef;
 use shm_arrow::{read_batch, write_batch, PinGuard, PoolAllocator, SchemaRegistry};
 use shm_artifact::{Artifact, VersionEvent, ARTIFACTS_TOPIC};
 use shm_core::{BorrowJournal, ChunkDesc, Pool, Segment};
+use shm_store::{KeyResolver, KeyedStore};
 use shm_ring::{DoorbellNotifier, DoorbellParker, Msg, Publisher, Ring, Subscriber};
 use shm_stream::{Commit, Coordination, StreamWriter};
 use shm_task::{
@@ -69,6 +70,23 @@ struct TaskQueueMap {
     done_write: OwnedFd,
 }
 
+/// A coordinator-granted keyed-store mapping: the three store segments (catalog,
+/// head-management, shared data pool). ADR-0007 G3.
+struct StoreMap {
+    catalog_seg: Arc<Segment>,
+    head_seg: Arc<Segment>,
+    data_seg: Arc<Segment>,
+}
+
+/// A node's local bidirectional **key cache** (opaque key bytes ↔ interned
+/// `key_id`), filled from the coordinator, so a warm key resolves with no UDS
+/// round-trip — the `schema_id` precedent applied to keys (ADR-0007 G3).
+#[derive(Default)]
+struct KeyCache {
+    by_bytes: HashMap<Vec<u8>, u32>,
+    by_id: HashMap<u32, Vec<u8>>,
+}
+
 /// An actor's handle onto a running coordinator's substrate.
 pub struct Node {
     name: String,
@@ -79,6 +97,11 @@ pub struct Node {
     topics: HashMap<String, TopicRing>,
     artifacts: HashMap<String, ArtifactMap>,
     task_queue: Option<TaskQueueMap>,
+    /// The mapped keyed-store segments (ADR-0007 G3), on first
+    /// [`open_store`](Node::open_store).
+    store: Option<StoreMap>,
+    /// The local key cache (filled by [`intern_key`](Node::intern_key)).
+    keys: Mutex<KeyCache>,
     /// Guarded send side (shared with the heartbeat thread).
     send: Arc<Mutex<UnixStream>>,
     /// Read side (responses only; main thread).
@@ -150,6 +173,8 @@ impl Node {
             topics: HashMap::new(),
             artifacts: HashMap::new(),
             task_queue: None,
+            store: None,
+            keys: Mutex::new(KeyCache::default()),
             send,
             read_stream,
             heartbeat: None,
@@ -210,6 +235,117 @@ impl Node {
         let schema = shm_arrow::deserialize_schema(&schema_bytes)?;
         self.registry.insert(schema_id, schema.clone());
         Ok(schema)
+    }
+
+    /// Intern an opaque store `key` at the coordinator (ADR-0007 G3), returning
+    /// its stable `key_id` and caching the mapping both ways. Probes the local
+    /// cache first (no syscall on a hit) — the `schema_id` precedent for keys.
+    pub fn intern_key(&self, key: &[u8]) -> Result<u32> {
+        {
+            let c = self.keys.lock().expect("key cache poisoned");
+            if let Some(&id) = c.by_bytes.get(key) {
+                return Ok(id);
+            }
+        }
+        let (resp, _fds) = self.request(&Request::InternKey {
+            key_bytes: key.to_vec(),
+        })?;
+        let key_id = match resp {
+            Response::KeyInterned { key_id } => key_id,
+            Response::Error { message } => return Err(Error::Rejected(message)),
+            _ => return Err(Error::Protocol("expected KeyInterned")),
+        };
+        let mut c = self.keys.lock().expect("key cache poisoned");
+        c.by_bytes.insert(key.to_vec(), key_id);
+        c.by_id.insert(key_id, key.to_vec());
+        Ok(key_id)
+    }
+
+    /// Resolve a coordinator-issued `key_id` back to its opaque key bytes
+    /// (ADR-0007 G3), caching the mapping. Local cache first, then UDS.
+    pub fn resolve_key(&self, key_id: u32) -> Result<Vec<u8>> {
+        {
+            let c = self.keys.lock().expect("key cache poisoned");
+            if let Some(bytes) = c.by_id.get(&key_id) {
+                return Ok(bytes.clone());
+            }
+        }
+        let (resp, _fds) = self.request(&Request::ResolveKey { key_id })?;
+        let key_bytes = match resp {
+            Response::KeyResolved { key_bytes } => key_bytes,
+            Response::Error { message } => return Err(Error::Rejected(message)),
+            _ => return Err(Error::Protocol("expected KeyResolved")),
+        };
+        let mut c = self.keys.lock().expect("key cache poisoned");
+        c.by_bytes.insert(key_bytes.clone(), key_id);
+        c.by_id.insert(key_id, key_bytes.clone());
+        Ok(key_bytes)
+    }
+
+    /// Map the built-in keyed store's three segments (idempotent). Usually called
+    /// implicitly by [`store`](Node::store).
+    pub fn open_store(&mut self) -> Result<()> {
+        if self.store.is_some() {
+            return Ok(());
+        }
+        let (resp, mut fds) = self.request(&Request::OpenStore)?;
+        let (catalog_seg_id, head_seg_id, data_seg_id) = match resp {
+            Response::StoreGranted {
+                catalog_seg_id,
+                head_seg_id,
+                data_seg_id,
+                ..
+            } => (catalog_seg_id, head_seg_id, data_seg_id),
+            Response::Error { message } => return Err(Error::Rejected(message)),
+            _ => return Err(Error::Protocol("expected StoreGranted")),
+        };
+        if fds.len() != 3 {
+            return Err(Error::MissingFds {
+                expected: 3,
+                received: fds.len(),
+            });
+        }
+        // fd order (coordinator send order): catalog, head, data.
+        let data_fd = fds.pop().unwrap();
+        let head_fd = fds.pop().unwrap();
+        let catalog_fd = fds.pop().unwrap();
+        // SAFETY: freshly-received SCM_RIGHTS fds naming the store's catalog / head
+        // / data shm segments; ownership transfers to the mapped `Segment`s.
+        let catalog_seg =
+            Arc::new(unsafe { Segment::from_raw_fd(into_raw(catalog_fd), catalog_seg_id)? });
+        let head_seg = Arc::new(unsafe { Segment::from_raw_fd(into_raw(head_fd), head_seg_id)? });
+        let data_seg = Arc::new(unsafe { Segment::from_raw_fd(into_raw(data_fd), data_seg_id)? });
+        self.store = Some(StoreMap {
+            catalog_seg,
+            head_seg,
+            data_seg,
+        });
+        Ok(())
+    }
+
+    /// A handle onto the built-in keyed store (ADR-0007 G3), mapping it on first
+    /// use. Use it to [`create`](shm_store::KeyedStore::create) /
+    /// [`open`](shm_store::KeyedStore::open) / [`evict`](shm_store::KeyedStore::evict)
+    /// keyed artifacts — e.g. `node.store()?.create(key, kind, &schema)?`.
+    ///
+    /// The handle borrows this node (as the key-interning
+    /// [`KeyResolver`](shm_store::KeyResolver)) but its [`Entry`](shm_store::Entry)
+    /// results are self-owned and outlive it.
+    pub fn store(&mut self) -> Result<KeyedStore<'_>> {
+        self.open_store()?;
+        // Reborrow `&mut self` as `&Node` for the rest: `open_store` already ran,
+        // so no further mutation is needed and the returned handle borrows shared.
+        let this: &Node = self;
+        let m = this.store.as_ref().expect("store mapped above");
+        Ok(KeyedStore::new(
+            m.catalog_seg.clone(),
+            m.head_seg.clone(),
+            m.data_seg.clone(),
+            this.journal_seg.clone(),
+            this.registry.clone(),
+            this.actor_id,
+            this,
+        ))
     }
 
     /// The actor id assigned by the coordinator.
@@ -635,6 +771,15 @@ impl Node {
     /// treating it as a crash.
     pub fn say_bye(&self) -> Result<()> {
         self.fire(&Request::Bye)
+    }
+}
+
+/// The [`Node`] is the keyed store's key-interning seam: it resolves opaque key
+/// bytes to a coordinator-issued `key_id` over UDS (with a local cache), so
+/// `shm-store` never speaks the control protocol itself (ADR-0007 G3).
+impl KeyResolver for Node {
+    fn intern_key(&self, key: &[u8]) -> shm_store::Result<u32> {
+        Node::intern_key(self, key).map_err(|e| shm_store::Error::Intern(e.to_string()))
     }
 }
 

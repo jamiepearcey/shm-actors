@@ -7,6 +7,7 @@ members = [
     "crates/shm-task",
     "crates/shm-artifact",
     "crates/shm-stream",
+    "crates/shm-store",
     "crates/shm-runtime",
     "crates/shm-bench",
     "crates/shm-arrowref-spike",
@@ -31,6 +32,7 @@ shm-ring = { path = "crates/shm-ring" }
 shm-task = { path = "crates/shm-task" }
 shm-artifact = { path = "crates/shm-artifact" }
 shm-stream = { path = "crates/shm-stream" }
+shm-store = { path = "crates/shm-store" }
 shm-runtime = { path = "crates/shm-runtime" }
 
 # External

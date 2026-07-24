@@ -54,6 +54,18 @@ pub struct RuntimeConfig {
 
     /// Size in bytes of each artifact's data segment.
     pub artifact_data_size: usize,
+
+    /// Slot capacity of the built-in keyed store's catalog (ADR-0007 G3). Each
+    /// `create` appends one slot (never reused after eviction), so this bounds the
+    /// number of distinct-entry lifetimes.
+    pub store_capacity: u32,
+
+    /// Pool geometry carved into the keyed store's shared data segment (backs
+    /// every entry's data + manifest chunks).
+    pub store_pool: PoolConfig,
+
+    /// Size in bytes of the keyed store's shared data segment.
+    pub store_data_size: usize,
 }
 
 /// Id offset separating the journal-segment id range from payload/ring ids.
@@ -66,6 +78,16 @@ pub const TASKQ_ID_OFFSET: u32 = 512;
 /// Base id offset of the per-artifact segment pair (head, data). Kept well above
 /// the journal range so a busy actor/topic/artifact population never collides.
 pub const ARTIFACT_ID_OFFSET: u32 = 4096;
+
+/// Base id offset of the keyed store's three segments (catalog, head, data). Kept
+/// well above the per-artifact range so populations never collide.
+pub const STORE_ID_OFFSET: u32 = 8192;
+
+/// First lineage `artifact_id` the keyed store issues (ADR-0007 G3). Kept far
+/// above the coordinator's per-name artifact id space (which starts at 1) so a
+/// journaled entry pin's `artifact_id` unambiguously routes to the store rather
+/// than to a normal hosted artifact.
+pub const STORE_ARTIFACT_ID_BASE: u32 = 1 << 28;
 
 impl Default for RuntimeConfig {
     fn default() -> RuntimeConfig {
@@ -86,6 +108,12 @@ impl Default for RuntimeConfig {
             // manifest chunk comfortably and fit the 1 MiB data segment.
             artifact_pool: PoolConfig::power_of_two(256, 8192, 8),
             artifact_data_size: 1 << 20,
+            // The keyed store shares one data pool across all entries, so give it
+            // more chunks per class than a single artifact; small classes hold the
+            // demo/skeleton batch + its manifest comfortably.
+            store_capacity: 256,
+            store_pool: PoolConfig::power_of_two(256, 8192, 32),
+            store_data_size: 1 << 20,
         }
     }
 }
@@ -135,5 +163,23 @@ impl RuntimeConfig {
     #[inline]
     pub fn artifact_head_seg_id(&self, i: u32) -> u32 {
         self.seg_base + ARTIFACT_ID_OFFSET + 2 * i
+    }
+
+    /// The keyed store's **catalog** segment id.
+    #[inline]
+    pub fn store_catalog_seg_id(&self) -> u32 {
+        self.seg_base + STORE_ID_OFFSET
+    }
+
+    /// The keyed store's **head** (management) segment id.
+    #[inline]
+    pub fn store_head_seg_id(&self) -> u32 {
+        self.seg_base + STORE_ID_OFFSET + 1
+    }
+
+    /// The keyed store's **data** (shared pool) segment id.
+    #[inline]
+    pub fn store_data_seg_id(&self) -> u32 {
+        self.seg_base + STORE_ID_OFFSET + 2
     }
 }

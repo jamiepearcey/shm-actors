@@ -57,7 +57,7 @@ use shm_core::{BorrowJournal, ChunkCtrl, ChunkDesc, PackedRef, Pool, PoolConfig,
 
 use crate::error::{Error, Result};
 use crate::event::{CommitKind, VersionEvent};
-use crate::head::{ArtifactHead, NO_VERSION, OWNER_NONE};
+use crate::head::{ArtifactHead, NO_VERSION, OWNER_NONE, SLOT_LIVE};
 use crate::manifest::{read_manifest, read_manifest_checked, write_manifest, Manifest};
 
 /// How a commit relates the new version to its predecessor.
@@ -103,6 +103,12 @@ pub struct Artifact {
     name_id: u32,
     head_seg: Arc<Segment>,
     data_seg: Arc<Segment>,
+    /// Byte offset of this artifact's [`ArtifactHead`] within `head_seg`'s
+    /// payload. `0` for the standard one-head-per-segment layout
+    /// ([`create`](Self::create)/[`attach`](Self::attach)); non-zero only for the
+    /// keyed-store layout ([`create_at`](Self::create_at)/[`attach_at`](Self::attach_at),
+    /// ADR-0007 G3) that packs many heads into one shared management segment.
+    head_off: usize,
     watch: Option<Box<dyn Fn(VersionEvent) + Send + Sync>>,
 }
 
@@ -137,6 +143,7 @@ impl Artifact {
             name_id,
             head_seg,
             data_seg,
+            head_off: 0,
             watch: None,
         })
     }
@@ -160,6 +167,81 @@ impl Artifact {
             name_id,
             head_seg,
             data_seg,
+            head_off: 0,
+            watch: None,
+        })
+    }
+
+    /// **ADDITIVE (v0.5 / ADR-0007 G3 — `shm-store`).** Create an artifact whose
+    /// [`ArtifactHead`] is placed at byte `head_off` within `head_seg`'s payload,
+    /// over a [`Pool`] that has **already** been laid into `data_seg` by the
+    /// caller (this does **not** create the pool).
+    ///
+    /// This is the offset-and-shared-pool counterpart of [`create`](Self::create)
+    /// that a keyed store (`shm-store`) uses to pack **many** artifact heads into
+    /// one shared management segment while all of them share one data pool: the
+    /// store creates the pool once, then calls this per entry. The RCU/MVCC
+    /// read/write/reclaim machinery is otherwise identical — only where the head
+    /// lives differs. `head_off` must be 8-byte aligned.
+    pub fn create_at(
+        name_id: u32,
+        head_seg: Arc<Segment>,
+        head_off: usize,
+        data_seg: Arc<Segment>,
+    ) -> Result<Artifact> {
+        debug_assert!(head_off.is_multiple_of(8), "head_off must be 8-byte aligned");
+        let need = head_off
+            .checked_add(ArtifactHead::region_bytes())
+            .ok_or(Error::Core(shm_core::Error::LayoutOverflow(
+                "head offset overflow",
+            )))?;
+        if head_seg.payload_len() < need {
+            return Err(Error::Core(shm_core::Error::LayoutOverflow(
+                "head segment too small for ArtifactHead at offset",
+            )));
+        }
+        // SAFETY: `payload_ptr()` is 64-byte aligned, `head_off` is 8-aligned (so
+        // the sum meets `ArtifactHead`'s 8-byte alignment), and the check above
+        // guarantees the region is large enough. Creation is single-threaded by
+        // contract (the store's per-entry slot is freshly claimed).
+        let ptr = unsafe { head_seg.payload_ptr().add(head_off).cast::<ArtifactHead>() };
+        // SAFETY: as above; the region is exclusively owned for this init.
+        unsafe { ArtifactHead::init_at(ptr) };
+        Ok(Artifact {
+            name_id,
+            head_seg,
+            data_seg,
+            head_off,
+            watch: None,
+        })
+    }
+
+    /// **ADDITIVE (v0.5 / ADR-0007 G3 — `shm-store`).** Attach to an artifact
+    /// whose [`ArtifactHead`] lives at byte `head_off` within `head_seg`, over a
+    /// shared pool already present in `data_seg`. The offset counterpart of
+    /// [`attach`](Self::attach); validates the pool and head magics.
+    pub fn attach_at(
+        name_id: u32,
+        head_seg: Arc<Segment>,
+        head_off: usize,
+        data_seg: Arc<Segment>,
+    ) -> Result<Artifact> {
+        // Validates `POOL_MAGIC` on the shared store pool.
+        Pool::attach(&data_seg)?;
+        let need = head_off
+            .checked_add(ArtifactHead::region_bytes())
+            .ok_or(Error::BadMagic)?;
+        if head_seg.payload_len() < need {
+            return Err(Error::BadMagic);
+        }
+        if !head_ref_at(&head_seg, head_off).check_magic() {
+            return Err(Error::BadMagic);
+        }
+        Ok(Artifact {
+            name_id,
+            head_seg,
+            data_seg,
+            head_off,
             watch: None,
         })
     }
@@ -190,10 +272,47 @@ impl Artifact {
         self.head().current.load(SeqCst)
     }
 
-    /// Borrow the on-shm [`ArtifactHead`].
+    /// Borrow the on-shm [`ArtifactHead`] (at this artifact's `head_off`).
     #[inline]
     fn head(&self) -> &ArtifactHead {
-        head_ref(&self.head_seg)
+        head_ref_at(&self.head_seg, self.head_off)
+    }
+
+    /// **ADDITIVE (v0.5 / ADR-0007 G3 — `shm-store` eviction).** Tear down every
+    /// version so a keyed store can reclaim all of an evicted entry's chunks by
+    /// refcount, reusing the *unchanged* RCU retire path.
+    ///
+    /// It stores [`NO_VERSION`] into `current` (and clears `manifest_desc`), which
+    /// makes **every** live version non-current, then drives
+    /// [`try_retire_version`] on each live slot:
+    ///
+    /// - an **unpinned** version is reclaimed immediately here (its data chunks
+    ///   released by refcount — shared/Append chunks survive until their last
+    ///   referencing version goes — and its manifest chunk freed);
+    /// - a **still-pinned** version (a live reader, or a crash-leaked pin the
+    ///   coordinator has not yet released) is reclaimed by the *standard*
+    ///   non-current retire when its last pin drops — because `current` is now
+    ///   [`NO_VERSION`], [`VersionPin`]'s `Drop` (and
+    ///   [`release_leaked_pin`](Self::release_leaked_pin)) see it as non-current
+    ///   and retire it.
+    ///
+    /// No RCU rule is reinvented; this only flips `current` and nudges the retirer.
+    /// Idempotent: a second call finds no live versions and is a no-op. The caller
+    /// must have first quiesced writers to the entry (the store tombstones the
+    /// catalog slot before calling this, so no new commit or pin can target it).
+    pub fn evict_all(&self) -> Result<()> {
+        let head = self.head();
+        head.current.store(NO_VERSION, SeqCst);
+        head.manifest_desc.store(0, Release);
+        for slot in head.pins.iter() {
+            if slot.state.load(Acquire) == SLOT_LIVE {
+                let v = slot.version.load(Acquire);
+                if v != NO_VERSION {
+                    try_retire_version(head, &self.data_seg, v)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     // ---- Write path: exclusive + optimistic commit ----
@@ -687,6 +806,7 @@ impl Artifact {
                 inner: Arc::new(PinState {
                     head_seg: self.head_seg.clone(),
                     data_seg: self.data_seg.clone(),
+                    head_off: self.head_off,
                     version: v,
                     slot_idx: idx,
                     manifest,
@@ -754,11 +874,21 @@ impl RefUnwindSafe for Artifact {}
 /// Borrow the [`ArtifactHead`] at the base of a management segment's payload.
 #[inline]
 fn head_ref(head_seg: &Segment) -> &ArtifactHead {
-    // SAFETY: `Artifact::create` initialised an `ArtifactHead` at the payload
-    // base (64-byte aligned, sufficiently large). The region stays mapped for
-    // the segment's lifetime, and every field is an atomic (`Sync`), so a shared
-    // reference for concurrent atomic access is sound.
-    unsafe { &*head_seg.payload_ptr().cast::<ArtifactHead>() }
+    head_ref_at(head_seg, 0)
+}
+
+/// Borrow the [`ArtifactHead`] at byte `off` within a management segment's
+/// payload (`off == 0` is the standard single-head layout; a non-zero offset is
+/// the keyed-store shared-management-segment layout, ADR-0007 G3).
+#[inline]
+fn head_ref_at(head_seg: &Segment, off: usize) -> &ArtifactHead {
+    // SAFETY: `create`/`create_at` initialised an `ArtifactHead` at `off`
+    // (payload_ptr is 64-byte aligned and `off` is 8-aligned, so the address
+    // meets the head's alignment; a bounds check at construction guaranteed the
+    // region is large enough). The region stays mapped for the segment's
+    // lifetime, and every field is an atomic (`Sync`), so a shared reference for
+    // concurrent atomic access is sound.
+    unsafe { &*head_seg.payload_ptr().add(off).cast::<ArtifactHead>() }
 }
 
 /// Stage one chunk: run `write` (which loans + writes it), then publish it, take
@@ -1107,6 +1237,9 @@ pub struct VersionPin {
 struct PinState {
     head_seg: Arc<Segment>,
     data_seg: Arc<Segment>,
+    /// Byte offset of the [`ArtifactHead`] within `head_seg` (see
+    /// [`Artifact::head_off`]); `0` for the standard layout.
+    head_off: usize,
     version: u64,
     slot_idx: usize,
     manifest: Manifest,
@@ -1139,7 +1272,7 @@ impl Drop for PinState {
                 let _ = journal.release(jp.slot);
             }
         }
-        let head = head_ref(&self.head_seg);
+        let head = head_ref_at(&self.head_seg, self.head_off);
         let slot = &head.pins[self.slot_idx];
         // We hold a live pin, so the slot still tracks our version and cannot be
         // reclaimed/reused underneath us.

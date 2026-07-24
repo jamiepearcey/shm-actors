@@ -26,15 +26,16 @@ use std::time::Instant;
 
 use core::sync::atomic::Ordering;
 
-use shm_artifact::Artifact;
+use shm_artifact::{Artifact, ArtifactHead};
 use shm_core::{
     doorbell_pair, BorrowJournal, ChunkCtrl, ChunkDesc, DoorbellPair, JournalRecord, Pool, Segment,
     FREE, LOANED, PUBLISHED,
 };
 use shm_ring::{required_bytes, DoorbellNotifier, Ring};
+use shm_store::Catalog;
 use shm_task::{now_nanos, ReapReport, TaskQueue};
 
-use crate::config::RuntimeConfig;
+use crate::config::{RuntimeConfig, STORE_ARTIFACT_ID_BASE};
 use crate::error::{Error, Result};
 use crate::protocol::{Request, Response};
 use crate::uds::{recv_frame, send_frame};
@@ -135,9 +136,21 @@ struct CoordState {
     /// The reverse map `schema_id` → serialized schema bytes, answering
     /// [`ResolveSchema`](crate::protocol::Request::ResolveSchema).
     schema_bytes: HashMap<u32, Vec<u8>>,
-    /// Next schema id to issue (monotonic, starts at 1; 0 is
-    /// [`RAW_SCHEMA_ID`](shm_arrow::RAW_SCHEMA_ID) and never issued).
+    /// Next schema id to issue (monotonic). Starts at
+    /// [`FIRST_USER_SCHEMA_ID`](shm_store::FIRST_USER_SCHEMA_ID) (16): ids `1..=15`
+    /// are reserved as **system** ids (ADR-0007 §ABI — envelope =
+    /// [`SCHEMA_TYPED_REF`](shm_store::SCHEMA_TYPED_REF)) and `0` is
+    /// [`RAW_SCHEMA_ID`](shm_arrow::RAW_SCHEMA_ID).
     next_schema_id: u32,
+    /// Master **key** catalog (ADR-0007 G3): opaque key bytes → issued `key_id`.
+    /// The coordinator is authoritative; nodes cache learned mappings. Keying is
+    /// by exact bytes, so an equal key from any process converges on one id.
+    key_ids: HashMap<Vec<u8>, u32>,
+    /// The reverse map `key_id` → key bytes, answering
+    /// [`ResolveKey`](crate::protocol::Request::ResolveKey).
+    key_bytes: HashMap<u32, Vec<u8>>,
+    /// Next key id to issue (monotonic, starts at 1; `0` is reserved for "none").
+    next_key_id: u32,
 }
 
 /// State shared across the accept thread, handler threads, and lease monitor.
@@ -156,6 +169,16 @@ struct CoordShared {
     work_db: DoorbellPair,
     /// The task queue's done doorbell (wakes parked requesters on completion).
     done_db: DoorbellPair,
+    /// The keyed store's **catalog** segment (ADR-0007 G3). The coordinator
+    /// created + initialised it and keeps it mapped so it can (a) grant its fd and
+    /// (b) read the catalog to route a dead actor's leaked entry pins / write
+    /// leases back to their `ArtifactHead` on crash.
+    store_catalog_seg: Arc<Segment>,
+    /// The keyed store's **head** (management) segment (packs every entry's
+    /// `ArtifactHead`).
+    store_head_seg: Arc<Segment>,
+    /// The keyed store's **data** (shared pool) segment.
+    store_data_seg: Arc<Segment>,
     state: Mutex<CoordState>,
     running: AtomicBool,
 }
@@ -207,6 +230,32 @@ impl Coordinator {
         }
         let work_db = doorbell_pair()?;
         let done_db = doorbell_pair()?;
+
+        // Built-in keyed store (ADR-0007 G3): three segments — the catalog (shm
+        // fast-path index), the head management segment (packs every entry's
+        // ArtifactHead), and the data segment (one shared pool). The coordinator
+        // initialises the catalog + data pool; entries' heads are laid lazily on
+        // `create`. Each head slot is 64-byte aligned for Arrow-friendly access.
+        let head_stride = (ArtifactHead::region_bytes() + 63) & !63;
+        let store_catalog_id = config.store_catalog_seg_id();
+        let store_head_id = config.store_head_seg_id();
+        let store_data_id = config.store_data_seg_id();
+        let store_catalog_seg = Arc::new(create_segment(
+            store_catalog_id,
+            Catalog::segment_bytes(config.store_capacity),
+        )?);
+        Catalog::init(
+            &store_catalog_seg,
+            config.store_capacity,
+            head_stride as u32,
+            STORE_ARTIFACT_ID_BASE,
+        )?;
+        let store_head_seg = Arc::new(create_segment(
+            store_head_id,
+            shm_core::segment::HEADER_SIZE + config.store_capacity as usize * head_stride,
+        )?);
+        let store_data_seg = Arc::new(create_segment(store_data_id, config.store_data_size)?);
+        Pool::create(&store_data_seg, &config.store_pool)?;
         // The coordinator's own queue handle, wired so reap can ring the
         // doorbells. Its notifiers borrow the write-ends the coordinator retains.
         // SAFETY: the region was just initialized above and stays mapped for the
@@ -224,6 +273,9 @@ impl Coordinator {
             task_queue,
             work_db,
             done_db,
+            store_catalog_seg,
+            store_head_seg,
+            store_data_seg,
             state: Mutex::new(CoordState {
                 next_actor_id: 1,
                 next_topic_index: 0,
@@ -238,10 +290,19 @@ impl Coordinator {
                 reclaimed: Vec::new(),
                 artifact_pins_reclaimed: 0,
                 write_leases_reclaimed: 0,
-                created_seg_ids: vec![payload_id, task_queue_id],
+                created_seg_ids: vec![
+                    payload_id,
+                    task_queue_id,
+                    store_catalog_id,
+                    store_head_id,
+                    store_data_id,
+                ],
                 schema_ids: HashMap::new(),
                 schema_bytes: HashMap::new(),
-                next_schema_id: 1,
+                next_schema_id: shm_store::FIRST_USER_SCHEMA_ID,
+                key_ids: HashMap::new(),
+                key_bytes: HashMap::new(),
+                next_key_id: 1,
             }),
             running: AtomicBool::new(true),
         });
@@ -446,6 +507,56 @@ impl Coordinator {
         intern_schema(&self.shared, schema_bytes)
     }
 
+    /// Intern store key bytes directly in the coordinator's master key catalog
+    /// (ADR-0007 G3), returning the stable id — the exact path a node's
+    /// `InternKey` request drives, for deterministic same-process tests.
+    pub fn intern_key_bytes(&self, key_bytes: &[u8]) -> u32 {
+        intern_key(&self.shared, key_bytes)
+    }
+
+    /// Resolve a coordinator-issued `key_id` back to its key bytes, or `None`.
+    pub fn resolve_key_bytes(&self, key_id: u32) -> Option<Vec<u8>> {
+        resolve_key_bytes(&self.shared, key_id)
+    }
+
+    /// Total free chunks across **all** size classes of the keyed store's shared
+    /// data pool (ADR-0007 G3), for a leak census in tests. A create + commit
+    /// consumes chunks; a full evict + reclaim returns this to its baseline.
+    pub fn store_data_free_total(&self) -> Option<usize> {
+        let pool = Pool::attach(&self.shared.store_data_seg).ok()?;
+        Some((0..pool.num_classes()).map(|c| pool.free_count(c)).sum())
+    }
+
+    /// The current (latest) version of the keyed-store entry for `key`, or `None`
+    /// if no live entry exists. `0` means "created but nothing committed".
+    pub fn store_entry_version(&self, key: &[u8]) -> Option<u64> {
+        self.store_entry_artifact(key).map(|a| a.current_version())
+    }
+
+    /// The live pin count on the keyed-store entry for `key` at `version`, or
+    /// `None` if no live entry / no live slot tracks it. Lets a test prove a
+    /// leaked entry pin was decremented by crash replay (ADR-0007 G3 × item J).
+    pub fn store_entry_pins(&self, key: &[u8], version: u64) -> Option<u32> {
+        self.store_entry_artifact(key)
+            .and_then(|a| a.version_pin_count(version))
+    }
+
+    /// Attach an [`Artifact`] handle onto the live keyed-store entry for `key` (by
+    /// interned key id → catalog slot → `ArtifactHead`), or `None` if none is live.
+    fn store_entry_artifact(&self, key: &[u8]) -> Option<Artifact> {
+        let key_id = *self.shared.state.lock().unwrap().key_ids.get(key)?;
+        let cat = Catalog::attach(&self.shared.store_catalog_seg).ok()?;
+        let idx = cat.find_live_by_key(key_id)?;
+        let head_off = cat.slot(idx).head_off() as usize;
+        Artifact::attach_at(
+            cat.artifact_id_for(idx),
+            self.shared.store_head_seg.clone(),
+            head_off,
+            self.shared.store_data_seg.clone(),
+        )
+        .ok()
+    }
+
     /// Resolve a coordinator-issued `schema_id` back to its serialized schema
     /// bytes (test/observability), or `None` if never interned.
     pub fn resolve_schema_bytes(&self, schema_id: u32) -> Option<Vec<u8>> {
@@ -569,6 +680,22 @@ fn handle_connection(shared: Arc<CoordShared>, stream: UnixStream) -> Result<()>
                     },
                 };
                 send_frame(&stream, &resp.encode(), &[])?;
+            }
+            Request::InternKey { key_bytes } => {
+                let key_id = intern_key(&shared, &key_bytes);
+                send_frame(&stream, &Response::KeyInterned { key_id }.encode(), &[])?;
+            }
+            Request::ResolveKey { key_id } => {
+                let resp = match resolve_key_bytes(&shared, key_id) {
+                    Some(key_bytes) => Response::KeyResolved { key_bytes },
+                    None => Response::Error {
+                        message: format!("unknown key_id {key_id}"),
+                    },
+                };
+                send_frame(&stream, &resp.encode(), &[])?;
+            }
+            Request::OpenStore => {
+                grant_store(&shared, &stream)?;
             }
             Request::Bye => {
                 if let Some(id) = actor_id {
@@ -831,6 +958,51 @@ fn resolve_schema_bytes(shared: &Arc<CoordShared>, schema_id: u32) -> Option<Vec
         .cloned()
 }
 
+// ---- Key coordinator (ADR-0007 G3) ----
+
+/// Intern opaque store key bytes in the coordinator's master catalog, returning a
+/// stable id. Idempotent by exact bytes (the same key from any process converges
+/// on one id), mirroring the schema-interning path; `0` is reserved for "none".
+fn intern_key(shared: &Arc<CoordShared>, key_bytes: &[u8]) -> u32 {
+    let mut st = shared.state.lock().unwrap();
+    if let Some(&id) = st.key_ids.get(key_bytes) {
+        return id;
+    }
+    let id = st.next_key_id;
+    st.next_key_id += 1;
+    st.key_ids.insert(key_bytes.to_vec(), id);
+    st.key_bytes.insert(id, key_bytes.to_vec());
+    id
+}
+
+/// Resolve a coordinator-issued `key_id` back to its key bytes, or `None`.
+fn resolve_key_bytes(shared: &Arc<CoordShared>, key_id: u32) -> Option<Vec<u8>> {
+    shared.state.lock().unwrap().key_bytes.get(&key_id).cloned()
+}
+
+/// Grant the built-in keyed store: its catalog, head, and data segment fds (in
+/// that order), plus each segment's id + payload length (ADR-0007 G3).
+///
+/// The node reads the catalog's capacity / head-stride / lineage base from the
+/// catalog header after mapping, so those are not carried in the frame.
+fn grant_store(shared: &Arc<CoordShared>, stream: &UnixStream) -> Result<()> {
+    let cat = &shared.store_catalog_seg;
+    let head = &shared.store_head_seg;
+    let data = &shared.store_data_seg;
+    let resp = Response::StoreGranted {
+        catalog_seg_id: cat.id(),
+        catalog_len: cat.payload_len() as u32,
+        head_seg_id: head.id(),
+        head_len: head.payload_len() as u32,
+        data_seg_id: data.id(),
+        data_len: data.payload_len() as u32,
+    };
+    // fd order the node relies on: catalog, head, data.
+    let fds = [cat.as_raw_fd(), head.as_raw_fd(), data.as_raw_fd()];
+    send_frame(stream, &resp.encode(), &fds)?;
+    Ok(())
+}
+
 /// Handle a consumer's `Pinned`: the chunk now has a live shared pin, so it is
 /// safe to release the producer's exclusive ownership (no reclaim race). This
 /// "arms" the chunk so that when the pinning actor dies, its pin is the only
@@ -932,6 +1104,9 @@ fn reclaim_dead(
         for a in st.artifacts.values() {
             v.push(a.data_seg.clone());
         }
+        // The keyed store's shared data pool can also hold a dead actor's
+        // journaled chunks (ADR-0007 G3), so route by its segment id too.
+        v.push(shared.store_data_seg.clone());
         v
     };
     let pools: Vec<(u32, Pool)> = segs
@@ -999,7 +1174,16 @@ fn reclaim_write_lease(shared: &Arc<CoordShared>, artifact_id: u32) -> bool {
 
 /// Route an interned `artifact_id` back to its hosted artifact and attach a
 /// handle onto it (shared by the item-J and item-K reclaim paths).
+///
+/// Lineage ids `>= STORE_ARTIFACT_ID_BASE` name a **keyed-store entry** rather
+/// than a per-name artifact, so those are routed through the store's catalog
+/// (ADR-0007 G3): the store is the registry of record via the segments the
+/// coordinator owns, so a dead actor's leaked entry pin / write lease is released
+/// against the entry's `ArtifactHead` exactly like a normal artifact's.
 fn attach_artifact_by_id(shared: &Arc<CoordShared>, artifact_id: u32) -> Option<Artifact> {
+    if artifact_id >= STORE_ARTIFACT_ID_BASE {
+        return attach_store_entry_by_id(shared, artifact_id);
+    }
     let (name_id, head, data) = {
         let st = shared.state.lock().unwrap();
         let name = st.artifact_name_by_id.get(&artifact_id)?.clone();
@@ -1007,6 +1191,23 @@ fn attach_artifact_by_id(shared: &Arc<CoordShared>, artifact_id: u32) -> Option<
         (a.name_id, a.head_seg.clone(), a.data_seg.clone())
     };
     Artifact::attach(name_id, head, data).ok()
+}
+
+/// Route a keyed-store lineage `artifact_id` to its entry's `ArtifactHead` by
+/// reading the store catalog (which the coordinator maps): find the slot for the
+/// id, take its `head_off`, and attach a handle at that offset over the store's
+/// shared head + data segments.
+fn attach_store_entry_by_id(shared: &Arc<CoordShared>, artifact_id: u32) -> Option<Artifact> {
+    let cat = Catalog::attach(&shared.store_catalog_seg).ok()?;
+    let idx = cat.slot_for_artifact_id(artifact_id)?;
+    let head_off = cat.slot(idx).head_off() as usize;
+    Artifact::attach_at(
+        artifact_id,
+        shared.store_head_seg.clone(),
+        head_off,
+        shared.store_data_seg.clone(),
+    )
+    .ok()
 }
 
 /// The single-pool **chunk** reclaim core, factored out so it can be unit-tested

@@ -33,6 +33,10 @@ pub enum Error {
     #[error("stream: {0}")]
     Stream(String),
 
+    /// An error from the keyed store (ADR-0007 G3).
+    #[error("store: {0}")]
+    Store(String),
+
     /// A standard-library I/O error (UDS accept/connect/read/write).
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -98,5 +102,11 @@ impl From<shm_task::Error> for Error {
 impl From<shm_stream::Error> for Error {
     fn from(e: shm_stream::Error) -> Self {
         Error::Stream(e.to_string())
+    }
+}
+
+impl From<shm_store::Error> for Error {
+    fn from(e: shm_store::Error) -> Self {
+        Error::Store(e.to_string())
     }
 }
