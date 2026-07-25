@@ -46,9 +46,25 @@ impl Subscriber<YieldParker> {
 
     /// Subscribe from sequence `0` (replays whatever is still live in the ring).
     pub fn from_start(ring: Ring) -> Subscriber<YieldParker> {
-        let mut s = Self::with_parker(ring, YieldParker);
-        s.cursor = 0;
-        s
+        Self::from_seq(ring, 0)
+    }
+
+    /// Subscribe from an explicit sequence — resume a consumer that already knows
+    /// how far it read.
+    ///
+    /// `seq` is the next sequence to deliver, matching [`cursor`](Subscriber::cursor),
+    /// so a consumer resumes with `from_seq(ring, last_seen + 1)`. Both
+    /// [`new`](Subscriber::new) and [`from_start`](Subscriber::from_start) are
+    /// special cases (`ring.head()` and `0`).
+    ///
+    /// The cursor is not clamped, because the ring already resolves both ends:
+    /// a `seq` that has been lapped out yields [`Msg::Lagged`] on the first read
+    /// and resyncs to the oldest still-live message, and a `seq` at or beyond the
+    /// head simply blocks until the producer reaches it. A caller that must
+    /// distinguish "replayed from where I asked" from "resynced after a lap"
+    /// should check for `Msg::Lagged` rather than pre-validating `seq`.
+    pub fn from_seq(ring: Ring, seq: u64) -> Subscriber<YieldParker> {
+        Self::from_seq_with_parker(ring, YieldParker, seq)
     }
 }
 
@@ -63,8 +79,15 @@ impl<P: Parker> Subscriber<P> {
     /// custom [`Parker`] — the [`from_start`](Subscriber::from_start) counterpart
     /// for a doorbell-backed subscriber.
     pub fn from_start_with_parker(ring: Ring, parker: P) -> Subscriber<P> {
+        Self::from_seq_with_parker(ring, parker, 0)
+    }
+
+    /// Subscribe from an explicit sequence with a custom [`Parker`] — the
+    /// [`from_seq`](Subscriber::from_seq) counterpart for a doorbell-backed
+    /// subscriber. See `from_seq` for the out-of-range semantics.
+    pub fn from_seq_with_parker(ring: Ring, parker: P, seq: u64) -> Subscriber<P> {
         let mut s = Self::with_parker(ring, parker);
-        s.cursor = 0;
+        s.cursor = seq;
         s
     }
 

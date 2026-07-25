@@ -224,3 +224,106 @@ fn one_producer_two_consumers_no_gaps() {
     assert_eq!(got1, expected, "consumer 1 saw gaps or reordering");
     assert_eq!(got2, expected, "consumer 2 saw gaps or reordering");
 }
+
+#[test]
+fn from_seq_resumes_at_the_requested_sequence() {
+    let capacity = 64u32;
+    let fx = Fixture::new(capacity);
+    let ring = fx.init_ring(capacity);
+
+    let publisher = Publisher::new(ring.clone());
+    for i in 0..10 {
+        publisher.publish(counter_desc(i));
+    }
+
+    // Resume a consumer that has already read through seq 3.
+    let mut sub = Subscriber::from_seq(ring.clone(), 4);
+    assert_eq!(sub.cursor(), 4);
+    for i in 4..10 {
+        assert_eq!(sub.try_recv(), Some(Msg::Sample(counter_desc(i))));
+    }
+    assert!(sub.try_recv().is_none());
+}
+
+#[test]
+fn from_seq_reduces_to_new_and_from_start_at_the_boundaries() {
+    let capacity = 64u32;
+    let fx = Fixture::new(capacity);
+    let ring = fx.init_ring(capacity);
+
+    let publisher = Publisher::new(ring.clone());
+    for i in 0..5 {
+        publisher.publish(counter_desc(i));
+    }
+
+    // from_seq(0) == from_start: replays everything still live.
+    let mut from_zero = Subscriber::from_seq(ring.clone(), 0);
+    let mut from_start = Subscriber::from_start(ring.clone());
+    assert_eq!(from_zero.cursor(), from_start.cursor());
+    for i in 0..5 {
+        assert_eq!(from_zero.try_recv(), Some(Msg::Sample(counter_desc(i))));
+        assert_eq!(from_start.try_recv(), Some(Msg::Sample(counter_desc(i))));
+    }
+
+    // from_seq(head) == new: live-only, sees nothing already published.
+    let mut from_head = Subscriber::from_seq(ring.clone(), ring.head());
+    let mut live_only = Subscriber::new(ring.clone());
+    assert_eq!(from_head.cursor(), live_only.cursor());
+    assert!(from_head.try_recv().is_none());
+    assert!(live_only.try_recv().is_none());
+
+    publisher.publish(counter_desc(5));
+    assert_eq!(from_head.try_recv(), Some(Msg::Sample(counter_desc(5))));
+    assert_eq!(live_only.try_recv(), Some(Msg::Sample(counter_desc(5))));
+}
+
+#[test]
+fn from_seq_before_the_live_window_lags_then_resyncs() {
+    let capacity = 4u32;
+    let fx = Fixture::new(capacity);
+    let ring = fx.init_ring(capacity);
+
+    let publisher = Publisher::new(ring.clone());
+    let n = 10u64; // seqs 0..=9; only the last `capacity` (6..=9) stay live
+    for i in 0..n {
+        publisher.publish(counter_desc(i));
+    }
+
+    // Asking for a sequence that has already been overwritten is not an error:
+    // the first read reports the gap and resyncs to the oldest live message.
+    let oldest_live = n - capacity as u64;
+    let mut sub = Subscriber::from_seq(ring.clone(), 2);
+    match sub.try_recv() {
+        Some(Msg::Lagged(missed)) => assert_eq!(missed, oldest_live - 2),
+        other => panic!("expected Lagged, got {other:?}"),
+    }
+    assert_eq!(sub.cursor(), oldest_live);
+    for i in oldest_live..n {
+        assert_eq!(sub.try_recv(), Some(Msg::Sample(counter_desc(i))));
+    }
+    assert!(sub.try_recv().is_none());
+}
+
+#[test]
+fn from_seq_beyond_head_waits_for_the_producer() {
+    let capacity = 64u32;
+    let fx = Fixture::new(capacity);
+    let ring = fx.init_ring(capacity);
+
+    let publisher = Publisher::new(ring.clone());
+    for i in 0..3 {
+        publisher.publish(counter_desc(i));
+    }
+
+    // A cursor ahead of the head is not an error either — it simply blocks until
+    // the producer reaches it, then delivers from exactly that sequence.
+    let mut sub = Subscriber::from_seq(ring.clone(), 5);
+    assert!(sub.try_recv().is_none(), "must not deliver before seq 5 exists");
+
+    publisher.publish(counter_desc(3));
+    publisher.publish(counter_desc(4));
+    assert!(sub.try_recv().is_none(), "seq 5 still unpublished");
+
+    publisher.publish(counter_desc(5));
+    assert_eq!(sub.try_recv(), Some(Msg::Sample(counter_desc(5))));
+}

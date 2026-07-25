@@ -221,3 +221,61 @@ fn crash_reclaim_same_process_deterministic() {
     // The consumer's in-memory batch still exists but any re-read is now stale.
     drop(pin);
 }
+
+/// `subscribe_from` resumes at an explicit sequence, so a consumer that
+/// persisted its progress does not re-receive what it already handled. This is
+/// what a resumable transport front (SSE `Last-Event-ID`, a `?from=` cursor)
+/// needs; plain `subscribe` can only start at the beginning of live history.
+#[test]
+fn subscribe_from_resumes_at_an_explicit_sequence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let uds = dir.path().join("coord.sock");
+
+    let config = RuntimeConfig::with_seg_base(unique_seg_base());
+    let mut coord = Coordinator::bind(&uds, config).expect("bind coordinator");
+    coord.start().expect("start coordinator");
+
+    let registry = || Arc::new(SchemaRegistry::with_schemas(&[demo_schema()]));
+
+    let mut producer = Node::connect(&uds, "producer", registry()).expect("producer connect");
+    producer.start_heartbeat(Duration::from_millis(150));
+    let batch = shm_runtime::demo::demo_batch();
+
+    // Three publishes occupy seqs 0, 1, 2.
+    let descs: Vec<_> = (0..3)
+        .map(|_| {
+            producer
+                .publish_batch(DEMO_TOPIC, &batch)
+                .expect("publish batch")
+        })
+        .collect();
+
+    // A consumer that already handled seq 0 resumes at 1.
+    let mut consumer = Node::connect(&uds, "consumer", registry()).expect("consumer connect");
+    consumer.start_heartbeat(Duration::from_millis(150));
+    let mut sub = consumer
+        .subscribe_from(DEMO_TOPIC, 1)
+        .expect("subscribe_from");
+    assert_eq!(sub.cursor(), 1, "cursor seeds to the requested sequence");
+
+    for (offset, expected) in descs[1..].iter().enumerate() {
+        let got = loop {
+            match sub.recv() {
+                Msg::Sample(d) => break d,
+                Msg::Lagged(_) => continue,
+            }
+        };
+        assert_eq!(
+            &got,
+            expected,
+            "subscribe_from must deliver seq {} next",
+            offset + 1
+        );
+    }
+
+    // Seq 0 was skipped, not buffered: nothing further is pending.
+    assert!(
+        sub.try_recv().is_none(),
+        "resumed subscriber must not replay the sequences it skipped"
+    );
+}

@@ -557,6 +557,39 @@ impl Node {
         Ok(Subscriber::from_start_with_parker(ring, DoorbellParker::new(read)))
     }
 
+    /// Subscribe to `topic` from an explicit sequence, parking on the topic's
+    /// doorbell — the resumable counterpart to [`subscribe`](Self::subscribe).
+    ///
+    /// `seq` is the next sequence to deliver, so a consumer that persisted its
+    /// progress resumes with `subscribe_from(topic, last_seen + 1)`. This is what
+    /// a resumable transport front (an SSE `Last-Event-ID`, a `?from=` cursor)
+    /// needs: `subscribe` can only start at the beginning of live history.
+    ///
+    /// Out-of-range sequences are resolved by the ring, not rejected here: one
+    /// that has been lapped out yields [`Msg::Lagged`](shm_ring::Msg::Lagged)
+    /// first and resyncs to the oldest live message, and one at or beyond the
+    /// head blocks until the producer reaches it. A caller that must report a
+    /// gap to its client should surface `Lagged` rather than pre-validate.
+    pub fn subscribe_from(
+        &mut self,
+        topic: &str,
+        seq: u64,
+    ) -> Result<Subscriber<DoorbellParker>> {
+        self.ensure_topic(topic, true)?;
+        let ring = self.ring_for(topic)?;
+        let read = self
+            .topics
+            .get(topic)
+            .expect("topic ensured above")
+            .doorbell
+            .try_clone()?;
+        Ok(Subscriber::from_seq_with_parker(
+            ring,
+            DoorbellParker::new(read),
+            seq,
+        ))
+    }
+
     /// Take a shared pin on a received `desc`, record it in the borrow journal,
     /// and reconstruct the `RecordBatch` **zero-copy** over the mapped chunk.
     ///

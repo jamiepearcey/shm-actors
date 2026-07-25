@@ -67,7 +67,16 @@ multi-process, shm-actors' sweet spot; multi-host stays on P5.)
 3. **First wedge: Tasks + batches** — back the task fabric with `shm-task`;
    node-plane WAL supplies durability (log-first, replay into shm on restart —
    bounds G8).
-4. **Topics → `shm-pubsub`** behind the SSE/WS front.
+4. **Topics → `shm-ring`** behind the SSE/WS front. (There is no `shm-pubsub`
+   crate — ADR-0001 folded that role into `shm-ring`, the SPMC broadcast ring
+   with per-subscriber cursors. Note `shm-stream` is *not* pub/sub; it is the
+   transactional multi-batch artifact writer.) The resumable-cursor prerequisite
+   is now in place: `Subscriber::from_seq` / `Node::subscribe_from` seek to an
+   explicit sequence, which is what serves `Last-Event-ID` / `?from=`.
+   Still node-plane work, not substrate: the per-topic `seq` sequencer,
+   retention policy (`max_messages`/`max_bytes`/`max_age_ms`), durability
+   (WAL-is-truth, ring volatile), tenant prefixing, and serialising the
+   multi-caller publish onto the ring's single-producer role.
 5. **Only after 3–4 prove out in production:** migrate the DuckDB worker segment
    path.
 
