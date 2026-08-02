@@ -56,11 +56,8 @@ pub fn demo_schema() -> SchemaRef {
 pub fn demo_batch() -> RecordBatch {
     let ids = Int64Array::from(vec![10i64, 20, 30, 40]);
     let names = StringArray::from(vec!["alpha", "bravo", "charlie", "delta"]);
-    RecordBatch::try_new(
-        demo_schema(),
-        vec![Arc::new(ids), Arc::new(names)],
-    )
-    .expect("demo batch is well formed")
+    RecordBatch::try_new(demo_schema(), vec![Arc::new(ids), Arc::new(names)])
+        .expect("demo batch is well formed")
 }
 
 /// The G1 result schema: a single derived scalar `(sum: Int64)` (ADR-0007 G1).
@@ -131,17 +128,11 @@ pub fn nested_batch() -> RecordBatch {
         DataType::Struct(f) => f.clone(),
         _ => unreachable!("field 0 is a struct"),
     };
-    let s = StructArray::new(
-        struct_fields,
-        vec![Arc::new(ids), Arc::new(tags)],
-        None,
-    );
+    let s = StructArray::new(struct_fields, vec![Arc::new(ids), Arc::new(tags)], None);
 
     // One Int64 element per row: values [0, 1, 2, ...], offsets 0,1,2,...,n.
     let values = Int64Array::from((0..n as i64).collect::<Vec<_>>());
-    let offsets = OffsetBuffer::new(ScalarBuffer::from(
-        (0..=n as i32).collect::<Vec<_>>(),
-    ));
+    let offsets = OffsetBuffer::new(ScalarBuffer::from((0..=n as i32).collect::<Vec<_>>()));
     let item = Arc::new(Field::new("item", DataType::Int64, false));
     let list = ListArray::new(item, offsets, Arc::new(values), None);
 

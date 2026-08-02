@@ -17,9 +17,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use shm_arrow::SchemaRegistry;
 use shm_core::PUBLISHED;
+use shm_ring::Msg;
 use shm_runtime::demo::{demo_schema, verify_demo_batch, DEMO_TOPIC};
 use shm_runtime::{Coordinator, Node, RuntimeConfig};
-use shm_ring::Msg;
 
 /// A per-run segment-id base, unique enough that concurrent test binaries and
 /// reruns never collide on POSIX shm names.
@@ -77,13 +77,7 @@ fn crash_reclaim_multiprocess() {
 
     let consumer = Command::new(exe)
         .args([
-            "consumer",
-            "--uds",
-            &uds_s,
-            "--topic",
-            DEMO_TOPIC,
-            "--result",
-            &result_s,
+            "consumer", "--uds", &uds_s, "--topic", DEMO_TOPIC, "--result", &result_s,
         ])
         .spawn()
         .expect("spawn consumer");
@@ -91,7 +85,9 @@ fn crash_reclaim_multiprocess() {
 
     // --- Wait for the consumer to pin + verify the zero-copy batch. ---
     let pinned = wait_until(Duration::from_secs(20), || {
-        std::fs::read_to_string(&result).map(|s| s.trim() == "OK").unwrap_or(false)
+        std::fs::read_to_string(&result)
+            .map(|s| s.trim() == "OK")
+            .unwrap_or(false)
     });
     assert!(
         pinned,
@@ -190,7 +186,10 @@ fn crash_reclaim_same_process_deterministic() {
             Msg::Lagged(_) => continue,
         }
     };
-    assert_eq!(recv_desc, desc, "consumer received the producer's descriptor");
+    assert_eq!(
+        recv_desc, desc,
+        "consumer received the producer's descriptor"
+    );
     let pin = consumer.pin_and_read(&desc).expect("pin + read");
     verify_demo_batch(&pin.batch).expect("zero-copy batch verifies");
 

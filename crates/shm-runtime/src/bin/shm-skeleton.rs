@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use shm_arrow::SchemaRegistry;
+use shm_ring::Msg;
 use shm_runtime::demo::{demo_batch, demo_schema, verify_demo_batch, DEMO_TOPIC};
 use shm_runtime::{Coordinator, Node, RuntimeConfig};
-use shm_ring::Msg;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -70,10 +70,7 @@ impl Opts {
                     i += 2;
                 }
                 "--seg-base" => {
-                    seg_base = args
-                        .get(i + 1)
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(1);
+                    seg_base = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1);
                     i += 2;
                 }
                 _ => i += 1,

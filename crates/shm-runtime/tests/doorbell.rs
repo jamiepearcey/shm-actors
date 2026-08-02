@@ -27,7 +27,10 @@ use shm_runtime::{Coordinator, Node, RuntimeConfig};
 /// A per-run segment-id base, unique enough that concurrent test binaries and
 /// reruns never collide on POSIX shm names.
 fn unique_seg_base() -> u32 {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
     let pid = std::process::id() as u64;
     300_000 + (((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 2_000_000) as u32
 }
@@ -72,7 +75,10 @@ fn doorbell_wakes_subscriber_across_nodes() {
     producer.publish_batch(DEMO_TOPIC, &batch).expect("publish");
 
     let (msg, t_ret) = handle.join().unwrap();
-    assert!(matches!(msg, Msg::Sample(_)), "expected a sample, got {msg:?}");
+    assert!(
+        matches!(msg, Msg::Sample(_)),
+        "expected a sample, got {msg:?}"
+    );
     let latency = t_ret.saturating_duration_since(t_pub);
     assert!(
         latency < Duration::from_millis(150),
@@ -145,10 +151,16 @@ fn idle_subscriber_blocks_not_spins() {
     );
 
     // Release the blocked recv so the thread can join, then clean up.
-    let published = ChunkDesc { offset: 1, ..ChunkDesc::ZERO };
+    let published = ChunkDesc {
+        offset: 1,
+        ..ChunkDesc::ZERO
+    };
     Publisher::with_notifier(ring, DoorbellNotifier::new(write_fd)).publish(published);
     let msg = consumer.join().unwrap();
-    assert!(matches!(msg, Msg::Sample(_)), "expected the release sample, got {msg:?}");
+    assert!(
+        matches!(msg, Msg::Sample(_)),
+        "expected the release sample, got {msg:?}"
+    );
 
     drop(db);
     let _ = Segment::unlink_by_id(id);

@@ -149,8 +149,8 @@ pub fn write_manifest<A: ChunkAllocator>(
     chunks: &[ChunkDesc],
     batch_spans: &[u32],
 ) -> Result<ChunkDesc> {
-    let chunk_count =
-        u32::try_from(chunks.len()).map_err(|_| Error::Unsupported("too many chunks in manifest"))?;
+    let chunk_count = u32::try_from(chunks.len())
+        .map_err(|_| Error::Unsupported("too many chunks in manifest"))?;
     let batch_count = u32::try_from(batch_spans.len())
         .map_err(|_| Error::Unsupported("too many batches in manifest"))?;
     debug_assert_eq!(
@@ -273,7 +273,9 @@ pub fn parse_manifest_bytes(bytes: &[u8]) -> Result<Manifest> {
     let span_bytes = batch_count
         .checked_mul(size_of::<u32>())
         .ok_or(Error::VersionGone)?;
-    let total = spans_off.checked_add(span_bytes).ok_or(Error::VersionGone)?;
+    let total = spans_off
+        .checked_add(span_bytes)
+        .ok_or(Error::VersionGone)?;
     debug_assert_eq!(total, manifest_len(chunk_count, batch_count));
     if total > bytes.len() {
         return Err(Error::VersionGone);

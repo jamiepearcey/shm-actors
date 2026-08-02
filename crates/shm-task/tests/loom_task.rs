@@ -62,9 +62,16 @@ fn loom_task_claim_exactly_once() {
         let won2 = w2.join().unwrap();
 
         // Exactly one worker claims the task.
-        assert!(won1 ^ won2, "task claimed by {} workers, expected exactly 1", (won1 as u8) + (won2 as u8));
+        assert!(
+            won1 ^ won2,
+            "task claimed by {} workers, expected exactly 1",
+            (won1 as u8) + (won2 as u8)
+        );
         // And the slot is now CLAIMED.
-        assert_eq!(slot.state.load(std::sync::atomic::Ordering::SeqCst), CLAIMED);
+        assert_eq!(
+            slot.state.load(std::sync::atomic::Ordering::SeqCst),
+            CLAIMED
+        );
     });
     eprintln!(
         "loom_task_claim_exactly_once: explored {} interleavings",

@@ -160,7 +160,11 @@ fn cache_loop_end_to_end() {
     let done = line_tokens(&work_r, "DONE").unwrap();
     // "DONE <slot> <seq> <sum> <rows>"
     let (w_slot, w_seq, sum, rows) = (&done[1], &done[2], &done[3], &done[4]);
-    assert_eq!(sum, &DEMO_ID_SUM.to_string(), "worker derived the wrong sum");
+    assert_eq!(
+        sum,
+        &DEMO_ID_SUM.to_string(),
+        "worker derived the wrong sum"
+    );
     assert_eq!(rows, "4", "worker derived the wrong row count");
 
     // The watcher observed the SAME terminal outcome via its stable handle.
@@ -174,7 +178,10 @@ fn cache_loop_end_to_end() {
     let submit = line_tokens(&watch_r, "SUBMIT").expect("watcher submit line");
     // The correlation id the watcher submitted equals the one the worker
     // completed: proof the loop closed on the same task.
-    assert_eq!(&submit[1], w_slot, "correlation slot mismatch watcher↔worker");
+    assert_eq!(
+        &submit[1], w_slot,
+        "correlation slot mismatch watcher↔worker"
+    );
     assert_eq!(&submit[2], w_seq, "correlation seq mismatch watcher↔worker");
 }
 
@@ -208,12 +215,17 @@ fn watcher_parks_until_event() {
     // A producer opens the artifact and commits version 1 → VersionEvent.
     let mut producer = Node::connect(&uds, "producer", registry()).expect("producer connect");
     producer.start_heartbeat(Duration::from_millis(150));
-    producer.open_artifact(CACHE_ARTIFACT).expect("open_artifact");
+    producer
+        .open_artifact(CACHE_ARTIFACT)
+        .expect("open_artifact");
     let t_commit = Instant::now();
     {
         let stream = producer.stream(CACHE_ARTIFACT).expect("stream");
         let mut w = stream
-            .writer(Commit::Replace, Coordination::Optimistic { expect_version: 0 })
+            .writer(
+                Commit::Replace,
+                Coordination::Optimistic { expect_version: 0 },
+            )
             .expect("writer");
         w.append_batch(&demo_batch()).expect("append");
         assert_eq!(w.commit().expect("commit"), 1);
@@ -287,8 +299,14 @@ fn worker_crash_requeues_at_least_once() {
 
     // At-least-once: the correlation id is STABLE across the requeue — the
     // second worker completed the very same task the first worker had claimed.
-    assert_eq!(done[1], hang_slot, "requeue changed the slot (correlation id)");
-    assert_eq!(done[2], hang_seq, "requeue changed the seq (correlation id)");
+    assert_eq!(
+        done[1], hang_slot,
+        "requeue changed the slot (correlation id)"
+    );
+    assert_eq!(
+        done[2], hang_seq,
+        "requeue changed the seq (correlation id)"
+    );
     assert_eq!(done[3], DEMO_ID_SUM.to_string(), "wrong derived sum");
     assert_eq!(done[4], "4", "wrong derived row count");
 
@@ -327,7 +345,10 @@ fn worker_requeue_deterministic() {
     let a_id = a.task_id();
     let report = coord.reap_tasks(now_nanos() + Duration::from_secs(3600).as_nanos() as u64);
     assert_eq!(report.requeued, 1, "lapsed claim must be requeued");
-    assert!(a.complete(ChunkDesc::ZERO).is_err(), "reaped claim must be Lost");
+    assert!(
+        a.complete(ChunkDesc::ZERO).is_err(),
+        "reaped claim must be Lost"
+    );
 
     // Worker B claims the requeued task: SAME correlation id (at-least-once).
     let b = queue.claim(lease).expect("B claims requeued task");
@@ -427,7 +448,10 @@ fn producer_crash_mid_stage_deterministic() {
     {
         let stream = node.stream(CACHE_ARTIFACT).expect("stream");
         let mut writer = stream
-            .writer(Commit::Replace, Coordination::Optimistic { expect_version: 0 })
+            .writer(
+                Commit::Replace,
+                Coordination::Optimistic { expect_version: 0 },
+            )
             .expect("writer");
         writer.append_batch(&demo_batch()).expect("append");
         assert!(
@@ -461,7 +485,12 @@ fn producer_crash_mid_stage_deterministic() {
 fn commit_replace(node: &Node, expect: u64) -> u64 {
     let stream = node.stream(CACHE_ARTIFACT).expect("stream");
     let mut w = stream
-        .writer(Commit::Replace, Coordination::Optimistic { expect_version: expect })
+        .writer(
+            Commit::Replace,
+            Coordination::Optimistic {
+                expect_version: expect,
+            },
+        )
         .expect("writer");
     w.append_batch(&demo_batch()).expect("append");
     w.commit().expect("commit")
@@ -581,7 +610,9 @@ fn worker_crash_mid_pin_reclaims_version() {
     // hung worker's pin holds its chunks against reclamation.
     let mut committer = Node::connect(&uds, "committer", registry()).expect("connect committer");
     committer.start_heartbeat(Duration::from_millis(150));
-    committer.open_artifact(CACHE_ARTIFACT).expect("open_artifact");
+    committer
+        .open_artifact(CACHE_ARTIFACT)
+        .expect("open_artifact");
     assert_eq!(commit_replace(&committer, 1), 2);
     assert_eq!(coord.artifact_current_version(CACHE_ARTIFACT), Some(2));
     // Still pinned → still Some(1) (retire skipped while the pin is live).
@@ -626,7 +657,10 @@ fn commit_replace_exclusive(node: &Node, expect: u64) -> u64 {
     let mut w = stream
         .writer(Commit::Replace, Coordination::Exclusive)
         .expect("exclusive writer");
-    assert_eq!(node.artifact(CACHE_ARTIFACT).unwrap().current_version(), expect);
+    assert_eq!(
+        node.artifact(CACHE_ARTIFACT).unwrap().current_version(),
+        expect
+    );
     w.append_batch(&demo_batch()).expect("append");
     w.commit().expect("commit")
 }
@@ -699,7 +733,11 @@ fn writer_crash_releases_and_fences_lease_deterministic() {
     let mut w2 = Node::connect(&uds, "writer2", registry()).expect("connect w2");
     w2.start_heartbeat(Duration::from_millis(150));
     w2.open_artifact(CACHE_ARTIFACT).expect("open_artifact");
-    assert_eq!(commit_replace_exclusive(&w2, 0), 1, "second writer commits v1");
+    assert_eq!(
+        commit_replace_exclusive(&w2, 0),
+        1,
+        "second writer commits v1"
+    );
     assert_eq!(coord.artifact_current_version(CACHE_ARTIFACT), Some(1));
     assert_eq!(
         coord.artifact_write_lease_owner(CACHE_ARTIFACT),
@@ -765,7 +803,11 @@ fn writer_crash_releases_and_fences_lease() {
     let mut w2 = Node::connect(&uds, "writer2", registry()).expect("connect w2");
     w2.start_heartbeat(Duration::from_millis(150));
     w2.open_artifact(CACHE_ARTIFACT).expect("open_artifact");
-    assert_eq!(commit_replace_exclusive(&w2, 0), 1, "second writer commits v1");
+    assert_eq!(
+        commit_replace_exclusive(&w2, 0),
+        1,
+        "second writer commits v1"
+    );
     assert_eq!(coord.artifact_current_version(CACHE_ARTIFACT), Some(1));
 }
 
@@ -802,7 +844,10 @@ fn coordinator_interns_idempotently_by_content() {
     assert_ne!(id_a1, 0, "an interned id is never RAW_SCHEMA_ID (0)");
 
     // Resolving an issued id returns the exact bytes; an unknown id is None.
-    assert_eq!(coord.resolve_schema_bytes(id_a1).as_deref(), Some(&bytes_a[..]));
+    assert_eq!(
+        coord.resolve_schema_bytes(id_a1).as_deref(),
+        Some(&bytes_a[..])
+    );
     assert_eq!(coord.resolve_schema_bytes(9999), None);
 }
 
@@ -833,14 +878,20 @@ fn two_unseeded_nodes_agree_on_schema_via_coordinator() {
     );
 
     // Producer negotiates the schema id with the coordinator, then commits v1.
-    producer.open_artifact(CACHE_ARTIFACT).expect("open_artifact");
-    let issued = producer.intern_schema(&demo_schema()).expect("intern_schema");
+    producer
+        .open_artifact(CACHE_ARTIFACT)
+        .expect("open_artifact");
+    let issued = producer
+        .intern_schema(&demo_schema())
+        .expect("intern_schema");
     assert_ne!(issued, 0, "coordinator issued a non-raw id");
     assert_eq!(commit_replace(&producer, 0), 1, "producer commits v1");
 
     // Consumer has never seen the schema. It pins v1, reads the manifest's
     // schema_id, and resolves the schema THROUGH THE COORDINATOR.
-    consumer.open_artifact(CACHE_ARTIFACT).expect("open_artifact");
+    consumer
+        .open_artifact(CACHE_ARTIFACT)
+        .expect("open_artifact");
     let pin = consumer.pin_artifact(CACHE_ARTIFACT).expect("pin");
     let manifest_schema_id = pin.manifest().schema_id;
     assert_eq!(
@@ -848,7 +899,9 @@ fn two_unseeded_nodes_agree_on_schema_via_coordinator() {
         "the id in the manifest is the coordinator-issued id the producer interned"
     );
 
-    let resolved = consumer.resolve_schema(manifest_schema_id).expect("resolve_schema");
+    let resolved = consumer
+        .resolve_schema(manifest_schema_id)
+        .expect("resolve_schema");
     assert_eq!(
         resolved,
         demo_schema(),
@@ -874,9 +927,15 @@ fn two_unseeded_nodes_agree_on_schema_via_coordinator() {
 fn commit_nested_replace(node: &Node, expect: u64) -> u64 {
     let stream = node.stream(NESTED_ARTIFACT).expect("stream");
     let mut w = stream
-        .writer(Commit::Replace, Coordination::Optimistic { expect_version: expect })
+        .writer(
+            Commit::Replace,
+            Coordination::Optimistic {
+                expect_version: expect,
+            },
+        )
         .expect("writer");
-    w.append_batch(&nested_batch()).expect("append nested batch");
+    w.append_batch(&nested_batch())
+        .expect("append nested batch");
     w.commit().expect("commit")
 }
 
@@ -904,13 +963,26 @@ fn nested_multichunk_version_via_coordinator_reads_zero_copy() {
     assert!(producer.registry().is_empty() && consumer.registry().is_empty());
 
     // Producer negotiates the NESTED schema id, then commits a multi-chunk v1.
-    producer.open_artifact(NESTED_ARTIFACT).expect("open_artifact");
-    let issued = producer.intern_schema(&nested_schema()).expect("intern nested schema");
-    assert_ne!(issued, 0, "coordinator issued a non-raw id for the nested schema");
-    assert_eq!(commit_nested_replace(&producer, 0), 1, "producer commits nested v1");
+    producer
+        .open_artifact(NESTED_ARTIFACT)
+        .expect("open_artifact");
+    let issued = producer
+        .intern_schema(&nested_schema())
+        .expect("intern nested schema");
+    assert_ne!(
+        issued, 0,
+        "coordinator issued a non-raw id for the nested schema"
+    );
+    assert_eq!(
+        commit_nested_replace(&producer, 0),
+        1,
+        "producer commits nested v1"
+    );
 
     // Consumer has never seen the schema. It pins v1 and inspects the manifest.
-    consumer.open_artifact(NESTED_ARTIFACT).expect("open_artifact");
+    consumer
+        .open_artifact(NESTED_ARTIFACT)
+        .expect("open_artifact");
     let pin = consumer.pin_artifact(NESTED_ARTIFACT).expect("pin");
     let m = pin.manifest();
     assert!(
@@ -929,11 +1001,19 @@ fn nested_multichunk_version_via_coordinator_reads_zero_copy() {
     );
 
     // Resolve the nested schema THROUGH THE COORDINATOR (unseeded consumer).
-    let resolved = consumer.resolve_schema(m.schema_id).expect("resolve nested schema");
-    assert_eq!(resolved, nested_schema(), "resolved nested schema equals the original");
+    let resolved = consumer
+        .resolve_schema(m.schema_id)
+        .expect("resolve nested schema");
+    assert_eq!(
+        resolved,
+        nested_schema(),
+        "resolved nested schema equals the original"
+    );
 
     // Reconstruct the multi-chunk nested batch zero-copy and verify it exactly.
-    let batch = pin.as_arrow(consumer.registry()).expect("as_arrow nested multi-chunk");
+    let batch = pin
+        .as_arrow(consumer.registry())
+        .expect("as_arrow nested multi-chunk");
     verify_nested_batch(&batch).expect("reconstructed nested batch matches the original");
 }
 
@@ -950,7 +1030,8 @@ fn commit_nested_exclusive(node: &Node) -> u64 {
     let mut w = stream
         .writer(Commit::Replace, Coordination::Exclusive)
         .expect("exclusive nested writer");
-    w.append_batch(&nested_batch()).expect("append nested batch");
+    w.append_batch(&nested_batch())
+        .expect("append nested batch");
     w.commit().expect("commit")
 }
 
@@ -1063,8 +1144,14 @@ fn hostile_cache_loop() {
     // Supersede v1 with v2 (in-process): v1 goes non-current but the hung pin
     // holds its chunks against reclamation.
     let committer = nested_node(&uds, "committer");
-    committer.intern_schema(&nested_schema()).expect("intern nested schema");
-    assert_eq!(commit_nested_replace(&committer, 1), 2, "committer installs v2");
+    committer
+        .intern_schema(&nested_schema())
+        .expect("intern nested schema");
+    assert_eq!(
+        commit_nested_replace(&committer, 1),
+        2,
+        "committer installs v2"
+    );
     assert_eq!(coord.artifact_current_version(NESTED_ARTIFACT), Some(2));
     assert_eq!(
         coord.artifact_slot_pins(NESTED_ARTIFACT, 1),
@@ -1148,8 +1235,13 @@ fn hostile_cache_loop() {
 
     // A second EXCLUSIVE writer acquires the fenced lease and commits nested v3.
     let w2 = nested_node(&uds, "writer2");
-    w2.intern_schema(&nested_schema()).expect("intern nested schema");
-    assert_eq!(commit_nested_exclusive(&w2), 3, "second writer commits nested v3");
+    w2.intern_schema(&nested_schema())
+        .expect("intern nested schema");
+    assert_eq!(
+        commit_nested_exclusive(&w2),
+        3,
+        "second writer commits nested v3"
+    );
     assert_eq!(coord.artifact_current_version(NESTED_ARTIFACT), Some(3));
     assert_eq!(
         coord.artifact_write_lease_owner(NESTED_ARTIFACT),
@@ -1199,9 +1291,18 @@ fn hostile_cache_loop_deterministic() {
     let empty_free = coord
         .artifact_free_total(NESTED_ARTIFACT)
         .expect("nested artifact known (empty pool)");
-    let issued = producer.intern_schema(&nested_schema()).expect("intern nested");
-    assert_ne!(issued, 0, "coordinator issued a non-raw id for the nested schema");
-    assert_eq!(commit_nested_replace(&producer, 0), 1, "producer commits nested v1");
+    let issued = producer
+        .intern_schema(&nested_schema())
+        .expect("intern nested");
+    assert_ne!(
+        issued, 0,
+        "coordinator issued a non-raw id for the nested schema"
+    );
+    assert_eq!(
+        commit_nested_replace(&producer, 0),
+        1,
+        "producer commits nested v1"
+    );
     let one_version_free = coord
         .artifact_free_total(NESTED_ARTIFACT)
         .expect("nested artifact known");
@@ -1231,13 +1332,21 @@ fn hostile_cache_loop_deterministic() {
 
     // --- Leg 2 (item J): journal-pin v1, supersede with v2, leak the pin, reclaim. ---
     let pinner = nested_node(&uds, "pinner");
-    let pin = pinner.pin_artifact(NESTED_ARTIFACT).expect("journalled pin");
+    let pin = pinner
+        .pin_artifact(NESTED_ARTIFACT)
+        .expect("journalled pin");
     assert_eq!(pin.version(), 1);
     assert_eq!(coord.artifact_slot_pins(NESTED_ARTIFACT, 1), Some(1));
 
     let committer = nested_node(&uds, "committer");
-    committer.intern_schema(&nested_schema()).expect("intern nested");
-    assert_eq!(commit_nested_replace(&committer, 1), 2, "committer installs v2");
+    committer
+        .intern_schema(&nested_schema())
+        .expect("intern nested");
+    assert_eq!(
+        commit_nested_replace(&committer, 1),
+        2,
+        "committer installs v2"
+    );
     assert_eq!(
         coord.artifact_slot_pins(NESTED_ARTIFACT, 1),
         Some(1),
@@ -1251,7 +1360,9 @@ fn hostile_cache_loop_deterministic() {
     // `kill -9` mid-pin: forget the pin so its Drop never runs (the ArtifactPin
     // journal entry + the +1 pin count leak, exactly as a crash leaves them).
     std::mem::forget(pin);
-    let _ = coord.force_reclaim(pinner.actor_id()).expect("force reclaim pinner");
+    let _ = coord
+        .force_reclaim(pinner.actor_id())
+        .expect("force reclaim pinner");
     assert!(
         coord.artifact_pins_reclaimed() >= 1,
         "the coordinator must record the leaked artifact-pin reclaim"
@@ -1269,7 +1380,9 @@ fn hostile_cache_loop_deterministic() {
 
     // --- Leg 3 (item K): exclusive writer stages a nested batch, leaks, reclaim. ---
     let writer = nested_node(&uds, "writer");
-    writer.intern_schema(&nested_schema()).expect("intern nested");
+    writer
+        .intern_schema(&nested_schema())
+        .expect("intern nested");
     {
         let stream = writer.stream(NESTED_ARTIFACT).expect("stream");
         let mut w = stream
@@ -1292,8 +1405,13 @@ fn hostile_cache_loop_deterministic() {
         Some(2),
         "no version was published while the lease was held"
     );
-    let reclaimed = coord.force_reclaim(writer.actor_id()).expect("force reclaim writer");
-    assert!(!reclaimed.is_empty(), "the staged nested chunks must be reclaimed");
+    let reclaimed = coord
+        .force_reclaim(writer.actor_id())
+        .expect("force reclaim writer");
+    assert!(
+        !reclaimed.is_empty(),
+        "the staged nested chunks must be reclaimed"
+    );
     assert!(
         coord.write_leases_reclaimed() >= 1,
         "the coordinator must record the leaked write-lease reclaim"
@@ -1312,7 +1430,11 @@ fn hostile_cache_loop_deterministic() {
     // A second exclusive writer acquires the fenced lease and commits nested v3.
     let w2 = nested_node(&uds, "writer2");
     w2.intern_schema(&nested_schema()).expect("intern nested");
-    assert_eq!(commit_nested_exclusive(&w2), 3, "second writer commits nested v3");
+    assert_eq!(
+        commit_nested_exclusive(&w2),
+        3,
+        "second writer commits nested v3"
+    );
     assert_eq!(coord.artifact_current_version(NESTED_ARTIFACT), Some(3));
     assert_eq!(coord.artifact_write_lease_owner(NESTED_ARTIFACT), Some(0));
 

@@ -27,9 +27,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use shm_arrow::SchemaRegistry;
+use shm_ring::Msg;
 use shm_runtime::demo::{demo_batch, demo_schema, DEMO_TOPIC};
 use shm_runtime::Node;
-use shm_ring::Msg;
 use std::sync::Arc;
 
 fn unique_seg_base() -> u32 {
@@ -78,7 +78,13 @@ fn data_plane_survives_coordinator_death() {
     // --- Coordinator as a separate, killable OS process. ---
     let mut coord = Reaper(
         Command::new(exe())
-            .args(["coordinator", "--uds", &uds_s, "--seg-base", &seg_base.to_string()])
+            .args([
+                "coordinator",
+                "--uds",
+                &uds_s,
+                "--seg-base",
+                &seg_base.to_string(),
+            ])
             .spawn()
             .expect("spawn coordinator"),
     );
@@ -100,7 +106,9 @@ fn data_plane_survives_coordinator_death() {
 
     // Publish one message while the coordinator is alive; the consumer receives it
     // — proof the pair is connected + mapped and messaging works.
-    let d1 = producer.publish_batch(DEMO_TOPIC, &demo_batch()).expect("publish #1");
+    let d1 = producer
+        .publish_batch(DEMO_TOPIC, &demo_batch())
+        .expect("publish #1");
     let got1 = recv_sample(&mut sub, Duration::from_secs(5)).expect("consumer receives pre-death");
     assert_eq!(got1, d1.offset, "consumer received the pre-death message");
 

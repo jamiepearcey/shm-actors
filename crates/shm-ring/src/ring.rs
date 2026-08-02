@@ -146,7 +146,10 @@ impl Ring {
         }
         let need = required_bytes(capacity);
         if region_len < need {
-            return Err(Error::RegionTooSmall { need, have: region_len });
+            return Err(Error::RegionTooSmall {
+                need,
+                have: region_len,
+            });
         }
 
         // SAFETY: `base` is 8-aligned and `region_len >= need`, so the header and
@@ -172,7 +175,12 @@ impl Ring {
                     desc: ChunkDesc::ZERO,
                 });
             }
-            Ok(Ring { header, slots, capacity: capacity as usize, mask: (capacity - 1) as u64 })
+            Ok(Ring {
+                header,
+                slots,
+                capacity: capacity as usize,
+                mask: (capacity - 1) as u64,
+            })
         }
     }
 
@@ -204,11 +212,19 @@ impl Ring {
         }
         let need = required_bytes(capacity);
         if region_len < need {
-            return Err(Error::RegionTooSmall { need, have: region_len });
+            return Err(Error::RegionTooSmall {
+                need,
+                have: region_len,
+            });
         }
         // SAFETY: `capacity` was validated at init; the slot array is in-bounds.
         let slots = unsafe { base.add(slots_offset()).cast::<Slot>() };
-        Ok(Ring { header, slots, capacity: capacity as usize, mask: mask as u64 })
+        Ok(Ring {
+            header,
+            slots,
+            capacity: capacity as usize,
+            mask: mask as u64,
+        })
     }
 
     /// The number of slots (a power of two).
@@ -283,7 +299,10 @@ impl Ring {
         // live message is `head - capacity`.
         if head - cursor > self.capacity as u64 {
             let new_cursor = head - self.capacity as u64;
-            return ReadOutcome::Lagged { skipped: new_cursor - cursor, new_cursor };
+            return ReadOutcome::Lagged {
+                skipped: new_cursor - cursor,
+                new_cursor,
+            };
         }
         let slot_ptr = self.slot_ptr(cursor);
         // SAFETY: `slot_ptr` is in-bounds; `seq` is an atomic, sound to borrow.
@@ -293,7 +312,10 @@ impl Ring {
             // as a lag against a fresh head.
             let head = self.header().head.load(Ordering::Acquire);
             let new_cursor = head - self.capacity as u64;
-            return ReadOutcome::Lagged { skipped: new_cursor.saturating_sub(cursor), new_cursor };
+            return ReadOutcome::Lagged {
+                skipped: new_cursor.saturating_sub(cursor),
+                new_cursor,
+            };
         }
         // SAFETY: `seq == cursor` and `head - cursor <= capacity`, so this slot
         // is not being overwritten; the guarded `desc` is a fully-published POD.
@@ -304,7 +326,10 @@ impl Ring {
         if seq.load(Ordering::Acquire) != cursor {
             let head = self.header().head.load(Ordering::Acquire);
             let new_cursor = head - self.capacity as u64;
-            return ReadOutcome::Lagged { skipped: new_cursor.saturating_sub(cursor), new_cursor };
+            return ReadOutcome::Lagged {
+                skipped: new_cursor.saturating_sub(cursor),
+                new_cursor,
+            };
         }
         ReadOutcome::Sample(desc)
     }

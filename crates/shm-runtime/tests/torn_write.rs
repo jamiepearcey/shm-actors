@@ -26,9 +26,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use shm_arrow::{ChunkAllocator, PoolAllocator, SchemaRegistry};
 use shm_core::{Pool, FREE, LOANED};
+use shm_ring::Msg;
 use shm_runtime::demo::{demo_batch, demo_schema, verify_demo_batch, CACHE_ARTIFACT, DEMO_TOPIC};
 use shm_runtime::{Coordinator, Node, RuntimeConfig};
-use shm_ring::Msg;
 use shm_stream::{Commit, Coordination};
 
 /// A per-run segment-id base with a process-local counter so parallel test
@@ -69,7 +69,9 @@ fn raw_torn_write_is_never_observed() {
     let mut sub = consumer.subscribe(DEMO_TOPIC).expect("subscribe");
 
     // A prior VALID publish the racing reader is allowed to see.
-    let valid = producer.publish_batch(DEMO_TOPIC, &demo_batch()).expect("publish valid");
+    let valid = producer
+        .publish_batch(DEMO_TOPIC, &demo_batch())
+        .expect("publish valid");
     assert_eq!(
         recv_sample(&mut sub, Duration::from_secs(5)),
         Some(valid.offset),
@@ -81,7 +83,8 @@ fn raw_torn_write_is_never_observed() {
     let pool = Pool::attach(producer.payload_segment()).expect("attach pool");
     let torn = pool.alloc(1024).expect("alloc torn chunk");
     let ctrl = pool.ctrl(&torn).expect("ctrl");
-    ctrl.try_loan(producer.actor_id()).expect("loan the torn chunk");
+    ctrl.try_loan(producer.actor_id())
+        .expect("loan the torn chunk");
     assert_eq!(ctrl.state(), LOANED, "the torn chunk is exclusively loaned");
     let gen_before = ctrl.generation();
     {
@@ -133,12 +136,19 @@ fn torn_stream_write_isolated_and_reclaimed() {
     // A producer commits a clean v1 (item E: negotiate the schema via coordinator).
     let mut producer = Node::connect(&uds, "producer", registry()).expect("producer connect");
     producer.start_heartbeat(Duration::from_millis(150));
-    producer.open_artifact(CACHE_ARTIFACT).expect("open_artifact");
-    producer.intern_schema(&demo_schema()).expect("intern schema");
+    producer
+        .open_artifact(CACHE_ARTIFACT)
+        .expect("open_artifact");
+    producer
+        .intern_schema(&demo_schema())
+        .expect("intern schema");
     {
         let stream = producer.stream(CACHE_ARTIFACT).expect("stream");
         let mut w = stream
-            .writer(Commit::Replace, Coordination::Optimistic { expect_version: 0 })
+            .writer(
+                Commit::Replace,
+                Coordination::Optimistic { expect_version: 0 },
+            )
             .expect("writer");
         w.append_batch(&demo_batch()).expect("append");
         assert_eq!(w.commit().expect("commit"), 1);
@@ -155,9 +165,13 @@ fn torn_stream_write_isolated_and_reclaimed() {
     {
         let stream = torn.stream(CACHE_ARTIFACT).expect("stream");
         let mut w = stream
-            .writer(Commit::Replace, Coordination::Optimistic { expect_version: 1 })
+            .writer(
+                Commit::Replace,
+                Coordination::Optimistic { expect_version: 1 },
+            )
             .expect("writer");
-        w.append_batch(&demo_batch()).expect("append staged (torn/incomplete) batch");
+        w.append_batch(&demo_batch())
+            .expect("append staged (torn/incomplete) batch");
         assert!(
             coord.artifact_free_total(CACHE_ARTIFACT).unwrap() < one_version_free,
             "the staged incomplete version must consume chunks"
@@ -192,8 +206,13 @@ fn torn_stream_write_isolated_and_reclaimed() {
 
     // Journal replay (crash reclaim) frees the torn staged chunk(s); the pool
     // returns to the one-version baseline and current_version never advanced.
-    let reclaimed = coord.force_reclaim(torn.actor_id()).expect("force reclaim torn writer");
-    assert!(!reclaimed.is_empty(), "the torn staged chunk must be reclaimed by journal replay");
+    let reclaimed = coord
+        .force_reclaim(torn.actor_id())
+        .expect("force reclaim torn writer");
+    assert!(
+        !reclaimed.is_empty(),
+        "the torn staged chunk must be reclaimed by journal replay"
+    );
     assert_eq!(
         coord.artifact_free_total(CACHE_ARTIFACT),
         Some(one_version_free),
@@ -209,10 +228,17 @@ fn torn_stream_write_isolated_and_reclaimed() {
     {
         let stream = producer.stream(CACHE_ARTIFACT).expect("stream");
         let mut w = stream
-            .writer(Commit::Replace, Coordination::Optimistic { expect_version: 1 })
+            .writer(
+                Commit::Replace,
+                Coordination::Optimistic { expect_version: 1 },
+            )
             .expect("writer");
         w.append_batch(&demo_batch()).expect("append");
-        assert_eq!(w.commit().expect("commit"), 2, "a clean v2 installs after the torn write");
+        assert_eq!(
+            w.commit().expect("commit"),
+            2,
+            "a clean v2 installs after the torn write"
+        );
     }
     assert_eq!(
         coord.artifact_free_total(CACHE_ARTIFACT),

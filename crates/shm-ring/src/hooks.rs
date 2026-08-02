@@ -101,7 +101,10 @@ pub struct DoorbellParker {
 impl DoorbellParker {
     /// Park on a doorbell read-end with the [`DEFAULT_DOORBELL_TIMEOUT`].
     pub fn new(read: OwnedFd) -> DoorbellParker {
-        DoorbellParker { read, timeout: DEFAULT_DOORBELL_TIMEOUT }
+        DoorbellParker {
+            read,
+            timeout: DEFAULT_DOORBELL_TIMEOUT,
+        }
     }
 
     /// Park on a doorbell read-end with a custom bounded timeout.

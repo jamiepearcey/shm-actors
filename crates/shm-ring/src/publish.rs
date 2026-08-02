@@ -19,7 +19,10 @@ pub struct Publisher<N: Notifier = NoopNotifier> {
 impl Publisher<NoopNotifier> {
     /// Create a publisher with the no-op notifier (spin/yield subscribers).
     pub fn new(ring: Ring) -> Publisher<NoopNotifier> {
-        Publisher { ring, notifier: NoopNotifier }
+        Publisher {
+            ring,
+            notifier: NoopNotifier,
+        }
     }
 }
 

@@ -29,7 +29,10 @@ impl Fixture {
         // Header(64) + ring bytes, generously rounded up.
         let size = (required_bytes(capacity) + 4096).next_power_of_two();
         let segment = Segment::create(id, size).expect("create segment");
-        Fixture { id, segment: Arc::new(segment) }
+        Fixture {
+            id,
+            segment: Arc::new(segment),
+        }
     }
 
     /// Initialize a ring in the segment payload and return the handle.
@@ -37,8 +40,12 @@ impl Fixture {
         // SAFETY: the payload region stays mapped for the fixture's lifetime and
         // no other party initializes it concurrently.
         unsafe {
-            Ring::init(self.segment.payload_ptr(), self.segment.payload_len(), capacity)
-                .expect("init ring")
+            Ring::init(
+                self.segment.payload_ptr(),
+                self.segment.payload_len(),
+                capacity,
+            )
+            .expect("init ring")
         }
     }
 }
@@ -51,7 +58,10 @@ impl Drop for Fixture {
 
 /// A trivial descriptor whose `offset` field carries the sequence counter.
 fn counter_desc(i: u64) -> ChunkDesc {
-    ChunkDesc { offset: i as u32, ..ChunkDesc::ZERO }
+    ChunkDesc {
+        offset: i as u32,
+        ..ChunkDesc::ZERO
+    }
 }
 
 #[test]
@@ -147,17 +157,26 @@ fn reliable_backpressure_flips_and_clears() {
     for i in 0..capacity as u64 {
         publisher.publish(counter_desc(i));
     }
-    assert!(!ring.would_backpressure(), "exactly capacity behind is not backpressure");
+    assert!(
+        !ring.would_backpressure(),
+        "exactly capacity behind is not backpressure"
+    );
 
     // One more publish pushes the reliable subscriber > capacity behind.
     publisher.publish(counter_desc(capacity as u64));
-    assert!(ring.would_backpressure(), "reliable subscriber is now > capacity behind");
+    assert!(
+        ring.would_backpressure(),
+        "reliable subscriber is now > capacity behind"
+    );
     assert_eq!(ring.min_reliable_cursor(), Some(0));
 
     // Draining catches the reliable cursor up, clearing backpressure.
     while sub.try_recv().is_some() {}
     assert_eq!(sub.cursor(), ring.head());
-    assert!(!ring.would_backpressure(), "backpressure clears once caught up");
+    assert!(
+        !ring.would_backpressure(),
+        "backpressure clears once caught up"
+    );
     assert_eq!(ring.min_reliable_cursor(), Some(ring.head()));
 }
 
@@ -318,7 +337,10 @@ fn from_seq_beyond_head_waits_for_the_producer() {
     // A cursor ahead of the head is not an error either — it simply blocks until
     // the producer reaches it, then delivers from exactly that sequence.
     let mut sub = Subscriber::from_seq(ring.clone(), 5);
-    assert!(sub.try_recv().is_none(), "must not deliver before seq 5 exists");
+    assert!(
+        sub.try_recv().is_none(),
+        "must not deliver before seq 5 exists"
+    );
 
     publisher.publish(counter_desc(3));
     publisher.publish(counter_desc(4));

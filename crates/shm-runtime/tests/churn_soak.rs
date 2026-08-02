@@ -85,7 +85,15 @@ impl Rng {
 fn spawn_churn(uds: &str, seed: u64) -> Reaper {
     Reaper(
         Command::new(exe())
-            .args(["churn", "--uds", uds, "--art", CHURN_ARTIFACT, "--seed", &seed.to_string()])
+            .args([
+                "churn",
+                "--uds",
+                uds,
+                "--art",
+                CHURN_ARTIFACT,
+                "--seed",
+                &seed.to_string(),
+            ])
             .spawn()
             .unwrap_or_else(|e| panic!("spawn churn {seed}: {e}")),
     )
@@ -103,7 +111,12 @@ fn churn_config() -> RuntimeConfig {
 
 fn commit_one(node: &Node, expect: u64) -> shm_runtime::Result<u64> {
     let stream = node.stream(CHURN_ARTIFACT)?;
-    let mut w = stream.writer(Commit::Replace, Coordination::Optimistic { expect_version: expect })?;
+    let mut w = stream.writer(
+        Commit::Replace,
+        Coordination::Optimistic {
+            expect_version: expect,
+        },
+    )?;
     w.append_batch(&demo_batch())?;
     Ok(w.commit()?)
 }
@@ -130,11 +143,20 @@ fn churn_soak_no_leak() {
     // A long-lived survivor establishes the one-live-version baseline.
     let mut survivor = Node::connect(&uds, "survivor", registry()).expect("survivor connect");
     survivor.start_heartbeat(Duration::from_millis(150));
-    survivor.open_artifact(CHURN_ARTIFACT).expect("open_artifact");
-    survivor.intern_schema(&demo_schema()).expect("intern schema");
+    survivor
+        .open_artifact(CHURN_ARTIFACT)
+        .expect("open_artifact");
+    survivor
+        .intern_schema(&demo_schema())
+        .expect("intern schema");
     commit_one(&survivor, 0).expect("survivor commits v1");
-    let baseline = coord.artifact_free_total(CHURN_ARTIFACT).expect("artifact known");
-    assert!(baseline > 0, "the churn pool must have free chunks to start");
+    let baseline = coord
+        .artifact_free_total(CHURN_ARTIFACT)
+        .expect("artifact known");
+    assert!(
+        baseline > 0,
+        "the churn pool must have free chunks to start"
+    );
 
     // Spawn the churn workers (deterministic seeds).
     const BASE_SEED: u64 = 0x00C0_FFEE_1234;
@@ -201,16 +223,25 @@ fn churn_soak_no_leak() {
          (min={min_free}, max={max_free})"
     );
     // No net decay: the run ended back at (not below) the baseline it started at.
-    assert_eq!(final_free, baseline, "the pool returned exactly to its one-version baseline");
+    assert_eq!(
+        final_free, baseline,
+        "the pool returned exactly to its one-version baseline"
+    );
     assert!(
         max_free <= baseline,
         "free never exceeded the baseline (would imply a version was double-freed): max={max_free}"
     );
 
     // The artifact is still fully functional after the whole soak.
-    let current = coord.artifact_current_version(CHURN_ARTIFACT).expect("current known");
+    let current = coord
+        .artifact_current_version(CHURN_ARTIFACT)
+        .expect("current known");
     let v = commit_one(&survivor, current).expect("survivor commits a clean version post-soak");
-    assert_eq!(v, current + 1, "the artifact still installs clean versions after the soak");
+    assert_eq!(
+        v,
+        current + 1,
+        "the artifact still installs clean versions after the soak"
+    );
     assert_eq!(
         coord.artifact_free_total(CHURN_ARTIFACT),
         Some(baseline),

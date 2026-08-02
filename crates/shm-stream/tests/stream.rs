@@ -212,7 +212,11 @@ fn append_shares_prior_chunk() {
     assert_eq!(pin_v2.version(), 2);
     assert_eq!(pin_v2.manifest().chunks.len(), 2);
     // v2's first chunk IS v1's chunk (shared, not copied).
-    assert_eq!(pin_v2.manifest().chunks[0], v1_chunk, "v2 must share v1's chunk");
+    assert_eq!(
+        pin_v2.manifest().chunks[0],
+        v1_chunk,
+        "v2 must share v1's chunk"
+    );
     assert_eq!(col(&pin_v2.as_arrow(&reg).unwrap()), vec![1, 2, 3, 4, 5]);
 
     // The shared chunk is PUBLISHED and referenced by both live versions.
@@ -246,7 +250,11 @@ fn replace_contains_only_staged() {
     assert_eq!(stream.commit().unwrap(), 2);
 
     let pin = art.pin().unwrap();
-    assert_eq!(pin.manifest().chunks.len(), 1, "Replace keeps only staged chunks");
+    assert_eq!(
+        pin.manifest().chunks.len(),
+        1,
+        "Replace keeps only staged chunks"
+    );
     assert_eq!(col(&pin.as_arrow(&reg).unwrap()), vec![99]);
 }
 
@@ -278,7 +286,11 @@ fn abort_frees_staged() {
     stream.abort();
 
     assert_eq!(art.current_version(), 0, "abort installs no version");
-    assert_eq!(pool.free_count(0), free_before, "both staged chunks returned");
+    assert_eq!(
+        pool.free_count(0),
+        free_before,
+        "both staged chunks returned"
+    );
     assert!(journal.is_empty(), "journal slots released on abort");
     // A fresh exclusive open succeeds: abort released the lease.
     assert!(art.open_exclusive(8).is_ok());
@@ -312,7 +324,11 @@ fn drop_without_commit_frees_staged() {
     }
 
     assert_eq!(art.current_version(), 0);
-    assert_eq!(pool.free_count(0), free_before, "Drop == abort: staged freed");
+    assert_eq!(
+        pool.free_count(0),
+        free_before,
+        "Drop == abort: staged freed"
+    );
     assert!(journal.is_empty());
 }
 
@@ -353,7 +369,11 @@ fn crash_equivalent_journal_replay_frees_staged() {
     assert_eq!(reclaimed.len(), 2, "both staged chunks reclaimed by replay");
 
     assert_eq!(art.current_version(), 0, "no version ever published");
-    assert_eq!(pool.free_count(0), free_before, "staged chunks returned to pool");
+    assert_eq!(
+        pool.free_count(0),
+        free_before,
+        "staged chunks returned to pool"
+    );
     // Every reclaimed chunk was recycled to FREE (its descriptor now stale).
     for desc in &reclaimed {
         assert_eq!(pool.ctrl(desc).unwrap().state(), FREE);
@@ -400,7 +420,10 @@ fn optimistic_conflict_second_stream_loses() {
     assert_eq!(a.commit().unwrap(), 2, "first stream wins the install");
     let err = b.commit().unwrap_err();
     assert!(
-        matches!(err, shm_stream::Error::Artifact(shm_artifact::Error::Conflict { .. })),
+        matches!(
+            err,
+            shm_stream::Error::Artifact(shm_artifact::Error::Conflict { .. })
+        ),
         "second stream must observe a Conflict, got {err:?}"
     );
 
@@ -408,7 +431,10 @@ fn optimistic_conflict_second_stream_loses() {
     // The loser's staged chunk was returned; net pool usage is the one winning
     // chunk (v2 replaced v1, whose chunk was reclaimed).
     assert_eq!(pool.free_count(0), free_after_seed);
-    assert!(journal.is_empty(), "both streams released their journal slots");
+    assert!(
+        journal.is_empty(),
+        "both streams released their journal slots"
+    );
     assert_eq!(col(&art.pin().unwrap().as_arrow(&reg).unwrap()), vec![11]);
 }
 
@@ -444,7 +470,9 @@ fn exclusive_second_open_is_write_locked() {
     assert!(
         matches!(
             locked.err(),
-            Some(shm_stream::Error::Artifact(shm_artifact::Error::WriteLocked))
+            Some(shm_stream::Error::Artifact(
+                shm_artifact::Error::WriteLocked
+            ))
         ),
         "second exclusive open must fail WriteLocked"
     );
@@ -503,7 +531,10 @@ fn wide_batch(cols: usize, rows: usize) -> (RecordBatch, SchemaRef) {
         columns.push(Arc::new(Int64Array::from(vals)));
     }
     let schema: SchemaRef = Arc::new(Schema::new(fields));
-    (RecordBatch::try_new(schema.clone(), columns).unwrap(), schema)
+    (
+        RecordBatch::try_new(schema.clone(), columns).unwrap(),
+        schema,
+    )
 }
 
 /// Total free chunks across every size class of the data pool.
@@ -531,14 +562,25 @@ fn multi_chunk_batch_commits_and_reads_equal() {
     .unwrap();
     // One append of a wide batch stages SEVERAL chunks (one batch).
     stream.append_batch(&b).unwrap();
-    assert!(stream.staged_len() >= 2, "a multi-chunk batch stages >= 2 chunks");
+    assert!(
+        stream.staged_len() >= 2,
+        "a multi-chunk batch stages >= 2 chunks"
+    );
     assert_eq!(stream.commit().unwrap(), 1);
 
     let pin = art.pin().unwrap();
     let m = pin.manifest();
     assert!(m.chunks.len() >= 2, "committed batch spans >= 2 chunks");
-    assert_eq!(m.batch_spans, vec![m.chunks.len() as u32], "one batch spanning all chunks");
-    assert_eq!(&pin.as_arrow(&reg).unwrap(), &b, "multi-chunk stream commit reads equal");
+    assert_eq!(
+        m.batch_spans,
+        vec![m.chunks.len() as u32],
+        "one batch spanning all chunks"
+    );
+    assert_eq!(
+        &pin.as_arrow(&reg).unwrap(),
+        &b,
+        "multi-chunk stream commit reads equal"
+    );
     assert!(journal.is_empty(), "journal slots released after commit");
 }
 
@@ -567,15 +609,31 @@ fn crash_replay_frees_every_chunk_of_a_multi_chunk_batch() {
     let staged_chunks = stream.staged_len();
     assert!(staged_chunks >= 2, "the batch staged >= 2 chunks");
     // EVERY chunk of the multi-chunk batch is journaled (not just the first).
-    assert_eq!(journal.len(), staged_chunks, "every staged chunk is journaled");
-    assert_eq!(free_before - free_all(&pool), staged_chunks, "all staged chunks loaned");
+    assert_eq!(
+        journal.len(),
+        staged_chunks,
+        "every staged chunk is journaled"
+    );
+    assert_eq!(
+        free_before - free_all(&pool),
+        staged_chunks,
+        "all staged chunks loaned"
+    );
 
     // Simulate the writer dying mid-stage: no Drop, no abort, no commit.
     std::mem::forget(stream);
 
     // Journal replay must free ALL of the batch's chunks, not just the primary.
     let reclaimed = replay_and_reclaim(&pool, &journal, owner);
-    assert_eq!(reclaimed.len(), staged_chunks, "replay freed every staged chunk");
+    assert_eq!(
+        reclaimed.len(),
+        staged_chunks,
+        "replay freed every staged chunk"
+    );
     assert_eq!(art.current_version(), 0, "no version ever published");
-    assert_eq!(free_all(&pool), free_before, "every staged chunk returned to the pool");
+    assert_eq!(
+        free_all(&pool),
+        free_before,
+        "every staged chunk returned to the pool"
+    );
 }

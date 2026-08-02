@@ -20,9 +20,7 @@
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-use nix::sys::socket::{
-    recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags,
-};
+use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags};
 
 use crate::error::{Error, Result};
 

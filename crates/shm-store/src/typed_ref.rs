@@ -256,7 +256,8 @@ pub fn read_typed_ref<S: SegmentBase>(resolver: &S, desc: &ChunkDesc) -> Result<
     // SAFETY: `desc` was minted for the segment `resolver` keeps mapped; its
     // `offset` is in-bounds and the chunk is >= 56 bytes (checked above). The
     // borrowed slice never outlives this call, and `from_bytes` copies out.
-    let bytes = unsafe { core::slice::from_raw_parts(base.add(desc.offset as usize), TYPED_REF_SIZE) };
+    let bytes =
+        unsafe { core::slice::from_raw_parts(base.add(desc.offset as usize), TYPED_REF_SIZE) };
     TypedRef::from_bytes(bytes)
 }
 
@@ -298,15 +299,24 @@ mod tests {
         // Corrupt magic.
         let mut bad = good;
         bad.magic ^= 0xdead;
-        assert!(matches!(TypedRef::from_bytes(&bad.to_bytes()), Err(Error::BadEnvelope)));
+        assert!(matches!(
+            TypedRef::from_bytes(&bad.to_bytes()),
+            Err(Error::BadEnvelope)
+        ));
 
         // Corrupt abi_version.
         let mut bad = good;
         bad.abi_version = 99;
-        assert!(matches!(TypedRef::from_bytes(&bad.to_bytes()), Err(Error::BadEnvelope)));
+        assert!(matches!(
+            TypedRef::from_bytes(&bad.to_bytes()),
+            Err(Error::BadEnvelope)
+        ));
 
         // Too short.
-        assert!(matches!(TypedRef::from_bytes(&[0u8; 40]), Err(Error::BadEnvelope)));
+        assert!(matches!(
+            TypedRef::from_bytes(&[0u8; 40]),
+            Err(Error::BadEnvelope)
+        ));
     }
 
     #[test]
@@ -370,8 +380,7 @@ mod tests {
             }
             let catalog = Segment::create(base, Catalog::segment_bytes(cap)).unwrap();
             Catalog::init(&catalog, cap, head_stride as u32, 1 << 28).unwrap();
-            let head =
-                Segment::create(base + 1, HEADER_SIZE + cap as usize * head_stride).unwrap();
+            let head = Segment::create(base + 1, HEADER_SIZE + cap as usize * head_stride).unwrap();
             let data = Segment::create(base + 2, 1 << 20).unwrap();
             Pool::create(&data, &PoolConfig::power_of_two(256, 8192, 32)).unwrap();
             let journal = Segment::create(base + 3, 64 * 1024).unwrap();
@@ -408,8 +417,11 @@ mod tests {
         Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]))
     }
     fn batch(schema: &SchemaRef, vals: &[i64]) -> RecordBatch {
-        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals.to_vec()))])
-            .unwrap()
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vals.to_vec()))],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -420,7 +432,10 @@ mod tests {
 
         let tref = TypedRef::by_key(RefKind::Dataset, 42, 16, 7);
         let desc = write_typed_ref(&alloc, &tref).unwrap();
-        assert_eq!(desc.schema_id, SCHEMA_TYPED_REF, "envelope chunk is system-tagged");
+        assert_eq!(
+            desc.schema_id, SCHEMA_TYPED_REF,
+            "envelope chunk is system-tagged"
+        );
 
         let guard = shm_arrow::PinGuard::new(h.data.clone());
         let got = read_typed_ref(&guard, &desc).unwrap();
@@ -429,7 +444,10 @@ mod tests {
         // A raw (schema_id 0) descriptor is rejected as not-an-envelope.
         let mut raw = desc;
         raw.schema_id = 0;
-        assert!(matches!(read_typed_ref(&guard, &raw), Err(Error::NotEnvelope(0))));
+        assert!(matches!(
+            read_typed_ref(&guard, &raw),
+            Err(Error::NotEnvelope(0))
+        ));
 
         h.unlink();
     }
@@ -442,8 +460,12 @@ mod tests {
 
         let entry = store.create(b"dataset/X", RefKind::Dataset, &sch).unwrap();
         let key_id = entry.key_id();
-        entry.commit(Commit::Replace, &batch(&sch, &[1, 2, 3])).unwrap();
-        entry.commit_replace(&batch(&sch, &[100, 200, 300])).unwrap();
+        entry
+            .commit(Commit::Replace, &batch(&sch, &[1, 2, 3]))
+            .unwrap();
+        entry
+            .commit_replace(&batch(&sch, &[100, 200, 300]))
+            .unwrap();
         assert_eq!(entry.current_version(), 2);
 
         // Resolve current (version 0 = current) → the pinned v2 batch.
@@ -464,13 +486,19 @@ mod tests {
         let tref_v1 = TypedRef::by_key(RefKind::Dataset, key_id, 16, 1);
         assert!(matches!(
             store.resolve_and_pin(&tref_v1),
-            Err(Error::VersionMismatch { expected: 1, actual: 2 })
+            Err(Error::VersionMismatch {
+                expected: 1,
+                actual: 2
+            })
         ));
 
         // A RawChunk kind is not resolvable.
         let raw = TypedRef::by_key(RefKind::RawChunk, 0, 0, 0);
         assert!(matches!(store.resolve(&raw), Err(Error::NotResolvable)));
-        assert!(matches!(store.resolve_and_pin(&raw), Err(Error::NotResolvable)));
+        assert!(matches!(
+            store.resolve_and_pin(&raw),
+            Err(Error::NotResolvable)
+        ));
 
         h.unlink();
     }

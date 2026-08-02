@@ -3,7 +3,7 @@
 use shm_core::ChunkDesc;
 
 use crate::hooks::{Parker, YieldParker};
-use crate::ring::{Ring, ReadOutcome};
+use crate::ring::{ReadOutcome, Ring};
 
 /// The number of spin iterations `recv` makes before parking.
 const SPIN_LIMIT: u32 = 256;
@@ -72,7 +72,12 @@ impl<P: Parker> Subscriber<P> {
     /// Subscribe from the current head with a custom [`Parker`].
     pub fn with_parker(ring: Ring, parker: P) -> Subscriber<P> {
         let cursor = ring.head();
-        Subscriber { ring, cursor, parker, reliable: None }
+        Subscriber {
+            ring,
+            cursor,
+            parker,
+            reliable: None,
+        }
     }
 
     /// Subscribe from sequence `0` (replaying whatever is still live) with a
@@ -135,7 +140,10 @@ impl<P: Parker> Subscriber<P> {
                 self.sync_reliable();
                 Some(Msg::Sample(desc))
             }
-            ReadOutcome::Lagged { skipped, new_cursor } => {
+            ReadOutcome::Lagged {
+                skipped,
+                new_cursor,
+            } => {
                 self.cursor = new_cursor;
                 self.sync_reliable();
                 Some(Msg::Lagged(skipped))

@@ -37,13 +37,13 @@ repository = "https://github.com/example/shm-actors"
 # Only the crates ArrowRef actually consumes carry these; the rest of the
 # workspace stays path-only because nothing outside this repo references them.
 shm-core = { path = "crates/shm-core", version = "0.1.0", registry = "kellnr" }
-shm-arrow = { path = "crates/shm-arrow" }
-shm-ring = { path = "crates/shm-ring" }
-shm-task = { path = "crates/shm-task" }
-shm-artifact = { path = "crates/shm-artifact" }
-shm-stream = { path = "crates/shm-stream" }
-shm-store = { path = "crates/shm-store" }
-shm-runtime = { path = "crates/shm-runtime" }
+shm-arrow = { path = "crates/shm-arrow", version = "0.1.0", registry = "kellnr" }
+shm-ring = { path = "crates/shm-ring", version = "0.1.0", registry = "kellnr" }
+shm-task = { path = "crates/shm-task", version = "0.1.0", registry = "kellnr" }
+shm-artifact = { path = "crates/shm-artifact", version = "0.1.0", registry = "kellnr" }
+shm-stream = { path = "crates/shm-stream", version = "0.1.0", registry = "kellnr" }
+shm-store = { path = "crates/shm-store", version = "0.1.0", registry = "kellnr" }
+shm-runtime = { path = "crates/shm-runtime", version = "0.1.0", registry = "kellnr" }
 
 # External
 bytemuck = { version = "1", features = ["derive"] }

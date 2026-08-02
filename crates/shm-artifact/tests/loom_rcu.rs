@@ -51,7 +51,9 @@ fn loom_rcu_install_vs_read() {
         let head = Arc::new(ArtifactHead::fresh());
         // Install version 1 (single-threaded setup).
         head.claim_slot(1, manifest_for(1)).expect("slot for v1");
-        head.current.compare_exchange(0, 1, SeqCst, SeqCst).expect("install v1");
+        head.current
+            .compare_exchange(0, 1, SeqCst, SeqCst)
+            .expect("install v1");
         head.manifest_desc.store(manifest_for(1), Release);
 
         // Committer: install version 2 via the production RCU sequence.

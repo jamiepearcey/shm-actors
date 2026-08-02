@@ -468,7 +468,11 @@ mod tests {
         assert_eq!(cat.find_live_by_key(100), None, "tombstoned key is gone");
         let i2 = cat.alloc_slot().unwrap();
         let (aid2, _) = cat.publish_slot(i2, 100, RefKind::Dataset);
-        assert_eq!(cat.find_live_by_key(100), Some(i2), "re-create finds new slot");
+        assert_eq!(
+            cat.find_live_by_key(100),
+            Some(i2),
+            "re-create finds new slot"
+        );
         assert_ne!(aid2, aid0, "reincarnation has a new lineage id");
 
         seg.unlink().ok();

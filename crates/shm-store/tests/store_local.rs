@@ -55,8 +55,8 @@ impl Harness {
         }
         let catalog = Segment::create(base, Catalog::segment_bytes(cap)).expect("catalog seg");
         Catalog::init(&catalog, cap, head_stride as u32, 1 << 28).expect("catalog init");
-        let head = Segment::create(base + 1, HEADER_SIZE + cap as usize * head_stride)
-            .expect("head seg");
+        let head =
+            Segment::create(base + 1, HEADER_SIZE + cap as usize * head_stride).expect("head seg");
         let data = Segment::create(base + 2, 1 << 20).expect("data seg");
         Pool::create(&data, &PoolConfig::power_of_two(256, 8192, 32)).expect("pool");
         let journal = Segment::create(base + 3, 64 * 1024).expect("journal seg");
@@ -102,7 +102,11 @@ fn schema() -> SchemaRef {
 }
 
 fn batch(schema: &SchemaRef, vals: &[i64]) -> RecordBatch {
-    RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vals.to_vec()))],
+    )
+    .unwrap()
 }
 
 #[test]
@@ -147,8 +151,12 @@ fn create_is_idempotent_and_keys_are_distinct() {
     let h = Harness::new(81_000 + (std::process::id() & 0x3ff), &sch);
     let store = h.store();
 
-    let a = store.create(b"a", RefKind::Dataset, &sch).expect("create a");
-    let a_again = store.create(b"a", RefKind::Dataset, &sch).expect("re-create a");
+    let a = store
+        .create(b"a", RefKind::Dataset, &sch)
+        .expect("create a");
+    let a_again = store
+        .create(b"a", RefKind::Dataset, &sch)
+        .expect("re-create a");
     assert_eq!(
         a.artifact_id(),
         a_again.artifact_id(),
@@ -156,7 +164,11 @@ fn create_is_idempotent_and_keys_are_distinct() {
     );
 
     let b = store.create(b"b", RefKind::Result, &sch).expect("create b");
-    assert_ne!(a.artifact_id(), b.artifact_id(), "different keys, different entries");
+    assert_ne!(
+        a.artifact_id(),
+        b.artifact_id(),
+        "different keys, different entries"
+    );
     assert_ne!(a.key_id(), b.key_id());
 
     h.unlink();
@@ -199,7 +211,9 @@ fn evict_tombstones_reclaims_to_baseline_and_absent_open_errors() {
     store.evict(b"dataset/X").expect("second evict is a no-op");
 
     // A re-create after eviction appends a fresh entry with a new lineage id.
-    let e2 = store.create(b"dataset/X", RefKind::Dataset, &sch).expect("re-create");
+    let e2 = store
+        .create(b"dataset/X", RefKind::Dataset, &sch)
+        .expect("re-create");
     assert_eq!(e2.current_version(), 0, "fresh reincarnation");
 
     h.unlink();

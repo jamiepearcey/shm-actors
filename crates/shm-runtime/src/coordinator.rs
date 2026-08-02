@@ -321,7 +321,8 @@ impl Coordinator {
         // just an ordinary broadcast ring the runtime routes `VersionEvent`s on.
         {
             let mut st = self.shared.state.lock().unwrap();
-            let _ = get_or_create_topic(&mut st, &self.shared.config, shm_artifact::ARTIFACTS_TOPIC)?;
+            let _ =
+                get_or_create_topic(&mut st, &self.shared.config, shm_artifact::ARTIFACTS_TOPIC)?;
         }
 
         let listener = UnixListener::bind(&self.uds_path)?;
@@ -865,12 +866,17 @@ fn grant_artifact(shared: &Arc<CoordShared>, name: &str, stream: &UnixStream) ->
 
             let head_seg_id = config.artifact_head_seg_id(index);
             let data_seg_id = alloc_artifact_data_id();
-            let head_size = shm_core::segment::HEADER_SIZE
-                + shm_artifact::ArtifactHead::region_bytes();
+            let head_size =
+                shm_core::segment::HEADER_SIZE + shm_artifact::ArtifactHead::region_bytes();
             let head_seg = Arc::new(create_segment(head_seg_id, head_size)?);
             let data_seg = Arc::new(create_segment(data_seg_id, config.artifact_data_size)?);
             // Initialise the artifact (pool + head) once, coordinator-side.
-            Artifact::create(name_id, head_seg.clone(), data_seg.clone(), &config.artifact_pool)?;
+            Artifact::create(
+                name_id,
+                head_seg.clone(),
+                data_seg.clone(),
+                &config.artifact_pool,
+            )?;
 
             let head_fd = head_seg.as_raw_fd();
             let data_fd = data_seg.as_raw_fd();
@@ -1042,8 +1048,7 @@ fn lease_monitor(shared: Arc<CoordShared>) {
         {
             let mut st = shared.state.lock().unwrap();
             for (id, a) in st.actors.iter_mut() {
-                if a.liveness == Liveness::Alive
-                    && now.duration_since(a.last_heartbeat) > deadline
+                if a.liveness == Liveness::Alive && now.duration_since(a.last_heartbeat) > deadline
                 {
                     a.liveness = Liveness::Dead;
                     dead.push((*id, a.journal_seg.clone()));
@@ -1366,8 +1371,11 @@ mod tests {
     fn replay_reclaims_a_pinned_chunk() {
         let base: u32 = 40_000 + (std::process::id() & 0x7ff);
         let payload = Segment::create(base, 1 << 18).expect("payload seg");
-        let pool = Pool::create(&payload, &shm_core::PoolConfig::power_of_two(4096, 16384, 4))
-            .expect("pool");
+        let pool = Pool::create(
+            &payload,
+            &shm_core::PoolConfig::power_of_two(4096, 16384, 4),
+        )
+        .expect("pool");
         let jseg = Segment::create(base + 1, 64 * 1024).expect("journal seg");
         let journal = BorrowJournal::create(&jseg, 64).expect("journal");
 

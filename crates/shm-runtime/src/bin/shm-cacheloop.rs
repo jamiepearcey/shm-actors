@@ -281,7 +281,10 @@ fn run_producer(opts: &Opts, commit: bool) -> i32 {
         }
     };
     // Replace-optimistic over the empty artifact (expect current == 0).
-    let mut writer = match stream.writer(Commit::Replace, Coordination::Optimistic { expect_version: 0 }) {
+    let mut writer = match stream.writer(
+        Commit::Replace,
+        Coordination::Optimistic { expect_version: 0 },
+    ) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("producer writer failed: {e}");
@@ -360,7 +363,10 @@ fn run_watcher(opts: &Opts) -> i32 {
             return 1;
         }
     };
-    write_result(opts, &format!("SUBMIT {} {}\n", handle.slot_idx, handle.seq));
+    write_result(
+        opts,
+        &format!("SUBMIT {} {}\n", handle.slot_idx, handle.seq),
+    );
     println!("watcher submitted task {handle:?}");
 
     match queue.wait(handle) {
@@ -449,7 +455,10 @@ fn run_worker(opts: &Opts, hang: bool) -> i32 {
     };
     match task.complete(result_desc(sum, rows)) {
         Ok(()) => {
-            write_result(opts, &format!("DONE {} {} {} {}\n", id.slot_idx, id.seq, sum, rows));
+            write_result(
+                opts,
+                &format!("DONE {} {} {} {}\n", id.slot_idx, id.seq, sum, rows),
+            );
             println!("worker completed {id:?}: sum={sum} rows={rows}");
         }
         Err(e) => {
@@ -633,7 +642,12 @@ fn run_kill_at(opts: &Opts) -> i32 {
             let expect = node.artifact(art).map(|a| a.current_version()).unwrap_or(0);
             let stream = node.stream(art).expect("stream");
             let mut writer = stream
-                .writer(Commit::Replace, Coordination::Optimistic { expect_version: expect })
+                .writer(
+                    Commit::Replace,
+                    Coordination::Optimistic {
+                        expect_version: expect,
+                    },
+                )
                 .expect("optimistic writer");
             writer.append_batch(&art_batch(opts)).expect("append 1");
             if point == "stage-2" {
@@ -693,7 +707,12 @@ fn run_kill_at(opts: &Opts) -> i32 {
             // so at abort time the pinned version is non-current → its reclaim
             // must retire it. Bounded so a stuck driver never hangs the actor.
             let start = Instant::now();
-            while node.artifact(art).map(|a| a.current_version()).unwrap_or(pinned) <= pinned {
+            while node
+                .artifact(art)
+                .map(|a| a.current_version())
+                .unwrap_or(pinned)
+                <= pinned
+            {
                 if start.elapsed() > Duration::from_secs(30) {
                     break;
                 }
@@ -861,9 +880,12 @@ fn run_churn(opts: &Opts) -> i32 {
                 // committers race; the loser rolls back cleanly (freeing staged).
                 let expect = node.artifact(art).map(|a| a.current_version()).unwrap_or(0);
                 if let Ok(stream) = node.stream(art) {
-                    if let Ok(mut w) = stream
-                        .writer(Commit::Replace, Coordination::Optimistic { expect_version: expect })
-                    {
+                    if let Ok(mut w) = stream.writer(
+                        Commit::Replace,
+                        Coordination::Optimistic {
+                            expect_version: expect,
+                        },
+                    ) {
                         if w.append_batch(&art_batch(opts)).is_ok() {
                             let _ = w.commit();
                         }
@@ -891,8 +913,8 @@ fn run_churn(opts: &Opts) -> i32 {
             4 => {
                 // Submit a short-lived task (reaped if unclaimed by its deadline).
                 if let Ok(queue) = node.task_queue() {
-                    let deadline = now_nanos()
-                        + Duration::from_millis(200 + rng.below(200)).as_nanos() as u64;
+                    let deadline =
+                        now_nanos() + Duration::from_millis(200 + rng.below(200)).as_nanos() as u64;
                     let _ = queue.submit(
                         ChunkDesc {
                             schema_id: 1,

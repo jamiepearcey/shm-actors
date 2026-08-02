@@ -7,8 +7,8 @@ use std::thread;
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use shm_artifact::{Artifact, Commit, CommitKind, VersionEvent};
 use shm_arrow::SchemaRegistry;
+use shm_artifact::{Artifact, Commit, CommitKind, VersionEvent};
 use shm_core::{BorrowJournal, JournalRecord, PoolConfig, Segment, FREE, PUBLISHED};
 use shm_ring::{Msg, Publisher, Ring, Subscriber};
 
@@ -118,7 +118,10 @@ fn append_shares_prior_chunk_and_rcu_isolates_old_pin() {
 
     // v1 with [1,2,3].
     let mut w = art.open_exclusive(7).unwrap();
-    assert_eq!(w.commit(Commit::Replace, &batch(&[1, 2, 3]), &reg).unwrap(), 1);
+    assert_eq!(
+        w.commit(Commit::Replace, &batch(&[1, 2, 3]), &reg).unwrap(),
+        1
+    );
 
     // Pin v1 BEFORE committing v2.
     let pin_v1 = art.pin().unwrap();
@@ -283,9 +286,7 @@ fn version_event_published_on_commit() {
     let ring_seg = Arc::new(Segment::create(ring_id, 1 << 16).unwrap());
     // SAFETY: the payload region stays mapped for the segment's lifetime and is
     // initialised exactly once here before any attach.
-    let ring = unsafe {
-        Ring::init(ring_seg.payload_ptr(), ring_seg.payload_len(), 64).unwrap()
-    };
+    let ring = unsafe { Ring::init(ring_seg.payload_ptr(), ring_seg.payload_len(), 64).unwrap() };
     let publisher = Arc::new(Publisher::new(ring.clone()));
     let mut sub = Subscriber::from_start(ring.clone());
 
@@ -465,7 +466,11 @@ fn journalled_pin_records_and_clean_drop_releases() {
 
     // A clean drop releases the journal slot (nothing left for a replay).
     drop(pin);
-    assert_eq!(journal.len(), 0, "clean drop must release the journal entry");
+    assert_eq!(
+        journal.len(),
+        0,
+        "clean drop must release the journal entry"
+    );
 }
 
 #[test]
@@ -609,7 +614,11 @@ fn stress_readers_never_dereference_a_freed_chunk() {
 
     // Every journalled pin was taken and dropped cleanly: the journal is empty.
     let journal = BorrowJournal::attach(&jseg).unwrap();
-    assert_eq!(journal.len(), 0, "no journalled pin may leak after a clean run");
+    assert_eq!(
+        journal.len(),
+        0,
+        "no journalled pin may leak after a clean run"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +666,11 @@ fn journalled_exclusive_records_and_clean_drop_releases() {
     }
 
     // Clean drop released the journal slot AND the lease (fence bumped to 1).
-    assert_eq!(journal.len(), 0, "clean drop must release the WriteLease entry");
+    assert_eq!(
+        journal.len(),
+        0,
+        "clean drop must release the WriteLease entry"
+    );
     assert_eq!(art.write_lease_owner(), 0, "clean drop must free the lease");
 }
 
@@ -688,7 +701,11 @@ fn fenced_committer_installs_no_version_and_returns_staged() {
         w.commit(Commit::Replace, &batch(&[1, 2, 3]), &reg),
         Err(shm_artifact::Error::Fenced)
     ));
-    assert_eq!(art.current_version(), 0, "a fenced commit installs no version");
+    assert_eq!(
+        art.current_version(),
+        0,
+        "a fenced commit installs no version"
+    );
     assert_eq!(
         free_total(&fx.data_seg),
         free_before,
@@ -734,7 +751,11 @@ fn clean_release_bumps_fence_and_new_writer_acquires() {
 
     // The new writer acquires under the bumped fence (token 1, not 0).
     let mut w2 = art.open_exclusive(8).unwrap();
-    assert_eq!(w2.fence_token(), 1, "clean release must have bumped the fence");
+    assert_eq!(
+        w2.fence_token(),
+        1,
+        "clean release must have bumped the fence"
+    );
     assert_eq!(w2.commit(Commit::Replace, &batch(&[2]), &reg).unwrap(), 2);
     drop(w2);
 
@@ -758,7 +779,10 @@ fn wide_batch(cols: usize, rows: usize) -> (RecordBatch, SchemaRef) {
         columns.push(Arc::new(Int64Array::from(vals)));
     }
     let schema: SchemaRef = Arc::new(Schema::new(fields));
-    (RecordBatch::try_new(schema.clone(), columns).unwrap(), schema)
+    (
+        RecordBatch::try_new(schema.clone(), columns).unwrap(),
+        schema,
+    )
 }
 
 #[test]
@@ -786,7 +810,11 @@ fn multi_chunk_version_reads_zero_copy_and_reclaims_every_chunk() {
     {
         let pin = art.pin().unwrap();
         let m = pin.manifest();
-        assert!(m.chunks.len() >= 2, "batch must span >= 2 data chunks, got {}", m.chunks.len());
+        assert!(
+            m.chunks.len() >= 2,
+            "batch must span >= 2 data chunks, got {}",
+            m.chunks.len()
+        );
         assert_eq!(
             m.batch_spans,
             vec![m.chunks.len() as u32],
@@ -841,7 +869,11 @@ fn multi_chunk_append_shares_prior_chunks_across_versions() {
 
     let pin2 = art.pin().unwrap();
     let m2 = pin2.manifest();
-    assert_eq!(m2.chunks.len(), 2 * v1_chunks, "append concatenates both batches' chunks");
+    assert_eq!(
+        m2.chunks.len(),
+        2 * v1_chunks,
+        "append concatenates both batches' chunks"
+    );
     assert_eq!(m2.batch_spans.len(), 2, "two batches after append");
     assert_eq!(m2.batch_spans[0] as usize, v1_chunks);
     assert_eq!(m2.batch_spans[1] as usize, v1_chunks);
@@ -870,8 +902,14 @@ fn nested_struct_list_version_round_trips_zero_copy() {
     let art = fx.artifact(202);
 
     // Struct<{a: Int32, b: Utf8}> + List<Int32>, small enough to fit one chunk.
-    let a = Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4)])) as Arc<dyn arrow_array::Array>;
-    let bcol = Arc::new(StringArray::from(vec![Some("x"), None, Some("zz"), Some("www")])) as Arc<dyn arrow_array::Array>;
+    let a = Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4)]))
+        as Arc<dyn arrow_array::Array>;
+    let bcol = Arc::new(StringArray::from(vec![
+        Some("x"),
+        None,
+        Some("zz"),
+        Some("www"),
+    ])) as Arc<dyn arrow_array::Array>;
     let sfields = Fields::from(vec![
         Field::new("a", DataType::Int32, true),
         Field::new("b", DataType::Utf8, true),
@@ -906,7 +944,10 @@ fn nested_struct_list_version_round_trips_zero_copy() {
     let base = fx.data_seg.base_ptr() as usize;
     let end = base + fx.data_seg.size();
     let child = out.column(0).to_data().child_data()[0].buffers()[0].as_ptr() as usize;
-    assert!((base..end).contains(&child), "nested child buffer escaped the segment");
+    assert!(
+        (base..end).contains(&child),
+        "nested child buffer escaped the segment"
+    );
     drop(pin);
 
     // Retire v1 by superseding it; every chunk returns to the pool.

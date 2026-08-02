@@ -164,7 +164,9 @@ fn store_crash_reclaim_multiprocess() {
         None,
         "evicted key has no live entry"
     );
-    let after = coord.store_data_free_total().expect("store census after evict");
+    let after = coord
+        .store_data_free_total()
+        .expect("store census after evict");
     assert_eq!(
         after, baseline,
         "evict + reclaim returns the data pool to baseline (zero leak)"
@@ -188,7 +190,9 @@ fn store_crash_reclaim_same_process_deterministic() {
     let mut creator =
         Node::connect(&uds, "creator", Arc::new(SchemaRegistry::new())).expect("creator connect");
     creator.start_heartbeat(Duration::from_millis(150));
-    creator.intern_schema(&demo_schema()).expect("intern schema");
+    creator
+        .intern_schema(&demo_schema())
+        .expect("intern schema");
 
     // create + commit v1..v3 (owned Entry escapes the borrowed store handle).
     let entry = {

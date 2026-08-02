@@ -21,7 +21,9 @@ struct Region {
 impl Region {
     fn for_capacity(capacity: u32) -> Region {
         let bytes = required_bytes(capacity) + 64;
-        Region { buf: vec![0u64; bytes.div_ceil(8)] }
+        Region {
+            buf: vec![0u64; bytes.div_ceil(8)],
+        }
     }
     fn base(&self) -> *mut u8 {
         self.buf.as_ptr() as *mut u8
@@ -38,12 +40,21 @@ fn future() -> u64 {
 
 /// A request descriptor tagging task index `i` in `schema_id`.
 fn request(i: u32) -> ChunkDesc {
-    ChunkDesc { schema_id: i, offset: i.wrapping_mul(3), ..ChunkDesc::ZERO }
+    ChunkDesc {
+        schema_id: i,
+        offset: i.wrapping_mul(3),
+        ..ChunkDesc::ZERO
+    }
 }
 
 /// The result a worker `w` produces for a request (encodes the owner + task).
 fn result_for(req: ChunkDesc, w: u32) -> ChunkDesc {
-    ChunkDesc { schema_id: req.schema_id, segment_id: w, offset: req.schema_id.wrapping_mul(2), ..ChunkDesc::ZERO }
+    ChunkDesc {
+        schema_id: req.schema_id,
+        segment_id: w,
+        offset: req.schema_id.wrapping_mul(2),
+        ..ChunkDesc::ZERO
+    }
 }
 
 #[test]
@@ -93,7 +104,11 @@ fn exactly_once_claim_all_reach_done() {
 
     // Every task claimed exactly once.
     for (i, c) in claims.iter().enumerate() {
-        assert_eq!(c.load(Ordering::Acquire), 1, "task {i} not claimed exactly once");
+        assert_eq!(
+            c.load(Ordering::Acquire),
+            1,
+            "task {i} not claimed exactly once"
+        );
     }
     assert_eq!(completed.load(Ordering::Acquire), n as usize);
 
@@ -120,7 +135,10 @@ fn cancel_before_claim_is_cancelled() {
     queue.cancel(h).expect("cancel");
     assert_eq!(queue.poll(h).expect("poll"), TaskStatus::Cancelled);
     // No worker can claim a cancelled task.
-    assert!(queue.claim(1).is_none(), "cancelled task must not be claimable");
+    assert!(
+        queue.claim(1).is_none(),
+        "cancelled task must not be claimable"
+    );
 }
 
 #[test]
@@ -134,7 +152,10 @@ fn cancel_after_claim_flags_worker() {
     assert!(!task.is_cancelled(), "not cancelled yet");
 
     queue.cancel(h).expect("cancel");
-    assert!(task.is_cancelled(), "worker must observe the cooperative cancel flag");
+    assert!(
+        task.is_cancelled(),
+        "worker must observe the cooperative cancel flag"
+    );
 
     // A cooperative worker responds by failing.
     task.fail().expect("fail");
@@ -157,7 +178,10 @@ fn reap_requeues_and_second_worker_completes() {
     assert_eq!(report.failed, 0);
 
     // Worker A's stale claim is now lost (at-least-once): its complete is rejected.
-    assert!(a.complete(result_for(request(0), 1)).is_err(), "reaped claim must be Lost");
+    assert!(
+        a.complete(result_for(request(0), 1)).is_err(),
+        "reaped claim must be Lost"
+    );
 
     // A second worker picks up the *same* task (stable correlation id) and finishes.
     let b = queue.claim(2).expect("worker B claims requeued task");
@@ -175,10 +199,9 @@ fn reap_exceeding_retry_cap_fails_terminally() {
     let region = Region::for_capacity(4);
     let cap_retries = 1u32;
     // SAFETY: region outlives the queue.
-    let queue = unsafe {
-        TaskQueue::init_with_max_retries(region.base(), region.len(), 4, cap_retries)
-    }
-    .expect("init");
+    let queue =
+        unsafe { TaskQueue::init_with_max_retries(region.base(), region.len(), 4, cap_retries) }
+            .expect("init");
 
     let past = now_nanos().saturating_sub(1);
     let h = queue.submit(request(0), past).expect("submit");
@@ -209,11 +232,16 @@ fn stale_handle_after_slot_reuse() {
     assert!(matches!(queue.poll(h1).unwrap(), TaskStatus::Done(_)));
 
     // Reuse the (terminal) slot for a new task: h1's seq is now stale.
-    let h2 = queue.submit(request(1), future()).expect("submit 2 reuses slot");
+    let h2 = queue
+        .submit(request(1), future())
+        .expect("submit 2 reuses slot");
     assert_eq!(h1.slot_idx, h2.slot_idx, "same slot reused");
 
     assert!(matches!(queue.poll(h1), Err(shm_task::Error::StaleHandle)));
-    assert!(matches!(queue.cancel(h1), Err(shm_task::Error::StaleHandle)));
+    assert!(matches!(
+        queue.cancel(h1),
+        Err(shm_task::Error::StaleHandle)
+    ));
     // The fresh handle still resolves.
     assert_eq!(queue.poll(h2).expect("poll h2"), TaskStatus::Queued);
 }
@@ -227,18 +255,31 @@ fn queue_full_backpressure() {
 
     let mut handles = Vec::new();
     for i in 0..capacity {
-        handles.push(queue.submit(request(i), future()).expect("submit fills queue"));
+        handles.push(
+            queue
+                .submit(request(i), future())
+                .expect("submit fills queue"),
+        );
     }
     // All slots live → full.
-    assert!(matches!(queue.submit(request(99), future()), Err(shm_task::Error::QueueFull)));
+    assert!(matches!(
+        queue.submit(request(99), future()),
+        Err(shm_task::Error::QueueFull)
+    ));
 
     // A CLAIMED task is still not reusable.
     let t = queue.claim(1).expect("claim");
-    assert!(matches!(queue.submit(request(99), future()), Err(shm_task::Error::QueueFull)));
+    assert!(matches!(
+        queue.submit(request(99), future()),
+        Err(shm_task::Error::QueueFull)
+    ));
 
     // Completing frees exactly one slot for reuse.
     t.complete(result_for(request(0), 1)).expect("complete");
-    assert!(queue.submit(request(99), future()).is_ok(), "freed slot must accept a submit");
+    assert!(
+        queue.submit(request(99), future()).is_ok(),
+        "freed slot must accept a submit"
+    );
 }
 
 #[test]
@@ -297,7 +338,10 @@ fn doorbell_blocked_worker_wakes_on_submit() {
 
     let (got, elapsed) = worker.join().unwrap();
     assert_eq!(got, 5, "worker processed the submitted task");
-    assert!(elapsed < Duration::from_secs(2), "worker woke slowly: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "worker woke slowly: {elapsed:?}"
+    );
     assert!(matches!(queue.poll(h).unwrap(), TaskStatus::Done(_)));
 
     drop(db);

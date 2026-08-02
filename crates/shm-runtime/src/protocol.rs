@@ -315,7 +315,10 @@ impl<'a> Reader<'a> {
     }
 
     fn u8(&mut self) -> Result<u8> {
-        let b = *self.buf.get(self.pos).ok_or(Error::Protocol("short read: u8"))?;
+        let b = *self
+            .buf
+            .get(self.pos)
+            .ok_or(Error::Protocol("short read: u8"))?;
         self.pos += 1;
         Ok(b)
     }
@@ -564,7 +567,9 @@ impl Response {
                 region_len: r.u32()?,
             },
             tags::ACK => Response::Ack,
-            tags::ERROR => Response::Error { message: r.string()? },
+            tags::ERROR => Response::Error {
+                message: r.string()?,
+            },
             tags::ARTIFACT_GRANTED => Response::ArtifactGranted {
                 name_id: r.u32()?,
                 head_seg_id: r.u32()?,
@@ -625,10 +630,16 @@ mod tests {
             Request::Subscribe {
                 topic: "demo".into(),
             },
-            Request::Published { desc: sample_desc() },
-            Request::Pinned { desc: sample_desc() },
+            Request::Published {
+                desc: sample_desc(),
+            },
+            Request::Pinned {
+                desc: sample_desc(),
+            },
             Request::Bye,
-            Request::OpenArtifact { name: "cache".into() },
+            Request::OpenArtifact {
+                name: "cache".into(),
+            },
             Request::OpenTaskQueue,
             Request::InternSchema {
                 schema_bytes: vec![0, 1, 2, 3, 250, 255, 128],
@@ -740,10 +751,7 @@ mod tests {
 
     #[test]
     fn truncated_frame_is_rejected() {
-        let body = Request::Register {
-            name: "x".into(),
-        }
-        .encode();
+        let body = Request::Register { name: "x".into() }.encode();
         // Chop the string body off; decode must error, not panic.
         let err = Request::decode(&body[..2]);
         assert!(matches!(err, Err(Error::Protocol(_))));
@@ -751,10 +759,7 @@ mod tests {
 
     #[test]
     fn unknown_tag_is_rejected() {
-        assert!(matches!(
-            Request::decode(&[200u8]),
-            Err(Error::Protocol(_))
-        ));
+        assert!(matches!(Request::decode(&[200u8]), Err(Error::Protocol(_))));
         assert!(matches!(
             Response::decode(&[201u8]),
             Err(Error::Protocol(_))
@@ -863,7 +868,9 @@ mod tests {
                 schema_bytes: vec![1, 2, 3, 4, 5],
             },
             Request::ResolveSchema { schema_id: 42 },
-            Request::Published { desc: sample_desc() },
+            Request::Published {
+                desc: sample_desc(),
+            },
             Request::OpenTaskQueue,
         ];
         for r in reqs {

@@ -20,12 +20,10 @@ use arrow_schema::SchemaRef;
 use shm_arrow::{read_batch, write_batch, PinGuard, PoolAllocator, SchemaRegistry};
 use shm_artifact::{Artifact, VersionEvent, ARTIFACTS_TOPIC};
 use shm_core::{BorrowJournal, ChunkDesc, Pool, Segment};
-use shm_store::{read_typed_ref, write_typed_ref, KeyResolver, KeyedStore, TypedRef};
 use shm_ring::{DoorbellNotifier, DoorbellParker, Msg, Publisher, Ring, Subscriber};
+use shm_store::{read_typed_ref, write_typed_ref, KeyResolver, KeyedStore, TypedRef};
 use shm_stream::{Commit, Coordination, StreamWriter};
-use shm_task::{
-    now_nanos, ClaimedTask, Outcome, TaskHandle, TaskQueue, TaskStatus,
-};
+use shm_task::{now_nanos, ClaimedTask, Outcome, TaskHandle, TaskQueue, TaskStatus};
 
 use crate::error::{Error, Result};
 use crate::protocol::{Request, Response};
@@ -131,7 +129,11 @@ impl Node {
         // --- Register handshake (expects the two segment fds). ---
         {
             let guard = send.lock().expect("send mutex poisoned");
-            send_frame(&*guard, &Request::Register { name: name.into() }.encode(), &[])?;
+            send_frame(
+                &*guard,
+                &Request::Register { name: name.into() }.encode(),
+                &[],
+            )?;
         }
         let frame = recv_frame(&read_stream)?;
         let resp = Response::decode(&frame.body)?;
@@ -157,12 +159,10 @@ impl Node {
         let payload_fd = fds.pop().unwrap();
         // SAFETY: these fds were freshly received via SCM_RIGHTS from the
         // coordinator, each naming a live shm object; ownership transfers here.
-        let payload_seg = Arc::new(unsafe {
-            Segment::from_raw_fd(into_raw(payload_fd), payload_seg_id)?
-        });
-        let journal_seg = Arc::new(unsafe {
-            Segment::from_raw_fd(into_raw(journal_fd), journal_seg_id)?
-        });
+        let payload_seg =
+            Arc::new(unsafe { Segment::from_raw_fd(into_raw(payload_fd), payload_seg_id)? });
+        let journal_seg =
+            Arc::new(unsafe { Segment::from_raw_fd(into_raw(journal_fd), journal_seg_id)? });
 
         Ok(Node {
             name: name.into(),
@@ -358,7 +358,10 @@ impl Node {
     /// *not* shared, so an envelope destined for another process must live in the
     /// store's shared pool.
     pub fn write_ref_chunk(&self, tref: &TypedRef) -> Result<ChunkDesc> {
-        let m = self.store.as_ref().ok_or(Error::NotFound("store not open"))?;
+        let m = self
+            .store
+            .as_ref()
+            .ok_or(Error::NotFound("store not open"))?;
         let pool = Pool::attach(&m.data_seg)?;
         let alloc = PoolAllocator::new(&pool, &m.data_seg);
         Ok(write_typed_ref(&alloc, tref)?)
@@ -368,7 +371,10 @@ impl Node {
     /// the shared store data pool (ADR-0007 G1). Errors if `desc` is not tagged
     /// `SCHEMA_TYPED_REF` or fails envelope validation. The store must be open.
     pub fn read_ref_chunk(&self, desc: &ChunkDesc) -> Result<TypedRef> {
-        let m = self.store.as_ref().ok_or(Error::NotFound("store not open"))?;
+        let m = self
+            .store
+            .as_ref()
+            .ok_or(Error::NotFound("store not open"))?;
         let guard = PinGuard::new(m.data_seg.clone());
         Ok(read_typed_ref(&guard, desc)?)
     }
@@ -387,7 +393,10 @@ impl Node {
     /// (e.g. by the requester after reading a result, or by the worker that
     /// completed a task) to keep the store data-pool census leak-free.
     pub fn free_ref_chunk(&self, desc: &ChunkDesc) -> Result<()> {
-        let m = self.store.as_ref().ok_or(Error::NotFound("store not open"))?;
+        let m = self
+            .store
+            .as_ref()
+            .ok_or(Error::NotFound("store not open"))?;
         let pool = Pool::attach(&m.data_seg)?;
         let _ = pool.free(desc);
         Ok(())
@@ -403,7 +412,11 @@ impl Node {
     /// use. A worker claims the task, reads the envelope with
     /// [`task_ref`](Self::task_ref), and resolves it via
     /// [`store()`](Self::store)`.resolve_and_pin(..)`.
-    pub fn submit_typed_task(&mut self, tref: &TypedRef, deadline_nanos: u64) -> Result<TaskHandle> {
+    pub fn submit_typed_task(
+        &mut self,
+        tref: &TypedRef,
+        deadline_nanos: u64,
+    ) -> Result<TaskHandle> {
         self.open_store()?;
         self.open_task_queue()?;
         let desc = self.write_ref_chunk(tref)?;
@@ -450,9 +463,13 @@ impl Node {
             return Ok(());
         }
         let req = if subscribe {
-            Request::Subscribe { topic: topic.into() }
+            Request::Subscribe {
+                topic: topic.into(),
+            }
         } else {
-            Request::CreateTopic { topic: topic.into() }
+            Request::CreateTopic {
+                topic: topic.into(),
+            }
         };
         let (resp, mut fds) = self.request(&req)?;
         let (ring_seg_id, region_len) = match resp {
@@ -554,7 +571,10 @@ impl Node {
             .expect("topic ensured above")
             .doorbell
             .try_clone()?;
-        Ok(Subscriber::from_start_with_parker(ring, DoorbellParker::new(read)))
+        Ok(Subscriber::from_start_with_parker(
+            ring,
+            DoorbellParker::new(read),
+        ))
     }
 
     /// Subscribe to `topic` from an explicit sequence, parking on the topic's
@@ -570,11 +590,7 @@ impl Node {
     /// first and resyncs to the oldest live message, and one at or beyond the
     /// head blocks until the producer reaches it. A caller that must report a
     /// gap to its client should surface `Lagged` rather than pre-validate.
-    pub fn subscribe_from(
-        &mut self,
-        topic: &str,
-        seq: u64,
-    ) -> Result<Subscriber<DoorbellParker>> {
+    pub fn subscribe_from(&mut self, topic: &str, seq: u64) -> Result<Subscriber<DoorbellParker>> {
         self.ensure_topic(topic, true)?;
         let ring = self.ring_for(topic)?;
         let read = self

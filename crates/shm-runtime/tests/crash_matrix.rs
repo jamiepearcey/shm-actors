@@ -110,9 +110,20 @@ fn line_tokens(path: &std::path::Path, prefix: &str) -> Option<Vec<String>> {
 fn spawn_kill_at(point: &str, uds: &str, result: &str, art: &str) -> Reaper {
     let mut cmd = Command::new(exe());
     cmd.args([
-        "kill-at", "--uds", uds, "--result", result, "--kill-at", point, "--art", art,
+        "kill-at",
+        "--uds",
+        uds,
+        "--result",
+        result,
+        "--kill-at",
+        point,
+        "--art",
+        art,
     ]);
-    Reaper(cmd.spawn().unwrap_or_else(|e| panic!("spawn kill-at {point}: {e}")))
+    Reaper(
+        cmd.spawn()
+            .unwrap_or_else(|e| panic!("spawn kill-at {point}: {e}")),
+    )
 }
 
 fn spawn_role(role: &str, uds: &str, result: &str) -> Reaper {
@@ -130,10 +141,14 @@ fn boot_with_v1(uds: &std::path::Path) -> (Coordinator, Node, usize) {
 
     let mut survivor = Node::connect(uds, "survivor", registry()).expect("survivor connect");
     survivor.start_heartbeat(Duration::from_millis(150));
-    survivor.open_artifact(CACHE_ARTIFACT).expect("open_artifact");
+    survivor
+        .open_artifact(CACHE_ARTIFACT)
+        .expect("open_artifact");
     // Negotiate the schema id through the coordinator (item E) so a manifest a
     // multi-process worker later reads carries a coordinator-resolvable id.
-    survivor.intern_schema(&demo_schema()).expect("intern schema via coordinator");
+    survivor
+        .intern_schema(&demo_schema())
+        .expect("intern schema via coordinator");
     assert_eq!(commit_replace(&survivor, 0), 1, "survivor commits v1");
     let one_version_free = coord
         .artifact_free_total(CACHE_ARTIFACT)
@@ -144,7 +159,12 @@ fn boot_with_v1(uds: &std::path::Path) -> (Coordinator, Node, usize) {
 fn commit_replace(node: &Node, expect: u64) -> u64 {
     let stream = node.stream(CACHE_ARTIFACT).expect("stream");
     let mut w = stream
-        .writer(Commit::Replace, Coordination::Optimistic { expect_version: expect })
+        .writer(
+            Commit::Replace,
+            Coordination::Optimistic {
+                expect_version: expect,
+            },
+        )
         .expect("writer");
     w.append_batch(&demo_batch()).expect("append");
     w.commit().expect("commit")
@@ -158,12 +178,20 @@ fn assert_survivor_consistent(coord: &Coordinator, survivor: &Node, expect_curre
         Some(expect_current),
         "current_version must stay coherent after the crash reclaim"
     );
-    let pin = survivor.pin_artifact(CACHE_ARTIFACT).expect("survivor re-pins current");
-    assert_eq!(pin.version(), expect_current, "survivor pins the current version");
+    let pin = survivor
+        .pin_artifact(CACHE_ARTIFACT)
+        .expect("survivor re-pins current");
+    assert_eq!(
+        pin.version(),
+        expect_current,
+        "survivor pins the current version"
+    );
     survivor
         .resolve_schema(pin.manifest().schema_id)
         .expect("survivor resolves schema");
-    let batch = pin.as_arrow(survivor.registry()).expect("survivor reads zero-copy");
+    let batch = pin
+        .as_arrow(survivor.registry())
+        .expect("survivor reads zero-copy");
     verify_demo_batch(&batch).expect("survivor's zero-copy read is valid, not torn");
 }
 
@@ -190,7 +218,8 @@ fn run_data_pool_point(point: &str, expect_chunk_reclaim: bool, expect_lease_rec
 
     let actor = spawn_kill_at(point, &uds_s, res.to_str().unwrap(), CACHE_ARTIFACT);
     assert!(
-        wait_until(Duration::from_secs(20), || line_tokens(&res, "READY").is_some()),
+        wait_until(Duration::from_secs(20), || line_tokens(&res, "READY")
+            .is_some()),
         "{point}: actor never reached the transition (result: {:?})",
         std::fs::read_to_string(&res).ok()
     );
@@ -201,7 +230,8 @@ fn run_data_pool_point(point: &str, expect_chunk_reclaim: bool, expect_lease_rec
     // actor held: the pool returns EXACTLY to the one-version baseline.
     let reclaimed = wait_until(Duration::from_secs(10), || {
         coord.artifact_free_total(CACHE_ARTIFACT) == Some(one_version_free)
-            && (!expect_lease_reclaim || coord.artifact_write_lease_owner(CACHE_ARTIFACT) == Some(0))
+            && (!expect_lease_reclaim
+                || coord.artifact_write_lease_owner(CACHE_ARTIFACT) == Some(0))
     });
     assert!(
         reclaimed,
@@ -235,7 +265,11 @@ fn run_data_pool_point(point: &str, expect_chunk_reclaim: bool, expect_lease_rec
     assert_survivor_consistent(&coord, &survivor, 1);
 
     // And a fresh writer can still install v2 — the artifact is not wedged.
-    assert_eq!(commit_replace(&survivor, 1), 2, "{point}: artifact still writable after reclaim");
+    assert_eq!(
+        commit_replace(&survivor, 1),
+        2,
+        "{point}: artifact still writable after reclaim"
+    );
 }
 
 #[test]
@@ -273,7 +307,8 @@ fn kill_at_artifact_pin_mid_hold() {
 
     let actor = spawn_kill_at("art-pin", &uds_s, res.to_str().unwrap(), CACHE_ARTIFACT);
     assert!(
-        wait_until(Duration::from_secs(20), || line_tokens(&res, "READY").is_some()),
+        wait_until(Duration::from_secs(20), || line_tokens(&res, "READY")
+            .is_some()),
         "art-pin: actor never pinned a version (result: {:?})",
         std::fs::read_to_string(&res).ok()
     );
@@ -332,11 +367,14 @@ fn kill_at_payload_pin_mid_hold() {
     // node alive so the published chunk stays put until the consumer pins it.
     let mut producer = Node::connect(&uds, "producer", demo_registry()).expect("producer connect");
     producer.start_heartbeat(Duration::from_millis(150));
-    let desc = producer.publish_batch(DEMO_TOPIC, &demo_batch()).expect("publish");
+    let desc = producer
+        .publish_batch(DEMO_TOPIC, &demo_batch())
+        .expect("publish");
 
     let actor = spawn_kill_at("payload-pin", &uds_s, res.to_str().unwrap(), CACHE_ARTIFACT);
     assert!(
-        wait_until(Duration::from_secs(20), || line_tokens(&res, "READY").is_some()),
+        wait_until(Duration::from_secs(20), || line_tokens(&res, "READY")
+            .is_some()),
         "payload-pin: consumer never pinned (result: {:?})",
         std::fs::read_to_string(&res).ok()
     );
@@ -344,9 +382,9 @@ fn kill_at_payload_pin_mid_hold() {
     assert!(
         wait_until(Duration::from_secs(5), || {
             coord.is_armed()
-                && coord
-                    .chunk_snapshot(&desc)
-                    .is_some_and(|s| s.state == shm_core::PUBLISHED && s.owner == 0 && s.refcount >= 1)
+                && coord.chunk_snapshot(&desc).is_some_and(|s| {
+                    s.state == shm_core::PUBLISHED && s.owner == 0 && s.refcount >= 1
+                })
         }),
         "payload-pin: the chunk was never armed with a live pin"
     );
@@ -405,7 +443,8 @@ fn kill_at_task_claim_requeues() {
 
     let actor = spawn_kill_at("task-claim", &uds_s, res.to_str().unwrap(), CACHE_ARTIFACT);
     assert!(
-        wait_until(Duration::from_secs(20), || line_tokens(&res, "READY").is_some()),
+        wait_until(Duration::from_secs(20), || line_tokens(&res, "READY")
+            .is_some()),
         "task-claim: worker never claimed (result: {:?})",
         std::fs::read_to_string(&res).ok()
     );
@@ -416,14 +455,21 @@ fn kill_at_task_claim_requeues() {
     // A second worker claims the requeued task and completes it.
     let _worker = spawn_role("worker", &uds_s, work_r.to_str().unwrap());
     assert!(
-        wait_until(Duration::from_secs(20), || line_tokens(&work_r, "DONE").is_some()),
+        wait_until(Duration::from_secs(20), || line_tokens(&work_r, "DONE")
+            .is_some()),
         "task-claim: second worker never completed the requeued task (result: {:?})",
         std::fs::read_to_string(&work_r).ok()
     );
     let done = line_tokens(&work_r, "DONE").unwrap();
     // At-least-once: the correlation id is STABLE across the requeue.
-    assert_eq!(done[1], claimed_slot, "requeue changed the slot (correlation id)");
-    assert_eq!(done[2], claimed_seq, "requeue changed the seq (correlation id)");
+    assert_eq!(
+        done[1], claimed_slot,
+        "requeue changed the slot (correlation id)"
+    );
+    assert_eq!(
+        done[2], claimed_seq,
+        "requeue changed the seq (correlation id)"
+    );
     assert_eq!(done[3], DEMO_ID_SUM.to_string(), "wrong derived sum");
 
     // The original requester observes the same terminal outcome.
@@ -448,13 +494,17 @@ fn kill_at_task_submit_dead_submitter() {
 
     let actor = spawn_kill_at("task-submit", &uds_s, res.to_str().unwrap(), CACHE_ARTIFACT);
     assert!(
-        wait_until(Duration::from_secs(20), || line_tokens(&res, "READY").is_some()),
+        wait_until(Duration::from_secs(20), || line_tokens(&res, "READY")
+            .is_some()),
         "task-submit: submitter never submitted (result: {:?})",
         std::fs::read_to_string(&res).ok()
     );
     let ready = line_tokens(&res, "READY").unwrap();
     let (slot, seq): (u32, u64) = (ready[2].parse().unwrap(), ready[3].parse().unwrap());
-    let handle = shm_task::TaskHandle { slot_idx: slot, seq };
+    let handle = shm_task::TaskHandle {
+        slot_idx: slot,
+        seq,
+    };
     drop(actor);
 
     // The dead submitter's task is still QUEUED (not wedged): the handle it minted
@@ -474,7 +524,11 @@ fn kill_at_task_submit_dead_submitter() {
     let task = queue
         .claim(Duration::from_secs(5).as_nanos() as u64)
         .expect("the queued task is claimable after the submitter died");
-    assert_eq!(task.task_id(), handle, "claimed the very task the dead submitter left");
+    assert_eq!(
+        task.task_id(),
+        handle,
+        "claimed the very task the dead submitter left"
+    );
     task.complete(ChunkDesc {
         offset: 42,
         ..ChunkDesc::ZERO

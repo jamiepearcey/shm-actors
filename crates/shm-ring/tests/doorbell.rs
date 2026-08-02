@@ -16,7 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use shm_core::{doorbell_pair, doorbell_park, doorbell_ring, ChunkDesc, Segment};
-use shm_ring::{required_bytes, DoorbellNotifier, DoorbellParker, Msg, Publisher, Ring, Subscriber};
+use shm_ring::{
+    required_bytes, DoorbellNotifier, DoorbellParker, Msg, Publisher, Ring, Subscriber,
+};
 
 /// A generous timeout: a return sooner than this proves a real wakeup (vs the
 /// bounded park timeout that a busy peer would otherwise mask).
@@ -53,7 +55,10 @@ fn doorbell_ring_before_park_no_lost_wakeup() {
     let woke = doorbell_park(read.as_raw_fd(), LONG).expect("park");
     let elapsed = start.elapsed();
     assert!(woke, "a ring before park must still wake");
-    assert!(elapsed < Duration::from_secs(1), "park blocked despite pending byte: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "park blocked despite pending byte: {elapsed:?}"
+    );
 }
 
 #[test]
@@ -95,7 +100,10 @@ fn doorbell_broadcast_wakes_all_subscribers() {
     // Let every subscriber park, then publish ONCE, ringing the shared doorbell.
     barrier.wait();
     thread::sleep(Duration::from_millis(60));
-    let published = ChunkDesc { offset: 42, ..ChunkDesc::ZERO };
+    let published = ChunkDesc {
+        offset: 42,
+        ..ChunkDesc::ZERO
+    };
     Publisher::with_notifier(ring, DoorbellNotifier::new(write_fd)).publish(published);
 
     for (i, w) in workers.into_iter().enumerate() {
@@ -145,7 +153,10 @@ fn subscriber_parks_and_wakes_via_doorbell() {
 
     // Idle for a bit, then publish + ring the doorbell.
     thread::sleep(Duration::from_millis(120));
-    let published = ChunkDesc { offset: 7, ..ChunkDesc::ZERO };
+    let published = ChunkDesc {
+        offset: 7,
+        ..ChunkDesc::ZERO
+    };
     Publisher::with_notifier(ring, DoorbellNotifier::new(write_fd)).publish(published);
 
     let (msg, elapsed) = consumer.join().unwrap();
@@ -154,7 +165,10 @@ fn subscriber_parks_and_wakes_via_doorbell() {
         other => panic!("expected the published sample, got {other:?}"),
     }
     // Woke within a couple of park cycles of the publish, not after LONG.
-    assert!(elapsed < Duration::from_secs(1), "subscriber woke slowly: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "subscriber woke slowly: {elapsed:?}"
+    );
 
     // Keep the write-end alive until after the publish, then clean up.
     drop(db);

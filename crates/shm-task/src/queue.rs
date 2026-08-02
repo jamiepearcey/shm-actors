@@ -345,7 +345,10 @@ impl TaskQueue {
         }
         let need = required_bytes(capacity);
         if region_len < need {
-            return Err(Error::RegionTooSmall { need, have: region_len });
+            return Err(Error::RegionTooSmall {
+                need,
+                have: region_len,
+            });
         }
 
         // SAFETY: `base` is 8-aligned and `region_len >= need`, so the header and
@@ -414,7 +417,10 @@ impl TaskQueue {
         }
         let need = required_bytes(capacity);
         if region_len < need {
-            return Err(Error::RegionTooSmall { need, have: region_len });
+            return Err(Error::RegionTooSmall {
+                need,
+                have: region_len,
+            });
         }
         // SAFETY: `capacity` was validated at init; the slot array is in-bounds.
         let slots = unsafe { base.add(slots_offset()).cast::<TaskSlot>() };
@@ -534,7 +540,10 @@ impl TaskQueue {
             if self.header().waiters_work.load(Ordering::Acquire) > 0 {
                 self.work.notify();
             }
-            return Ok(TaskHandle { slot_idx: idx as u32, seq: new_seq });
+            return Ok(TaskHandle {
+                slot_idx: idx as u32,
+                seq: new_seq,
+            });
         }
         Err(Error::QueueFull)
     }
@@ -856,7 +865,10 @@ impl ClaimedTask {
     /// The correlation id of this task (`{slot_idx, seq}`), for dedup/logging.
     #[inline]
     pub fn task_id(&self) -> TaskHandle {
-        TaskHandle { slot_idx: self.idx as u32, seq: self.seq }
+        TaskHandle {
+            slot_idx: self.idx as u32,
+            seq: self.seq,
+        }
     }
 
     /// The id of the worker that claimed this task.

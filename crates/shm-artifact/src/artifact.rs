@@ -53,7 +53,9 @@ use shm_arrow::{
     read_batch_chunks, write_batch_chunks, ChunkAllocator, PoolAllocator, SchemaRegistry,
     SegmentBase,
 };
-use shm_core::{BorrowJournal, ChunkCtrl, ChunkDesc, PackedRef, Pool, PoolConfig, Segment, PUBLISHED};
+use shm_core::{
+    BorrowJournal, ChunkCtrl, ChunkDesc, PackedRef, Pool, PoolConfig, Segment, PUBLISHED,
+};
 
 use crate::error::{Error, Result};
 use crate::event::{CommitKind, VersionEvent};
@@ -189,7 +191,10 @@ impl Artifact {
         head_off: usize,
         data_seg: Arc<Segment>,
     ) -> Result<Artifact> {
-        debug_assert!(head_off.is_multiple_of(8), "head_off must be 8-byte aligned");
+        debug_assert!(
+            head_off.is_multiple_of(8),
+            "head_off must be 8-byte aligned"
+        );
         let need = head_off
             .checked_add(ArtifactHead::region_bytes())
             .ok_or(Error::Core(shm_core::Error::LayoutOverflow(
@@ -456,7 +461,15 @@ impl Artifact {
         let staged = write_batch_chunks(&alloc, registry, batch)?;
         loan_all(&pool, &alloc, &staged, owner)?;
         let spans = [staged.len() as u32];
-        self.commit_staged_inner(expect, owner, commit, &staged, &spans, schema_id, lease_fence)
+        self.commit_staged_inner(
+            expect,
+            owner,
+            commit,
+            &staged,
+            &spans,
+            schema_id,
+            lease_fence,
+        )
     }
 
     /// **The one true RCU install path**, shared by single-batch commits and by
@@ -625,7 +638,10 @@ impl Artifact {
         };
 
         // 5. Install: the single linearising CAS of `current`.
-        match head.current.compare_exchange(expect, target, SeqCst, SeqCst) {
+        match head
+            .current
+            .compare_exchange(expect, target, SeqCst, SeqCst)
+        {
             Ok(_) => {
                 // Publish the manifest pointer (readers validate manifest.version
                 // so the brief two-word window is never observed torn).
@@ -653,7 +669,10 @@ impl Artifact {
                     Some(&manifest_desc),
                     Some(slot_idx),
                 );
-                Err(Error::Conflict { expected: expect, actual })
+                Err(Error::Conflict {
+                    expected: expect,
+                    actual,
+                })
             }
         }
     }
@@ -1147,8 +1166,14 @@ impl Committer<'_> {
         registry: &SchemaRegistry,
     ) -> Result<u64> {
         let expect = self.artifact.head().current.load(SeqCst);
-        self.artifact
-            .commit_inner(expect, self.owner, commit, batch, registry, Some(self.token))
+        self.artifact.commit_inner(
+            expect,
+            self.owner,
+            commit,
+            batch,
+            registry,
+            Some(self.token),
+        )
     }
 
     /// **ADDITIVE (v0.2 stage C — for `shm-stream`).** Install a batch of

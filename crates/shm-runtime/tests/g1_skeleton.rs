@@ -392,7 +392,11 @@ fn g1_crash_reclaim_multiprocess() {
     let mut worker2 = Reaper(worker2);
 
     // The front's wait returns Done once worker2 completes the requeued task.
-    let outcome = front.task_queue().unwrap().wait(handle).expect("wait outcome");
+    let outcome = front
+        .task_queue()
+        .unwrap()
+        .wait(handle)
+        .expect("wait outcome");
     let result_desc = match outcome {
         Outcome::Done(d) => d,
         other => panic!("task did not complete: {other:?}"),
