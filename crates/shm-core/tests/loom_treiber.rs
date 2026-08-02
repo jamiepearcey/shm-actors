@@ -103,10 +103,19 @@ fn loom_treiber_no_double_alloc() {
 
         // Both concurrent pops succeed (2 nodes, 2 poppers) with distinct slots:
         // no chunk is popped by two allocators at once.
-        assert!(a.is_some() && b.is_some(), "both pops must succeed on a 2-node stack");
-        assert_ne!(a, b, "a chunk was popped by two allocators at once (double-alloc)");
+        assert!(
+            a.is_some() && b.is_some(),
+            "both pops must succeed on a 2-node stack"
+        );
+        assert_ne!(
+            a, b,
+            "a chunk was popped by two allocators at once (double-alloc)"
+        );
         // The list is now empty and uncorrupted.
-        assert_eq!(stack.walk().expect("free-list corrupted"), Vec::<u32>::new());
+        assert_eq!(
+            stack.walk().expect("free-list corrupted"),
+            Vec::<u32>::new()
+        );
     });
     eprintln!(
         "loom_treiber_no_double_alloc: explored {} interleavings",
@@ -140,7 +149,11 @@ fn loom_treiber_pop_push_integrity() {
         // free list is exactly the two original nodes.
         let mut walked = stack.walk().expect("free-list corrupted (cycle/overrun)");
         walked.sort_unstable();
-        assert_eq!(walked, vec![0, 1], "a node was lost or duplicated (ABA corruption)");
+        assert_eq!(
+            walked,
+            vec![0, 1],
+            "a node was lost or duplicated (ABA corruption)"
+        );
     });
     eprintln!(
         "loom_treiber_pop_push_integrity: explored {} interleavings",

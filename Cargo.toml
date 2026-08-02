@@ -26,7 +26,17 @@ repository = "https://github.com/example/shm-actors"
 
 [workspace.dependencies]
 # Intra-workspace
-shm-core = { path = "crates/shm-core" }
+# Publishable coordinates for the crates that leave this workspace.
+#
+# `path` still wins for every local build — these extra keys only take effect
+# when the crate is *published*, where a bare path dependency is rejected
+# ("all dependencies must have a version specified"). Marking the registry is
+# also mandatory: a crate published to an alternative registry may only depend
+# on crates from that same registry.
+#
+# Only the crates ArrowRef actually consumes carry these; the rest of the
+# workspace stays path-only because nothing outside this repo references them.
+shm-core = { path = "crates/shm-core", version = "0.1.0", registry = "kellnr" }
 shm-arrow = { path = "crates/shm-arrow" }
 shm-ring = { path = "crates/shm-ring" }
 shm-task = { path = "crates/shm-task" }

@@ -177,6 +177,7 @@ pub(crate) const fn buffers_offset(node_count: usize) -> usize {
 /// Byte offset where the first padded payload buffer begins in the primary chunk.
 #[inline]
 pub(crate) const fn payload_start(node_count: usize, buffer_count: usize) -> usize {
-    let after_tables = buffers_offset(node_count) + buffer_count * core::mem::size_of::<BufferEntry>();
+    let after_tables =
+        buffers_offset(node_count) + buffer_count * core::mem::size_of::<BufferEntry>();
     align_up(after_tables, BUFFER_ALIGN)
 }

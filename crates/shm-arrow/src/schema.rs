@@ -304,7 +304,11 @@ mod tests {
         assert_eq!(reg.id_for(&schema_a()), Some(7), "lookup by content hash");
         // A subsequent intern of the same schema returns the inserted id, not a
         // freshly minted local one.
-        assert_eq!(reg.intern(&schema_a()), 7, "intern hits the inserted mapping");
+        assert_eq!(
+            reg.intern(&schema_a()),
+            7,
+            "intern hits the inserted mapping"
+        );
         // Idempotent re-insert is a no-op.
         reg.insert(7, schema_a());
         assert_eq!(reg.resolve(7), Some(schema_a()));

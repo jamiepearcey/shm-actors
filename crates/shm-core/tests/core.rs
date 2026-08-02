@@ -162,8 +162,14 @@ fn pool_alloc_free_and_exhaustion() {
     // Two classes: 64B x 4, 128B x 2.
     let cfg = PoolConfig {
         classes: vec![
-            shm_core::SizeClass { chunk_size: 64, chunk_count: 4 },
-            shm_core::SizeClass { chunk_size: 128, chunk_count: 2 },
+            shm_core::SizeClass {
+                chunk_size: 64,
+                chunk_count: 4,
+            },
+            shm_core::SizeClass {
+                chunk_size: 128,
+                chunk_count: 2,
+            },
         ],
     };
     let pool = Pool::create(&seg, &cfg).unwrap();
@@ -196,7 +202,10 @@ fn pool_alloc_free_and_exhaustion() {
 fn pool_treiber_aba_safety() {
     let seg = small_pool_segment();
     let cfg = PoolConfig {
-        classes: vec![shm_core::SizeClass { chunk_size: 64, chunk_count: 8 }],
+        classes: vec![shm_core::SizeClass {
+            chunk_size: 64,
+            chunk_count: 8,
+        }],
     };
     let pool = Pool::create(&seg, &cfg).unwrap();
 
@@ -294,7 +303,10 @@ fn chunkctrl_drop_loan_bumps_generation() {
 fn stale_descriptor_after_recycle() {
     let seg = small_pool_segment();
     let cfg = PoolConfig {
-        classes: vec![shm_core::SizeClass { chunk_size: 64, chunk_count: 2 }],
+        classes: vec![shm_core::SizeClass {
+            chunk_size: 64,
+            chunk_count: 2,
+        }],
     };
     let pool = Pool::create(&seg, &cfg).unwrap();
 
@@ -309,7 +321,10 @@ fn stale_descriptor_after_recycle() {
 
     // The old descriptor is now stale.
     let ctrl_after = pool.ctrl(&desc).unwrap();
-    assert!(matches!(ctrl_after.validate(&desc), Err(Error::StaleDescriptor)));
+    assert!(matches!(
+        ctrl_after.validate(&desc),
+        Err(Error::StaleDescriptor)
+    ));
 
     // A freshly allocated descriptor for the same slot validates fine.
     let desc2 = pool.alloc(64).unwrap();
@@ -426,7 +441,9 @@ fn journal_tagged_entries_roundtrip_all_kinds() {
     // WriteLease survives the replay.
     jrn.release(w0).unwrap();
     assert_eq!(jrn.len(), 4);
-    assert!(!jrn.replay().any(|r| matches!(r, JournalRecord::WriteLease { .. })));
+    assert!(!jrn
+        .replay()
+        .any(|r| matches!(r, JournalRecord::WriteLease { .. })));
 
     // A ChunkPin round-trips its whole descriptor, not just the offset.
     let full = jrn

@@ -125,14 +125,7 @@ impl JournalEntry {
         JournalEntry {
             kind: ENTRY_ARTIFACT_PIN,
             _pad: 0,
-            w: [
-                artifact_id,
-                version as u32,
-                (version >> 32) as u32,
-                0,
-                0,
-                0,
-            ],
+            w: [artifact_id, version as u32, (version >> 32) as u32, 0, 0, 0],
         }
     }
 
@@ -385,10 +378,16 @@ impl<'s> BorrowJournal<'s> {
                 // observes the bit (Acquire) also sees the entry.
                 // SAFETY: `idx < capacity`; slot array has `capacity` entries.
                 unsafe { self.slots.add(idx).write(entry) };
-                match word.compare_exchange_weak(cur, cur | mask, Ordering::AcqRel, Ordering::Relaxed)
-                {
+                match word.compare_exchange_weak(
+                    cur,
+                    cur | mask,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => {
-                        self.header().hint.store((idx + 1) as u32, Ordering::Relaxed);
+                        self.header()
+                            .hint
+                            .store((idx + 1) as u32, Ordering::Relaxed);
                         return Ok(idx);
                     }
                     Err(_) => continue, // contended; re-read this word

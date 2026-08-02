@@ -104,8 +104,8 @@ pub fn write_batch_chunks<A: ChunkAllocator>(
     let packing = pack(&plan, cap)?;
     let chunk_count = packing.chunk_used.len();
 
-    let row_count = u32::try_from(plan.row_count)
-        .map_err(|_| Error::Unsupported("row count exceeds u32"))?;
+    let row_count =
+        u32::try_from(plan.row_count).map_err(|_| Error::Unsupported("row count exceeds u32"))?;
     let node_count = u32::try_from(plan.nodes.len())
         .map_err(|_| Error::Unsupported("node count exceeds u32"))?;
     let buffer_count = u32::try_from(plan.buffers.len())
@@ -122,7 +122,10 @@ pub fn write_batch_chunks<A: ChunkAllocator>(
                     for c in &chunks {
                         alloc.free(c);
                     }
-                    return Err(Error::ChunkTooSmall { need: used, have: desc.len as usize });
+                    return Err(Error::ChunkTooSmall {
+                        need: used,
+                        have: desc.len as usize,
+                    });
                 }
                 desc.schema_id = schema_id;
                 chunks.push(desc);
@@ -209,12 +212,17 @@ fn plan_batch(batch: &RecordBatch) -> Result<Plan> {
 
 /// Append one `ArrayData` node (and, recursively, its children) to the flattened
 /// pre-order plan. `data` must already be normalized (offset `0` at every depth).
-fn plan_node(data: &ArrayData, nodes: &mut Vec<NodeEntry>, buffers: &mut Vec<Buffer>) -> Result<()> {
+fn plan_node(
+    data: &ArrayData,
+    nodes: &mut Vec<NodeEntry>,
+    buffers: &mut Vec<Buffer>,
+) -> Result<()> {
     ensure_supported(data.data_type())?;
 
-    let len = u32::try_from(data.len()).map_err(|_| Error::Unsupported("array length exceeds u32"))?;
-    let null_count =
-        u32::try_from(data.null_count()).map_err(|_| Error::Unsupported("null count exceeds u32"))?;
+    let len =
+        u32::try_from(data.len()).map_err(|_| Error::Unsupported("array length exceeds u32"))?;
+    let null_count = u32::try_from(data.null_count())
+        .map_err(|_| Error::Unsupported("null count exceeds u32"))?;
     let has_validity = data.nulls().is_some();
     let data_buffers = data.buffers().len();
     let child_count = data.child_data().len();
@@ -251,7 +259,9 @@ fn ensure_supported(dt: &DataType) -> Result<()> {
         DataType::Dictionary(_, _) => Err(Error::Unsupported("dictionary type not supported")),
         DataType::Union(_, _) => Err(Error::Unsupported("union type not supported")),
         DataType::Map(_, _) => Err(Error::Unsupported("map type not supported")),
-        DataType::RunEndEncoded(_, _) => Err(Error::Unsupported("run-end-encoded type not supported")),
+        DataType::RunEndEncoded(_, _) => {
+            Err(Error::Unsupported("run-end-encoded type not supported"))
+        }
         _ => Ok(()),
     }
 }
@@ -285,7 +295,10 @@ fn is_normalized(data: &ArrayData) -> bool {
 fn pack(plan: &Plan, cap: usize) -> Result<Packing> {
     let start = payload_start(plan.nodes.len(), plan.buffers.len());
     if start > cap {
-        return Err(Error::ChunkTooSmall { need: start, have: cap });
+        return Err(Error::ChunkTooSmall {
+            need: start,
+            have: cap,
+        });
     }
 
     let mut locs = Vec::with_capacity(plan.buffers.len());

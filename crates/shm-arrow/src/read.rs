@@ -200,7 +200,9 @@ where
         arrays.push(make_array(data));
     }
     if ni != node_count || bi != buffer_count {
-        return Err(Error::Layout("node/buffer table not fully consumed by schema"));
+        return Err(Error::Layout(
+            "node/buffer table not fully consumed by schema",
+        ));
     }
 
     Ok(RecordBatch::try_new(schema, arrays)?)

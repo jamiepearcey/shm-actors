@@ -34,7 +34,10 @@ impl Fixture {
         // Clean any leftover from a crashed prior run, then create fresh.
         let _ = Segment::unlink_by_id(id);
         let segment = Segment::create(id, size).expect("create segment");
-        Fixture { id, segment: Arc::new(segment) }
+        Fixture {
+            id,
+            segment: Arc::new(segment),
+        }
     }
 }
 
@@ -55,7 +58,13 @@ fn sample_schema() -> SchemaRef {
 fn sample_batch(schema: &SchemaRef) -> RecordBatch {
     let i = Int64Array::from(vec![1, 2, 3, 4, 5]);
     let f = Float64Array::from(vec![Some(1.5), None, Some(3.5), Some(4.5), None]);
-    let s = StringArray::from(vec![Some("alpha"), Some("beta"), None, Some("delta"), Some("")]);
+    let s = StringArray::from(vec![
+        Some("alpha"),
+        Some("beta"),
+        None,
+        Some("delta"),
+        Some(""),
+    ]);
     RecordBatch::try_new(schema.clone(), vec![Arc::new(i), Arc::new(f), Arc::new(s)]).unwrap()
 }
 
@@ -111,7 +120,10 @@ fn read_buffers_point_inside_segment() {
         let data = col.to_data();
         if let Some(nulls) = data.nulls() {
             let p = nulls.buffer().as_ptr() as usize;
-            assert!((base..end).contains(&p), "validity buffer escaped the segment");
+            assert!(
+                (base..end).contains(&p),
+                "validity buffer escaped the segment"
+            );
             checked += 1;
         }
         for b in data.buffers() {
@@ -120,7 +132,10 @@ fn read_buffers_point_inside_segment() {
             checked += 1;
         }
     }
-    assert!(checked >= 4, "expected several in-segment buffers, saw {checked}");
+    assert!(
+        checked >= 4,
+        "expected several in-segment buffers, saw {checked}"
+    );
 }
 
 #[test]
@@ -145,7 +160,10 @@ fn stale_descriptor_is_rejected() {
     let pin = Arc::new(PinGuard::new(fx.segment.clone()));
     let err = read_batch(pin, ctrl, &desc, &registry).unwrap_err();
     assert!(
-        matches!(err, shm_arrow::Error::Core(shm_core::Error::StaleDescriptor)),
+        matches!(
+            err,
+            shm_arrow::Error::Core(shm_core::Error::StaleDescriptor)
+        ),
         "expected StaleDescriptor, got {err:?}"
     );
 }
@@ -194,7 +212,10 @@ fn unknown_schema_id_is_rejected() {
     let empty_registry = SchemaRegistry::new();
     let pin = Arc::new(PinGuard::new(fx.segment.clone()));
     let err = read_batch(pin, ctrl, &desc, &empty_registry).unwrap_err();
-    assert!(matches!(err, shm_arrow::Error::UnknownSchema(_)), "got {err:?}");
+    assert!(
+        matches!(err, shm_arrow::Error::UnknownSchema(_)),
+        "got {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +249,10 @@ fn assert_buffers_in_segment(batch: &RecordBatch, segment: &Segment) -> usize {
         let mut n = 0;
         if let Some(nulls) = data.nulls() {
             let p = nulls.buffer().as_ptr() as usize;
-            assert!((base..end).contains(&p), "validity buffer escaped the segment");
+            assert!(
+                (base..end).contains(&p),
+                "validity buffer escaped the segment"
+            );
             n += 1;
         }
         for b in data.buffers() {
@@ -243,7 +267,11 @@ fn assert_buffers_in_segment(batch: &RecordBatch, segment: &Segment) -> usize {
     }
     let base = segment.base_ptr() as usize;
     let end = base + segment.size();
-    batch.columns().iter().map(|c| walk(&c.to_data(), base, end)).sum()
+    batch
+        .columns()
+        .iter()
+        .map(|c| walk(&c.to_data(), base, end))
+        .sum()
 }
 
 #[test]
@@ -254,7 +282,12 @@ fn struct_column_round_trips_zero_copy() {
 
     // A Struct<{a: Int32, b: Utf8}> column, with a null in the struct.
     let a = Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(4)])) as ArrayRef;
-    let b = Arc::new(StringArray::from(vec![Some("x"), Some("yy"), Some("zzz"), None])) as ArrayRef;
+    let b = Arc::new(StringArray::from(vec![
+        Some("x"),
+        Some("yy"),
+        Some("zzz"),
+        None,
+    ])) as ArrayRef;
     let fields = Fields::from(vec![
         Field::new("a", DataType::Int32, true),
         Field::new("b", DataType::Utf8, true),
@@ -313,8 +346,8 @@ fn sliced_primitive_equals_logical_slice() {
     let full_s = StringArray::from(vec!["a", "bb", "ccc", "dddd", "e", "ff"]);
     let sliced_i = full_i.slice(2, 3); // [30, 40, 50]
     let sliced_s = full_s.slice(2, 3); // ["ccc","dddd","e"]
-    // The value buffer really is a sub-window (its data pointer is past the
-    // parent's start), proving the input is genuinely sliced.
+                                       // The value buffer really is a sub-window (its data pointer is past the
+                                       // parent's start), proving the input is genuinely sliced.
     assert_ne!(
         sliced_i.to_data().buffers()[0].as_ptr(),
         full_i.to_data().buffers()[0].as_ptr(),
@@ -375,7 +408,11 @@ fn batch_spanning_multiple_chunks_round_trips() {
     let registry = SchemaRegistry::with_schemas(std::slice::from_ref(&schema));
 
     let (out, descs) = stage_and_read(&pool, &alloc, &registry, &fx.segment, &batch);
-    assert!(descs.len() >= 2, "batch must span >= 2 chunks, spanned {}", descs.len());
+    assert!(
+        descs.len() >= 2,
+        "batch must span >= 2 chunks, spanned {}",
+        descs.len()
+    );
     assert_eq!(&out, &batch, "multi-chunk batch must round-trip exactly");
     // Every buffer reachable and inside the mapping (buffers land in >1 chunk).
     let checked = assert_buffers_in_segment(&out, &fx.segment);
@@ -406,13 +443,12 @@ fn nested_sliced_combined_round_trips() {
     let registry = SchemaRegistry::with_schemas(std::slice::from_ref(&schema));
 
     let (out, _descs) = stage_and_read(&pool, &alloc, &registry, &fx.segment, &batch);
-    assert_eq!(&out, &batch, "sliced nested column round-trips to its logical slice");
+    assert_eq!(
+        &out, &batch,
+        "sliced nested column round-trips to its logical slice"
+    );
     // The reconstructed list holds exactly the middle 3 lists: [[3,4],[5,6],[7]].
-    let got = out
-        .column(0)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .unwrap();
+    let got = out.column(0).as_any().downcast_ref::<ListArray>().unwrap();
     assert_eq!(got.len(), 3);
 }
 
@@ -429,12 +465,13 @@ fn corrupt_node_buffer_count_is_rejected_not_paniced() {
     let alloc = PoolAllocator::new(&pool, &fx.segment);
 
     // Single non-nullable Int64 column: node_count = 1, buffer_count = 1.
-    let schema: SchemaRef =
-        Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
     let registry = SchemaRegistry::with_schemas(std::slice::from_ref(&schema));
-    let batch =
-        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))])
-            .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+    )
+    .unwrap();
 
     let desc = write_batch(&alloc, &registry, &batch).unwrap();
     let ctrl = pool.ctrl(&desc).unwrap();

@@ -265,8 +265,14 @@ impl<'s> Pool<'s> {
                 // Build the intrusive free-list link chain for this class.
                 let data = base.add(layout.data_offsets[i]);
                 for local in 0..c.chunk_count {
-                    let link = data.add(local as usize * c.chunk_size as usize).cast::<u32>();
-                    let next = if local + 1 < c.chunk_count { local + 1 } else { EMPTY };
+                    let link = data
+                        .add(local as usize * c.chunk_size as usize)
+                        .cast::<u32>();
+                    let next = if local + 1 < c.chunk_count {
+                        local + 1
+                    } else {
+                        EMPTY
+                    };
                     link.write(next);
                 }
                 let head_slot = if c.chunk_count > 0 { 0 } else { EMPTY };
@@ -384,7 +390,9 @@ impl<'s> Pool<'s> {
     pub fn alloc(&self, size: u32) -> Result<ChunkDesc> {
         let class_idx = (0..self.num_classes)
             .find(|&i| self.class(i).chunk_size >= size)
-            .ok_or(Error::LayoutOverflow("allocation exceeds largest size class"))?;
+            .ok_or(Error::LayoutOverflow(
+                "allocation exceeds largest size class",
+            ))?;
         let class = self.class(class_idx);
 
         // Treiber pop (the ABA-safe CAS loop lives in `treiber_pop`; the closure
@@ -401,7 +409,8 @@ impl<'s> Pool<'s> {
         let global = class.base_index as usize + local as usize;
         // SAFETY: `global < total_chunks`.
         let generation = unsafe { (*self.ctrls.add(global)).generation() };
-        let seg_offset = HEADER_SIZE + class.data_offset as usize + local as usize * class.chunk_size as usize;
+        let seg_offset =
+            HEADER_SIZE + class.data_offset as usize + local as usize * class.chunk_size as usize;
 
         Ok(ChunkDesc {
             segment_id: self.segment.id(),

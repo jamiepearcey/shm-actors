@@ -217,7 +217,11 @@ pub fn doorbell_ring(fd: RawFd) -> Result<()> {
 /// caller must always re-check the ring after this returns — a wake is only a
 /// hint.
 pub fn doorbell_park(fd: RawFd, timeout: Duration) -> Result<bool> {
-    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
     let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
     // SAFETY: `pfd` is a single valid `pollfd`; `poll` reads/writes just it.
     let n = unsafe { libc::poll(&mut pfd, 1, ms) };

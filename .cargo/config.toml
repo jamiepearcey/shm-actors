@@ -1,0 +1,36 @@
+# Alternative registry for shm-actors crates.
+#
+# Cargo discovers config by walking up from the current directory, and the
+# kellnr definition previously lived only in `projects/ETL/.cargo/config.toml`.
+# This repo sits under `projects/infrastructure/`, so it never saw that file —
+# hence `error: registry index was not found in any configuration: kellnr`.
+# The definition belongs next to the crates that publish to it.
+#
+# Credentials do NOT belong here — this file is committed. `cargo login` writes
+# the token to ~/.cargo/credentials.toml instead:
+#
+#     cargo login --registry kellnr
+#
+# (run it with no token argument so the value is read from stdin and never
+# reaches your shell history or the process list)
+#
+# Publish order matters: `shm-arrow` depends on `shm-core`, and a registry will
+# not accept a crate whose dependency it does not yet have.
+#
+#     cargo publish -p shm-core  --registry kellnr
+#     cargo publish -p shm-arrow --registry kellnr
+#
+# Note: a crate published here that depends on another crate from this registry
+# must mark that dependency `registry = "kellnr"`. crates.io rejects any package
+# with a dependency from an alternative registry, so a given crate can target
+# one or the other, not both.
+[registries.kellnr]
+index = "sparse+https://kellnr-cz28p4jk7vyc7eaeghhjmbp8.deepintrospect.com/api/v1/crates/"
+
+# This Kellnr runs with KELLNR_REGISTRY__AUTH_REQUIRED=true, so the *index*
+# needs a token to read, not just to publish. Without a credential provider
+# cargo refuses with "authenticated registries require a credential-provider to
+# be configured". `cargo:token` is the built-in provider that reads
+# ~/.cargo/credentials.toml, which is where `cargo login` writes.
+[registry]
+global-credential-providers = ["cargo:token"]
