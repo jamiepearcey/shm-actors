@@ -1008,14 +1008,14 @@ impl TaskQueueHandle {
 
     /// Non-blocking claim with a fresh lease `lease_nanos` into the future (its
     /// deadline is stamped on the claim), or `None` if the queue is empty.
-    pub fn claim(&self, lease_nanos: u64) -> Option<ClaimedTask> {
+    pub fn claim(&self, lease_nanos: u64) -> Option<ClaimedTask<'_>> {
         self.queue
             .claim_with_lease(self.worker_id, now_nanos().wrapping_add(lease_nanos))
     }
 
     /// Claim a task, parking on the work doorbell while none is queued, stamping
     /// a fresh `lease_nanos` lease on the successful claim.
-    pub fn claim_blocking(&self, lease_nanos: u64) -> Result<ClaimedTask> {
+    pub fn claim_blocking(&self, lease_nanos: u64) -> Result<ClaimedTask<'_>> {
         let parker = DoorbellParker::new(self.work_read.try_clone()?);
         Ok(self
             .queue

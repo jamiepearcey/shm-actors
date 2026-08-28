@@ -26,6 +26,15 @@
 //! table stays truth). The slot format is an ABI break, so [`JOURNAL_MAGIC`] is
 //! bumped `SHMJRNL1` → `SHMJRNL2`; the fixed-slot bitmap design and
 //! [`DEFAULT_CAPACITY`] are preserved.
+//!
+//! ## Incarnations (ADR-0008 P0.1)
+//!
+//! Both artifact tags additionally carry the **incarnation** of the head region
+//! the borrow was taken against, claimed out of the payload's reserved words
+//! (`SHMJRNL2` → `SHMJRNL3`). Once the keyed store can reclaim and re-create a
+//! catalog slot, `artifact_id` alone names a *slot*, not an occupant — so
+//! replaying a record from a previous occupant would release a borrow belonging
+//! to the current one. The incarnation is what lets replay tell them apart.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -33,12 +42,13 @@ use crate::desc::ChunkDesc;
 use crate::error::{Error, Result};
 use crate::segment::Segment;
 
-/// Magic for a journal header: little-endian `b"SHMJRNL2"`.
+/// Magic for a journal header: little-endian `b"SHMJRNL3"`.
 ///
-/// Bumped from `SHMJRNL1` for the v0.3 tagged-slot format (ADR-0003 item J): a
-/// slot is now a [`JournalEntry`] (`kind` tag + 24-byte payload), not a bare
-/// [`ChunkDesc`], so a v0.2 journal is rejected by the magic check.
-pub const JOURNAL_MAGIC: u64 = u64::from_le_bytes(*b"SHMJRNL2");
+/// Bumped from `SHMJRNL2` for the ADR-0008 P0.1 payload change: both artifact
+/// tags now carry an `incarnation`. (`SHMJRNL2` in turn replaced `SHMJRNL1` at
+/// v0.3 / ADR-0003 item J, when a slot became a [`JournalEntry`] — `kind` tag
+/// plus 24-byte payload — rather than a bare [`ChunkDesc`].)
+pub const JOURNAL_MAGIC: u64 = u64::from_le_bytes(*b"SHMJRNL3");
 
 /// Default journal capacity (pins) when unspecified.
 pub const DEFAULT_CAPACITY: usize = 1024;
@@ -48,10 +58,11 @@ pub const DEFAULT_CAPACITY: usize = 1024;
 pub const ENTRY_EMPTY: u32 = 0;
 /// Entry-kind tag: a chunk pin, payload = a [`ChunkDesc`] (v0.2 semantics).
 pub const ENTRY_CHUNK_PIN: u32 = 1;
-/// Entry-kind tag: an artifact version pin, payload = `{artifact_id, version}`.
+/// Entry-kind tag: an artifact version pin, payload =
+/// `{artifact_id, incarnation, version}`.
 pub const ENTRY_ARTIFACT_PIN: u32 = 2;
 /// Entry-kind tag: an exclusive artifact **write lease** (ADR-0003 item K),
-/// payload = `{artifact_id, fence}`. A leaked one (a `kill -9`ed exclusive
+/// payload = `{artifact_id, incarnation, fence}`. A leaked one (a `kill -9`ed exclusive
 /// writer) is crash-reclaimed by the coordinator force-releasing the artifact's
 /// fenced write lease.
 pub const ENTRY_WRITE_LEASE: u32 = 3;
@@ -69,14 +80,18 @@ pub const ENTRY_WRITE_LEASE: u32 = 3;
 /// - **`ENTRY_CHUNK_PIN`**: `w` is a [`ChunkDesc`]'s six `u32` fields in ABI
 ///   order (`segment_id, generation, offset, len, schema_id, _pad`).
 /// - **`ENTRY_ARTIFACT_PIN`**: `w[0]` = `artifact_id`; `w[1..3]` = the `u64`
-///   `version` as little-endian `(lo, hi)`; `w[3..6]` = zero.
+///   `version` as little-endian `(lo, hi)`; `w[3]` = `incarnation`; `w[4..6]` = zero.
 /// - **`ENTRY_WRITE_LEASE`**: `w[0]` = `artifact_id`; `w[1]` = the lease `fence`
-///   the writer acquired under; `w[2..6]` = zero.
+///   the writer acquired under; `w[2]` = `incarnation`; `w[3..6]` = zero.
 ///
-/// Adding [`ENTRY_WRITE_LEASE`] is a new **tag value** within the existing
-/// tagged-slot layout, not a new layout — so it does **not** bump
-/// [`JOURNAL_MAGIC`] (a reader that predates the tag simply skips it via
-/// [`to_record`](JournalEntry::to_record)).
+/// ADR-0008 P0.1 claimed the reserved words for `incarnation` on both artifact
+/// tags, which **is** a payload-layout change and so does bump
+/// [`JOURNAL_MAGIC`].
+///
+/// Adding a new **tag value** within this layout (as [`ENTRY_WRITE_LEASE`] was)
+/// does not bump the magic — a reader predating the tag simply skips it via
+/// [`to_record`](JournalEntry::to_record). Reinterpreting an existing tag's
+/// payload words, as P0.1 did, does.
 ///
 /// The payload is read/written as `u32` words, so no field ever needs `u64`
 /// alignment inside the slot.
@@ -119,23 +134,31 @@ impl JournalEntry {
         }
     }
 
-    /// Build an artifact-version-pin entry for `{artifact_id, version}`.
+    /// Build an artifact-version-pin entry for `{artifact_id, incarnation, version}`.
     #[inline]
-    pub fn artifact_pin(artifact_id: u32, version: u64) -> JournalEntry {
+    pub fn artifact_pin(artifact_id: u32, incarnation: u32, version: u64) -> JournalEntry {
         JournalEntry {
             kind: ENTRY_ARTIFACT_PIN,
             _pad: 0,
-            w: [artifact_id, version as u32, (version >> 32) as u32, 0, 0, 0],
+            w: [
+                artifact_id,
+                version as u32,
+                (version >> 32) as u32,
+                incarnation,
+                0,
+                0,
+            ],
         }
     }
 
-    /// Build an exclusive write-lease entry for `{artifact_id, fence}` (item K).
+    /// Build an exclusive write-lease entry for `{artifact_id, incarnation, fence}`
+    /// (item K).
     #[inline]
-    pub fn write_lease(artifact_id: u32, fence: u32) -> JournalEntry {
+    pub fn write_lease(artifact_id: u32, incarnation: u32, fence: u32) -> JournalEntry {
         JournalEntry {
             kind: ENTRY_WRITE_LEASE,
             _pad: 0,
-            w: [artifact_id, fence, 0, 0, 0, 0],
+            w: [artifact_id, fence, incarnation, 0, 0, 0],
         }
     }
 
@@ -154,10 +177,12 @@ impl JournalEntry {
             })),
             ENTRY_ARTIFACT_PIN => Some(JournalRecord::ArtifactPin {
                 artifact_id: self.w[0],
+                incarnation: self.w[3],
                 version: u64::from(self.w[1]) | (u64::from(self.w[2]) << 32),
             }),
             ENTRY_WRITE_LEASE => Some(JournalRecord::WriteLease {
                 artifact_id: self.w[0],
+                incarnation: self.w[2],
                 fence: self.w[1],
             }),
             _ => None,
@@ -183,6 +208,12 @@ pub enum JournalRecord {
     ArtifactPin {
         /// The interned artifact name id the pin was taken against.
         artifact_id: u32,
+        /// Which **occupant** of that id's head region the pin was taken
+        /// against (ADR-0008 P0.1). A keyed-store slot can be reclaimed and
+        /// re-created between a crash and its replay; routing a record whose
+        /// incarnation no longer matches would decrement the *next* occupant's
+        /// pin count, so replay drops it instead.
+        incarnation: u32,
         /// The artifact version the pin froze.
         version: u64,
     },
@@ -193,6 +224,9 @@ pub enum JournalRecord {
     WriteLease {
         /// The interned artifact name id whose write lease is held.
         artifact_id: u32,
+        /// Which occupant of that id's head region the lease was taken against
+        /// — see [`ArtifactPin`](JournalRecord::ArtifactPin).
+        incarnation: u32,
         /// The fence generation the writer acquired the lease under.
         fence: u32,
     },
@@ -343,16 +377,26 @@ impl<'s> BorrowJournal<'s> {
     /// reclaimed by the coordinator decrementing the artifact's per-version pin
     /// count. Convenience over [`record_entry`](Self::record_entry) with
     /// [`JournalEntry::artifact_pin`].
-    pub fn record_artifact_pin(&self, artifact_id: u32, version: u64) -> Result<usize> {
-        self.record_entry(JournalEntry::artifact_pin(artifact_id, version))
+    pub fn record_artifact_pin(
+        &self,
+        artifact_id: u32,
+        incarnation: u32,
+        version: u64,
+    ) -> Result<usize> {
+        self.record_entry(JournalEntry::artifact_pin(artifact_id, incarnation, version))
     }
 
     /// Record an exclusive **write lease** (item K): a leaked one is crash-
     /// reclaimed by the coordinator force-releasing the artifact's fenced write
     /// lease. Convenience over [`record_entry`](Self::record_entry) with
     /// [`JournalEntry::write_lease`].
-    pub fn record_write_lease(&self, artifact_id: u32, fence: u32) -> Result<usize> {
-        self.record_entry(JournalEntry::write_lease(artifact_id, fence))
+    pub fn record_write_lease(
+        &self,
+        artifact_id: u32,
+        incarnation: u32,
+        fence: u32,
+    ) -> Result<usize> {
+        self.record_entry(JournalEntry::write_lease(artifact_id, incarnation, fence))
     }
 
     /// Record a tagged `entry` into a free slot and mark it occupied.

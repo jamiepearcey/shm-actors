@@ -41,10 +41,14 @@ pub mod store;
 pub mod typed_ref;
 
 pub use catalog::{
-    Catalog, CatalogSlot, RefKind, CATALOG_MAGIC, SLOT_FREE, SLOT_LIVE, SLOT_TOMBSTONE,
+    Catalog, CatalogSlot, RefKind, CATALOG_MAGIC, FIRST_GEN, FREE_NIL, SLOT_FREE, SLOT_LIVE,
+    SLOT_RECLAIMING, SLOT_TOMBSTONE,
 };
 pub use error::{Error, Result};
-pub use store::{Entry, KeyResolver, KeyedStore, MAX_KEY_LEN};
+pub use store::{
+    release_task_binding, sweep_tombstones, Entry, KeyResolver, KeyedStore, RetainedRef,
+    MAX_KEY_LEN,
+};
 pub use typed_ref::{
     read_typed_ref, resolve_path, write_typed_ref, ResolvePath, TypedRef, TYPED_REF_ABI_VERSION,
     TYPED_REF_MAGIC, TYPED_REF_SIZE,

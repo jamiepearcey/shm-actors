@@ -6,7 +6,9 @@
 //! which assumes only the POSIX baseline: `shm_open` + `ftruncate` + `mmap`, a
 //! one-byte UDS write/read doorbell, and lease-based death detection.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(not(target_os = "linux"))]
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{OwnedFd, RawFd};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -48,6 +50,27 @@ pub trait Platform {
 
     /// The death-detection policy this platform provides.
     fn death_detection(&self) -> DeathDetection;
+
+    /// Create a segment hardened against resizing by fd holders, when the
+    /// platform can (Linux: an anonymous sealed `memfd`, ADR-0011). The POSIX
+    /// default is a plain named [`segment_create`](Self::segment_create) — per
+    /// ADR-0004's item-H ruling, every new `Platform` method carries a
+    /// POSIX-fallback default so correctness never depends on a fast path.
+    fn segment_create_sealed(&self, id: u32, size: usize) -> Result<Segment> {
+        self.segment_create(id, size)
+    }
+
+    /// The platform's deadline clock, in nanoseconds. Values are only ever
+    /// compared against each other (lease/deadline arithmetic), so the epoch is
+    /// platform-defined: the POSIX default is the Unix wall clock; Linux uses
+    /// `CLOCK_MONOTONIC` (ADR-0011), immune to wall-clock steps.
+    fn now_nanos(&self) -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
 }
 
 /// The v0.1 POSIX-baseline platform.
@@ -114,8 +137,9 @@ impl Platform for PosixPlatform {
 // state and change no existing signature; the v0.1 single-reader
 // `doorbell_signal`/`doorbell_wait` methods above are left untouched.
 //
-// The primitive is a per-ring anonymous **pipe**. The write-end is handed to
-// publishers; the read-end to subscribers. A publish writes one byte; parked
+// The primitive is a per-ring anonymous **pipe** (on Linux, an **eventfd** —
+// ADR-0011 — with identical level-triggered semantics). The write-end is handed
+// to publishers; the read-end to subscribers. A publish writes one byte; parked
 // subscribers block in level-triggered `poll(2)` on the read-end, so a single
 // byte wakes *every* subscriber already blocked in `poll` on that fd (the
 // kernel wakes the fd's whole poll wait-queue — a true broadcast). On wake each
@@ -141,15 +165,29 @@ pub struct DoorbellPair {
     pub write: OwnedFd,
 }
 
-/// Create a fresh doorbell pipe with both ends set non-blocking + close-on-exec.
+/// Create a fresh doorbell with both ends set non-blocking + close-on-exec.
+///
+/// POSIX backend: an anonymous `pipe(2)` (+ `fcntl(2)`; no `pipe2`, which macOS
+/// lacks). Linux backend (ADR-0011): a single **eventfd** whose two "ends" are
+/// dups of one object — cheaper than a pipe (a counter, no byte queue) with
+/// identical level-triggered broadcast-wake semantics, and because both ends
+/// are the same object the `SCM_RIGHTS` granting protocol is unchanged.
 ///
 /// Non-blocking is required on the read-end so [`doorbell_park`] can drain to
 /// `EAGAIN`, and desirable on the write-end so [`doorbell_ring`] never blocks a
-/// wait-free publish when the pipe is full. Close-on-exec keeps the ends from
-/// leaking into unrelated child processes (they are distributed explicitly via
-/// `SCM_RIGHTS`, not inherited across `exec`). Portable across macOS and Linux
-/// (`pipe(2)` + `fcntl(2)`; no `pipe2`, which macOS lacks).
+/// wait-free publish when the doorbell is full/saturated. Close-on-exec keeps
+/// the ends from leaking into unrelated child processes (they are distributed
+/// explicitly via `SCM_RIGHTS`, not inherited across `exec`).
 pub fn doorbell_pair() -> Result<DoorbellPair> {
+    #[cfg(target_os = "linux")]
+    return crate::platform_linux::eventfd_doorbell_pair();
+    #[cfg(not(target_os = "linux"))]
+    doorbell_pair_pipe()
+}
+
+/// The POSIX pipe backend of [`doorbell_pair`].
+#[cfg(not(target_os = "linux"))]
+fn doorbell_pair_pipe() -> Result<DoorbellPair> {
     let mut fds = [0 as RawFd; 2];
     // SAFETY: `fds` is a valid writable 2-element array; `pipe` fills both slots.
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
@@ -166,6 +204,7 @@ pub fn doorbell_pair() -> Result<DoorbellPair> {
 }
 
 /// Set `O_NONBLOCK` and `FD_CLOEXEC` on `fd`.
+#[cfg(not(target_os = "linux"))]
 fn set_nonblock_cloexec(fd: RawFd) -> Result<()> {
     // SAFETY: `fd` is a live owned descriptor; these `fcntl` calls only read and
     // rewrite its status/descriptor flags.
@@ -182,14 +221,23 @@ fn set_nonblock_cloexec(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-/// Ring a doorbell: write one byte to a doorbell write-end.
+/// Ring a doorbell write-end (POSIX: one pipe byte; Linux: an eventfd +1).
 ///
-/// Non-blocking and idempotent for wakeup purposes: a full pipe (`EAGAIN`)
-/// already carries a pending byte, so the wakeup is guaranteed regardless; a
-/// hung-up reader (`EPIPE`) means no subscriber is listening, so none needs
-/// waking. Both are treated as success so a wait-free publish never fails on
-/// the doorbell.
+/// Non-blocking and idempotent for wakeup purposes: a full pipe / saturated
+/// eventfd counter (`EAGAIN`) is already readable, so the wakeup is guaranteed
+/// regardless; a hung-up pipe reader (`EPIPE`) means no subscriber is
+/// listening, so none needs waking. Both are treated as success so a wait-free
+/// publish never fails on the doorbell.
 pub fn doorbell_ring(fd: RawFd) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return crate::platform_linux::eventfd_ring(fd);
+    #[cfg(not(target_os = "linux"))]
+    doorbell_ring_pipe(fd)
+}
+
+/// The POSIX pipe backend of [`doorbell_ring`].
+#[cfg(not(target_os = "linux"))]
+fn doorbell_ring_pipe(fd: RawFd) -> Result<()> {
     let byte = [1u8; 1];
     loop {
         // SAFETY: writing one byte from a valid buffer to a live owned fd.

@@ -48,6 +48,17 @@ pub struct RuntimeConfig {
     /// [`shm_task::TaskQueue::reap`]).
     pub task_max_retries: u32,
 
+    /// **P0.3 (ADR-0010, G12).** Grace period the coordinator's binding reap
+    /// ([`shm_task::TaskQueue::reap_bindings`]) adds to a task's submit
+    /// deadline before force-releasing the task's retained-ref bindings when
+    /// the requester never acked. This bounds how long a terminal task's
+    /// retained input/output stays readable without an ack — ArrowRef's
+    /// retention/TTL semantics surfacing in the substrate. A multiple of
+    /// [`lease_deadline`](Self::lease_deadline) by default (4×), so a
+    /// requester always outlives at least a few heartbeat leases' worth of
+    /// ack window.
+    pub task_binding_grace: Duration,
+
     /// Pool geometry carved into each artifact's data segment (backs data +
     /// manifest chunks).
     pub artifact_pool: PoolConfig,
@@ -104,6 +115,9 @@ impl Default for RuntimeConfig {
             monitor_tick: Duration::from_millis(40),
             task_capacity: 256,
             task_max_retries: shm_task::DEFAULT_MAX_RETRIES,
+            // 4 × lease_deadline: a dead requester is declared dead well before
+            // its unacked bindings are reaped.
+            task_binding_grace: Duration::from_millis(2000),
             // Small classes (256 B..8 KiB) hold the cache-loop demo batch + its
             // manifest chunk comfortably and fit the 1 MiB data segment.
             artifact_pool: PoolConfig::power_of_two(256, 8192, 8),

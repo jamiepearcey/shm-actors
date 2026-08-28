@@ -159,6 +159,13 @@ spike had to demonstrate clear-on-ack on the *input* chunk, not the output. →
 v0.5 item: **auto-tie input/output chunk leases to the task slot** (release on
 terminal/ack, journal for crash reclamation) + an **evict-current / drop-to-empty**
 artifact op. *Maps to "lifecycle/TTL/clear-on-ack groups".*
+*Resolved by ADR-0010 (Holon P0.3): `evict_current` = an empty Replace commit
+(the output-side clear-on-ack the spike could not demonstrate now is — see the
+spike's `output_cleared_on_ack`); task-lifecycle-tied retained-ref bindings live
+in a lease side table in the task-queue segment (`SHMTASK3`), released
+exactly-once at requester ack or by the coordinator's reap backstop; and
+`evict_all` force-releases the entry's write lease so a hold dies with the
+entry/task, never with the actor.*
 
 ### G6 — item S: `O(capacity)` claim scan + head-of-array contention — **MEDIUM**
 `submit` scans `0..capacity` for a reusable slot (`queue.rs` l.496; spread by
@@ -169,6 +176,8 @@ queue is `O(1)` MPMC. **Evidence:** code-read; the spike (capacity 8, one worker
 did not stress it. → v0.5 item **S**: a real MPMC index / per-worker claim start
 offset (cheap first step: spread the claim cursor like `enqueue_head`) / free-slot
 free-list. Only bites at high fan-out.
+*Resolved by ADR-0009 (Holon P0.2): FREE/READY Treiber index stacks make claim and
+submit O(1) (amortized) and dissolve the low-slot CAS pileup; `SHMTASK2`.*
 
 ### G5 — item R: Append commit is `O(prior chunk count)` — **MEDIUM, but avoidable here**
 Confirmed in `artifact.rs::commit_staged_inner` (l.447–479): an `Append` commit

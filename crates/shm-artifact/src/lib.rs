@@ -11,9 +11,11 @@
 //! - [`ArtifactHead`] — the atomic RCU control block (`current` version +
 //!   `manifest_desc` + a fixed pin table), placed by hand at the base of a
 //!   management segment. See [`head`] for its frozen ABI.
-//! - [`VersionManifest`] — an immutable on-chunk record listing a version's data
-//!   chunk(s); itself a chunk, referenced by a [`ChunkDesc`](shm_core::ChunkDesc)
-//!   and pointed at by a [`PackedRef`](shm_core::PackedRef). See [`manifest`].
+//! - [`VersionManifest`] — an immutable on-chunk record listing the data
+//!   chunk(s) a version **added** plus a link to its predecessor's manifest
+//!   (ADR-0013 chained manifests); itself a chunk, referenced by a
+//!   [`ChunkDesc`](shm_core::ChunkDesc) and pointed at by a
+//!   [`PackedRef`](shm_core::PackedRef). See [`manifest`].
 //! - [`Artifact`] — the handle: [`create`](Artifact::create) /
 //!   [`attach`](Artifact::attach), [`pin`](Artifact::pin) (read),
 //!   [`open_exclusive`](Artifact::open_exclusive) +
@@ -30,22 +32,29 @@
 //! # RCU / MVCC protocol
 //!
 //! - **Commit** stages new data + a new manifest chunk (loaned, written once,
-//!   published), reference-counts any shared chunks into the new version, then
-//!   installs with one `SeqCst` CAS of `current` (`n → n+1`) followed by a
-//!   `Release` store of `manifest_desc`. Nothing already published is mutated, so
-//!   a torn version is impossible; readers additionally validate
-//!   `manifest.version` so the two-word head update is never observed torn.
-//! - **Commit kinds**: [`Commit::Replace`] (supersede wholesale),
-//!   [`Commit::Append`] (share the predecessor's chunks + new data),
-//!   [`Commit::Patch`] (deferred to v0.2 — [`Error::Unsupported`]).
+//!   published) listing only the new data, takes one reference on the
+//!   predecessor's manifest for an `Append` link, then installs with one
+//!   `SeqCst` CAS of `current` (`n → n+1`) followed by a `Release` store of
+//!   `manifest_desc`. Nothing already published is mutated, so a torn version
+//!   is impossible; readers additionally validate `manifest.version` so the
+//!   two-word head update is never observed torn.
+//! - **Commit kinds**: [`Commit::Replace`] (supersede wholesale — a chain
+//!   root), [`Commit::Append`] (link to the predecessor's manifest + new data —
+//!   O(new data) commit and pin, ADR-0013), [`Commit::Patch`] (deferred to
+//!   v0.2 — [`Error::Unsupported`]).
 //! - **Multi-writer**: exclusive mode takes a lease (second writer →
 //!   [`Error::WriteLocked`]); optimistic mode races on the install CAS (loser →
 //!   [`Error::Conflict`]).
-//! - **Reclamation**: a version's chunks are released only when its pin count is
-//!   `0` **and** it is not `current`. Chunk `refcount`s count *referencing
-//!   versions*, so an Append-shared chunk survives until the last referencing
-//!   version is reclaimed. See [`artifact`]'s `try_retire_version` for the exact
-//!   rule.
+//! - **Reclamation**: a version owns one reference — its manifest chunk — and
+//!   releases it only when its pin count is `0` **and** it is not `current`. A
+//!   manifest owns one reference on each data chunk it lists and one on its
+//!   predecessor manifest; whoever releases a manifest's last reference
+//!   cascades through those. See [`artifact`]'s `try_retire_version` for the
+//!   exact rule.
+//! - **Read**: [`VersionPin::as_arrow_batches`] is zero-copy, one
+//!   [`RecordBatch`](arrow_array::RecordBatch) per batch across the chain;
+//!   [`VersionPin::as_arrow`] concatenates (copies) when a version holds more
+//!   than one batch.
 //!
 //! # Scope (v0.1)
 //!
@@ -68,8 +77,10 @@ pub mod manifest;
 pub use artifact::{Artifact, Commit, Committer, VersionPin};
 pub use error::{Error, Result};
 pub use event::{CommitKind, VersionEvent, ARTIFACTS_TOPIC, EVENT_MAGIC};
-pub use head::{ArtifactHead, PinSlot, MAX_LIVE_VERSIONS};
+pub use head::{
+    ArtifactHead, PinSlot, FIRST_INCARNATION, MAX_LIVE_VERSIONS, NO_INCARNATION,
+};
 pub use manifest::{
-    manifest_len, parse_manifest_bytes, read_manifest, read_manifest_checked, write_manifest,
-    Manifest, VersionManifest, MANIFEST_MAGIC,
+    manifest_len, parse_manifest_bytes, read_manifest, read_manifest_checked, walk_chain_with,
+    write_manifest, Manifest, ManifestLink, VersionManifest, MANIFEST_MAGIC,
 };

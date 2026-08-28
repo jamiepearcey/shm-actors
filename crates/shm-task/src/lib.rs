@@ -36,20 +36,33 @@ pub mod queue;
 
 pub use error::{Error, Result};
 pub use queue::{
-    required_bytes, slots_offset, ClaimedTask, Outcome, ReapReport, TaskHandle, TaskQueue,
-    TaskQueueHeader, TaskSlot, TaskStatus, CANCELLED, CLAIMED, DEFAULT_MAX_RETRIES, DONE, EMPTY,
-    FAILED, QUEUED, TASK_MAGIC,
+    lease_capacity, lease_table_offset, required_bytes, slots_offset, ClaimedTask, LeaseBinding,
+    LeaseSlot, Outcome, ReapReport, TaskHandle, TaskQueue, TaskQueueHeader, TaskSlot, TaskStatus,
+    CANCELLED, CLAIMED, DEFAULT_MAX_RETRIES, DONE, EMPTY, FAILED, LEASE_ARMED, LEASE_NONE,
+    LEASE_RELEASED, QUEUED, TASK_MAGIC,
 };
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Current wall-clock time in nanoseconds since the Unix epoch.
+/// The queue's deadline clock, in nanoseconds.
 ///
 /// A convenience for building submit `deadline_nanos` and the `now` passed to
-/// [`TaskQueue::reap`]; both must share one clock domain, and this provides a
-/// single process-agnostic one. (A v0.3 Linux fast path may switch to
-/// `CLOCK_MONOTONIC`; the deadline contract is unchanged.)
+/// [`TaskQueue::reap`]; both must share **one clock domain**, and this provides
+/// the single process-agnostic one. On Linux this is `CLOCK_MONOTONIC`
+/// (ADR-0011): system-wide consistent across every process on one boot — and a
+/// queue's participants always share one host (it is shared memory) and one
+/// build, hence one clock — so an NTP wall-clock step can no longer spuriously
+/// reap (or immortalize) a claim lease. Elsewhere it remains the Unix wall
+/// clock. Deadlines are only ever compared against each other, never
+/// interpreted as dates, so the differing epoch is invisible to the contract.
+#[cfg(target_os = "linux")]
 pub fn now_nanos() -> u64 {
+    shm_core::monotonic_now_nanos()
+}
+
+/// The queue's deadline clock, in nanoseconds (POSIX baseline: the Unix wall
+/// clock; see the Linux variant's doc for the clock-domain contract).
+#[cfg(not(target_os = "linux"))]
+pub fn now_nanos() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)

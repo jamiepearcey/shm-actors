@@ -334,6 +334,18 @@ impl Ring {
         ReadOutcome::Sample(desc)
     }
 
+    /// The ring's ABI-reserved futex doorbell word ([`RingHeader::doorbell_seq`],
+    /// reserved by ADR-0003, activated by ADR-0011's Linux fast paths).
+    ///
+    /// A [`FutexNotifier`](crate::hooks) bumps it and futex-wakes; a
+    /// [`FutexParker`](crate::hooks) futex-waits on it. The accessor is
+    /// available on every platform (the word is plain shared memory); only the
+    /// futex hooks that operate on it are Linux-gated. The returned reference
+    /// borrows the mapped header, so it lives as long as this handle.
+    pub fn doorbell_word(&self) -> &AtomicU32 {
+        &self.header().doorbell_seq
+    }
+
     /// Register interest as a parked subscriber (increment `waiters`).
     pub(crate) fn add_waiter(&self) {
         self.header().waiters.fetch_add(1, Ordering::AcqRel);

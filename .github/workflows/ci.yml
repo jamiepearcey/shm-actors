@@ -79,7 +79,7 @@ jobs:
       # soak locally; it is intentionally NOT lengthened in CI to keep the gate fast.
       - name: Test (per crate)
         run: |
-          for c in shm-core shm-arrow shm-ring shm-task shm-artifact shm-stream shm-runtime; do
+          for c in shm-core shm-arrow shm-ring shm-task shm-artifact shm-stream shm-store shm-runtime; do
             echo "::group::test $c"
             cargo test -p "$c"
             echo "::endgroup::"
@@ -168,6 +168,8 @@ jobs:
         run: cargo test -p shm-artifact --test loom_pin -- --nocapture
       - name: loom — RCU install vs. read (shm-artifact, core 4)
         run: cargo test -p shm-artifact --test loom_rcu -- --nocapture
+      - name: loom — recycle handshake (shm-artifact, ADR-0008 P0.1)
+        run: cargo test -p shm-artifact --test loom_reclaim -- --nocapture
       - name: loom — task-claim CAS (shm-task, core 3)
         run: cargo test -p shm-task --test loom_task -- --nocapture
 

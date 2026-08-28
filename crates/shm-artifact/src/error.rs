@@ -39,6 +39,16 @@ pub enum Error {
         actual: u64,
     },
 
+    /// The handle's occupant of the head region is no longer the one in service:
+    /// the keyed store reclaimed the slot and (possibly) re-created a different
+    /// entry in it, so this handle names something that no longer exists
+    /// (ADR-0008 P0.1).
+    ///
+    /// This is an expected, recoverable outcome for any handle held across an
+    /// eviction — not a corruption signal. The caller re-resolves by key.
+    #[error("artifact handle is stale: its head region was reclaimed and re-occupied")]
+    Stale,
+
     /// A feature is deliberately not implemented in this version (e.g. a
     /// [`Commit::Patch`](crate::Commit::Patch) commit, deferred to v0.2).
     #[error("unsupported in v0.1: {0}")]

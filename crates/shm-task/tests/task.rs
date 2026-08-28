@@ -347,5 +347,315 @@ fn doorbell_blocked_worker_wakes_on_submit() {
     drop(db);
 }
 
+#[test]
+fn cancelled_slot_recycles_through_claim_to_submit() {
+    // ADR-0009: a slot cancelled while QUEUED rides its READY node until a
+    // claim pop transfers it to the FREE stack; a later submit must get it back.
+    let capacity = 8u32;
+    let region = Region::for_capacity(capacity);
+    // SAFETY: region outlives the queue.
+    let queue = unsafe { TaskQueue::init(region.base(), region.len(), capacity) }.expect("init");
+
+    // Fill the queue, cancel everything (a cancel storm), then drain: one claim
+    // sees only CANCELLED nodes, transfers them all to FREE, and returns None.
+    let mut handles = Vec::new();
+    for i in 0..capacity {
+        handles.push(queue.submit(request(i), future()).expect("submit"));
+    }
+    for h in &handles {
+        queue.cancel(*h).expect("cancel");
+    }
+    assert!(queue.claim(1).is_none(), "all tasks are cancelled");
+
+    // Stack hygiene: every slot came back — the queue refills to capacity and
+    // fully drains, with no slot lost and no double membership.
+    let mut round2 = Vec::new();
+    for i in 0..capacity {
+        round2.push(
+            queue
+                .submit(request(100 + i), future())
+                .expect("cancelled slots must be reusable"),
+        );
+    }
+    assert!(matches!(
+        queue.submit(request(999), future()),
+        Err(shm_task::Error::QueueFull)
+    ));
+    for _ in 0..capacity {
+        let t = queue.claim(1).expect("claim refill");
+        let req = t.request();
+        t.complete(result_for(req, 1)).expect("complete");
+    }
+    assert!(queue.claim(1).is_none(), "drained");
+    for h in &round2 {
+        assert!(matches!(queue.poll(*h).expect("poll"), TaskStatus::Done(_)));
+    }
+    // The old handles are stale (slots reused), not resurrected.
+    for h in &handles {
+        assert!(matches!(queue.poll(*h), Err(shm_task::Error::StaleHandle)));
+    }
+}
+
+#[test]
+fn queue_full_with_only_cancelled_slots_recovers() {
+    // ADR-0009 queue-full edge fallback: with the FREE stack empty and every
+    // slot CANCELLED (still riding READY nodes), submit must still succeed —
+    // the pre-ADR behavior, where a CANCELLED slot was directly reusable.
+    let capacity = 4u32;
+    let region = Region::for_capacity(capacity);
+    // SAFETY: region outlives the queue.
+    let queue = unsafe { TaskQueue::init(region.base(), region.len(), capacity) }.expect("init");
+
+    let mut handles = Vec::new();
+    for i in 0..capacity {
+        handles.push(queue.submit(request(i), future()).expect("submit"));
+    }
+    for h in &handles {
+        queue.cancel(*h).expect("cancel");
+    }
+    // FREE is empty; all four slots are CANCELLED on READY. Each submit
+    // recovers one via the bounded fallback pop.
+    for i in 0..capacity {
+        queue
+            .submit(request(200 + i), future())
+            .expect("cancel-heavy queue must not report full");
+    }
+    // Now the queue is genuinely full of live QUEUED tasks.
+    assert!(matches!(
+        queue.submit(request(999), future()),
+        Err(shm_task::Error::QueueFull)
+    ));
+}
+
+#[test]
+fn submit_claim_complete_at_large_capacity() {
+    // Correctness (not perf) at a deep queue: the index stacks must route every
+    // one of `n` tasks exactly once through 4 workers at capacity 4096.
+    let capacity = 4096u32;
+    let n = 1000u32;
+    let m = 4u32;
+    let region = Region::for_capacity(capacity);
+    // SAFETY: `region` outlives every handle/thread below (joined before drop).
+    let queue = unsafe { TaskQueue::init(region.base(), region.len(), capacity) }.expect("init");
+
+    let mut handles = Vec::new();
+    for i in 0..n {
+        handles.push(queue.submit(request(i), future()).expect("submit"));
+    }
+    let claims: Arc<Vec<AtomicU32>> = Arc::new((0..n).map(|_| AtomicU32::new(0)).collect());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+    for w in 1..=m {
+        let q = queue.clone();
+        let claims = claims.clone();
+        let completed = completed.clone();
+        workers.push(thread::spawn(move || {
+            while completed.load(Ordering::Acquire) < n as usize {
+                match q.claim(w) {
+                    Some(task) => {
+                        let req = task.request();
+                        claims[req.schema_id as usize].fetch_add(1, Ordering::AcqRel);
+                        task.complete(result_for(req, w)).expect("complete");
+                        completed.fetch_add(1, Ordering::AcqRel);
+                    }
+                    None => thread::yield_now(),
+                }
+            }
+        }));
+    }
+    for w in workers {
+        w.join().unwrap();
+    }
+    for (i, c) in claims.iter().enumerate() {
+        assert_eq!(c.load(Ordering::Acquire), 1, "task {i} not claimed once");
+    }
+    for h in &handles {
+        assert!(matches!(queue.poll(*h).expect("poll"), TaskStatus::Done(_)));
+    }
+}
+
+/// **The P0.2 property test** (fails on the pre-ADR-0009 O(capacity) scan):
+/// probing an empty queue for work must cost the same at capacity 2^16 as at
+/// capacity 2^9. The old `claim_inner` scanned all `capacity` slots before
+/// returning `None`, so the large queue cost ~128x the small one; the READY
+/// stack pop is O(1), so the ratio collapses to ~1. The 16x threshold leaves
+/// an order of magnitude of headroom for machine noise on either side.
+#[test]
+fn empty_claim_probe_cost_is_flat_in_capacity() {
+    fn best_probe_batch(capacity: u32) -> Duration {
+        let region = Region::for_capacity(capacity);
+        // SAFETY: region outlives the queue (dropped at end of scope).
+        let queue =
+            unsafe { TaskQueue::init(region.base(), region.len(), capacity) }.expect("init");
+        for _ in 0..100 {
+            assert!(queue.claim(1).is_none(), "queue is empty");
+        }
+        let mut best = Duration::MAX;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            for _ in 0..2000 {
+                std::hint::black_box(queue.claim(1));
+            }
+            best = best.min(t0.elapsed());
+        }
+        best
+    }
+    let small = best_probe_batch(1 << 9);
+    let large = best_probe_batch(1 << 16);
+    let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
+    assert!(
+        ratio < 16.0,
+        "empty-claim probe scales with capacity: cap 2^9 -> {small:?}, cap 2^16 -> {large:?} \
+         (ratio {ratio:.1}x; an O(1) claim is ~1x, the O(capacity) scan ~128x)"
+    );
+}
+
 // Bring `AsRawFd` into scope for `db.write.as_raw_fd()`.
 use std::os::fd::AsRawFd;
+
+// ---- P0.3 (ADR-0010): the lease side table — task-lifecycle-tied bindings ----
+
+/// The whole binding lifecycle: input armed at submit, output armed by the
+/// worker under `CLAIMED`, both released **exactly once** at the requester's
+/// ack (idempotent thereafter), with `NotTerminal` protecting a live task.
+#[test]
+fn task_binding_lifecycle_arms_at_submit_and_releases_exactly_once_at_ack() {
+    use shm_task::{Error, LeaseBinding};
+    let region = Region::for_capacity(8);
+    let queue = unsafe { TaskQueue::init(region.base(), region.len(), 8) }.expect("init");
+
+    let input = LeaseBinding {
+        artifact_id: 77,
+        incarnation: 3,
+        version: 5,
+    };
+    let output = LeaseBinding {
+        artifact_id: 88,
+        incarnation: 4,
+        version: 9,
+    };
+
+    let h = queue
+        .submit_with_binding(request(1), future(), input)
+        .expect("submit with input binding");
+
+    // A live task's bindings cannot be acked out from under it.
+    assert!(matches!(queue.ack(h), Err(Error::NotTerminal)), "queued = live");
+    let task = queue.claim(11).expect("claim");
+    assert!(matches!(queue.ack(h), Err(Error::NotTerminal)), "claimed = live");
+
+    // The worker ties its retained output to the task, then completes.
+    task.bind_output(output).expect("bind output");
+    task.complete(result_for(request(1), 11)).expect("complete");
+
+    // Terminal: the ack hands both bindings to the coordinator, exactly once,
+    // and the next reap (zero grace, no liveness check) releases them.
+    assert_eq!(queue.ack(h).expect("ack"), 2);
+    assert_eq!(queue.ack(h).expect("ack twice"), 0, "idempotent");
+    let mut got = queue.reap_bindings(0, 0);
+    got.sort_by_key(|b| b.artifact_id);
+    assert_eq!(got, vec![input, output]);
+
+    // The records went back to the free list: a fresh task can arm again.
+    let h2 = queue
+        .submit_with_binding(request(2), future(), input)
+        .expect("records recycled");
+    let t2 = queue.claim(11).expect("claim 2");
+    t2.fail().expect("fail");
+    // A FAILED outcome is ackable too (the input is no longer needed).
+    assert_eq!(queue.ack(h2).expect("ack failed task"), 1);
+    assert_eq!(queue.reap_bindings(0, 0), vec![input]);
+}
+
+/// The reap backstop: a live (`QUEUED`/`CLAIMED`) task's bindings are never
+/// touched, however late; a terminal task's bindings are released only past
+/// `deadline + grace`; a racing ack and reap release each binding exactly once.
+#[test]
+fn task_binding_reap_backstop_respects_liveness_and_grace() {
+    use shm_task::LeaseBinding;
+    let region = Region::for_capacity(4);
+    let queue = unsafe { TaskQueue::init(region.base(), region.len(), 4) }.expect("init");
+
+    let b = LeaseBinding {
+        artifact_id: 501,
+        incarnation: 1,
+        version: 2,
+    };
+    let deadline = 1_000_000u64;
+    let grace = 1_000u64;
+    let h = queue
+        .submit_with_binding(request(1), deadline, b)
+        .expect("submit");
+
+    // QUEUED: protected even arbitrarily far past deadline + grace.
+    assert_eq!(queue.reap_bindings(u64::MAX, grace), vec![]);
+    let task = queue.claim(9).expect("claim");
+    // CLAIMED: still protected.
+    assert_eq!(queue.reap_bindings(u64::MAX, grace), vec![]);
+    task.complete(ChunkDesc::ZERO).expect("complete");
+
+    // Terminal, but inside the requester's ack window: untouched.
+    assert_eq!(queue.reap_bindings(deadline + grace, grace), vec![]);
+    // Past the window: the backstop wins the binding.
+    assert_eq!(queue.reap_bindings(deadline + grace + 1, grace), vec![b]);
+    // The ack that never came finds nothing left (exactly-once).
+    assert_eq!(queue.ack(h).expect("late ack"), 0);
+}
+
+/// Slot reuse cannot cross-release: bindings are tied to `{slot_idx, seq}`, so
+/// an old task's unacked binding survives the slot being recycled for a new
+/// task, the old handle's ack releases only the old binding, and the new
+/// task's binding stays armed. Also: the lease table backpressures with
+/// `LeaseTableFull` when every record is armed.
+#[test]
+fn task_binding_survives_slot_reuse_and_table_full_backpressures() {
+    use shm_task::{Error, LeaseBinding};
+    let region = Region::for_capacity(1); // one slot: reuse is immediate
+    let queue = unsafe { TaskQueue::init(region.base(), region.len(), 1) }.expect("init");
+
+    let old = LeaseBinding {
+        artifact_id: 601,
+        incarnation: 1,
+        version: 1,
+    };
+    let new = LeaseBinding {
+        artifact_id: 602,
+        incarnation: 1,
+        version: 1,
+    };
+
+    let h_old = queue
+        .submit_with_binding(request(1), future(), old)
+        .expect("submit old");
+    queue
+        .claim(5)
+        .expect("claim old")
+        .complete(ChunkDesc::ZERO)
+        .expect("complete old");
+
+    // The slot recycles for a NEW task before the old requester acks.
+    let h_new = queue
+        .submit_with_binding(request(2), future(), new)
+        .expect("submit new into the same slot");
+    assert_eq!(h_new.slot_idx, h_old.slot_idx, "same slot reused");
+    assert_ne!(h_new.seq, h_old.seq, "fresh incarnation");
+
+    // With capacity 1 the lease table holds 2 records, both now armed:
+    // arming a third binding backpressures.
+    let t_new = queue.claim(5).expect("claim new");
+    assert!(matches!(
+        t_new.bind_output(new),
+        Err(Error::LeaseTableFull)
+    ));
+
+    // The old handle's ack releases ONLY the old binding (seq-matched), even
+    // though its slot now hosts a live task (StaleHandle from poll's view).
+    assert!(matches!(queue.poll(h_old), Err(Error::StaleHandle)));
+    assert_eq!(queue.ack(h_old).expect("ack old"), 1);
+    assert_eq!(queue.reap_bindings(0, 0), vec![old]);
+
+    // The new task's binding is untouched and still releasable at its own ack.
+    t_new.complete(ChunkDesc::ZERO).expect("complete new");
+    assert_eq!(queue.ack(h_new).expect("ack new"), 1);
+    assert_eq!(queue.reap_bindings(0, 0), vec![new]);
+}

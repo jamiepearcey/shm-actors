@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use shm_arrow::SchemaRegistry;
 use shm_runtime::demo::{demo_batch, demo_schema, verify_demo_batch};
 use shm_runtime::{Coordinator, Node, RuntimeConfig};
-use shm_store::RefKind;
+use shm_store::{RefKind, SLOT_FREE, SLOT_TOMBSTONE};
 
 const KEY: &str = "dataset/X";
 
@@ -246,7 +246,8 @@ fn store_crash_reclaim_same_process_deterministic() {
         "the coordinator counted one leaked entry pin reclaim"
     );
 
-    // Evict + census: back to baseline (zero leak).
+    // Evict + census: back to baseline (zero leak), and the slot itself is
+    // FREE again — the ADR-0008 P0.1 census (not merely the chunks back).
     creator
         .store()
         .expect("open store")
@@ -257,5 +258,47 @@ fn store_crash_reclaim_same_process_deterministic() {
         coord.store_data_free_total().unwrap(),
         baseline,
         "evict + reclaim returns the data pool to baseline"
+    );
+    assert!(
+        coord.store_slot_states().iter().all(|&s| s == SLOT_FREE),
+        "the crash-replayed, evicted entry's slot returned to FREE: {:?}",
+        coord.store_slot_states()
+    );
+
+    // --- ADR-0008 P0.1, the deferred path through the coordinator. ---
+    // Re-create the key (the freed slot recycles with a fresh incarnation), pin
+    // it, and evict while pinned: the slot must sit in TOMBSTONE until the pin
+    // drops, and the sweep — the exact monitor-tick path — returns it to FREE.
+    let entry2 = {
+        let store = creator.store().expect("open store");
+        store
+            .create(KEY.as_bytes(), RefKind::Dataset, &demo_schema())
+            .expect("re-create recycles the slot")
+    };
+    entry2.commit_replace(&demo_batch()).expect("commit");
+    let held = entry2.pin().expect("pin the recycled entry");
+    creator
+        .store()
+        .expect("open store")
+        .evict(KEY.as_bytes())
+        .expect("evict while pinned");
+    assert!(
+        coord.store_slot_states().contains(&SLOT_TOMBSTONE),
+        "a pinned entry's slot stays TOMBSTONE (deferred reclaim): {:?}",
+        coord.store_slot_states()
+    );
+    drop(held);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            coord.sweep_store_tombstones();
+            coord.store_slot_states().iter().all(|&s| s == SLOT_FREE)
+        }),
+        "after the pin drops, the sweep returns the slot to FREE: {:?}",
+        coord.store_slot_states()
+    );
+    assert_eq!(
+        coord.store_data_free_total().unwrap(),
+        baseline,
+        "and the census is back at baseline after the deferred reclaim"
     );
 }

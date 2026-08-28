@@ -8,7 +8,7 @@ use std::thread;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use shm_arrow::SchemaRegistry;
-use shm_artifact::{Artifact, Commit, CommitKind, VersionEvent};
+use shm_artifact::{write_manifest, Artifact, Commit, CommitKind, VersionEvent};
 use shm_core::{BorrowJournal, JournalRecord, PoolConfig, Segment, FREE, PUBLISHED};
 use shm_ring::{Msg, Publisher, Ring, Subscriber};
 
@@ -42,12 +42,33 @@ impl Fixture {
         }
     }
 
+    /// A fixture whose data segment is `data_bytes` long (for the chained-manifest
+    /// lineage tests, which need thousands of small chunks).
+    fn with_data_size(data_bytes: usize) -> Fixture {
+        let head_id = next_segment_id();
+        let data_id = next_segment_id();
+        let _ = Segment::unlink_by_id(head_id);
+        let _ = Segment::unlink_by_id(data_id);
+        let head_seg = Arc::new(Segment::create(head_id, 1 << 16).expect("create head"));
+        let data_seg = Arc::new(Segment::create(data_id, data_bytes).expect("create data"));
+        Fixture {
+            head_id,
+            data_id,
+            head_seg,
+            data_seg,
+        }
+    }
+
     fn artifact(&self, name_id: u32) -> Artifact {
+        self.artifact_with(name_id, &PoolConfig::power_of_two(1024, 4096, 64))
+    }
+
+    fn artifact_with(&self, name_id: u32, pool: &PoolConfig) -> Artifact {
         Artifact::create(
             name_id,
             self.head_seg.clone(),
             self.data_seg.clone(),
-            &PoolConfig::power_of_two(1024, 4096, 64),
+            pool,
         )
         .expect("create artifact")
     }
@@ -134,10 +155,25 @@ fn append_shares_prior_chunk_and_rcu_isolates_old_pin() {
     // The pin taken on v1 still reads v1 correctly AFTER v2 is installed.
     assert_eq!(col(&pin_v1.as_arrow(&reg).unwrap()), vec![1, 2, 3]);
 
-    // A fresh pin sees v2 = both chunks concatenated.
+    // A fresh pin sees v2 = both chunks concatenated. Its head manifest lists
+    // only v2's OWN chunk and links to v1's manifest (ADR-0013); the table is
+    // the chain.
     let pin_v2 = art.pin().unwrap();
     assert_eq!(pin_v2.version(), 2);
-    assert_eq!(pin_v2.manifest().chunks.len(), 2);
+    assert_eq!(pin_v2.manifest().chunks.len(), 1, "own chunk only");
+    assert_eq!(pin_v2.manifest().depth, 1);
+    assert_eq!(pin_v2.manifest().total_batches, 2);
+    assert_eq!(pin_v2.manifest().prev.map(|l| l.version), Some(1));
+    let chain = pin_v2.chain().unwrap();
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].version, 1, "oldest first");
+    assert_eq!(chain[1].version, 2);
+    assert_eq!(pin_v2.data_chunks().unwrap().len(), 2);
+    assert_eq!(
+        pin_v2.data_chunks().unwrap()[0],
+        pin_v1.manifest().chunks[0],
+        "v2's table starts with v1's chunk, shared not copied"
+    );
     assert_eq!(col(&pin_v2.as_arrow(&reg).unwrap()), vec![1, 2, 3, 4, 5]);
 
     // v1's old pin STILL reads v1 after v2 exists (repeat to prove isolation).
@@ -155,33 +191,53 @@ fn reclamation_frees_exclusive_chunk_but_keeps_shared() {
     w.commit(Commit::Replace, &batch(&[1, 2, 3]), &reg).unwrap();
     let v1_data = art.pin().unwrap().manifest().chunks[0];
 
-    // v2: append shares v1's chunk, adds an exclusive chunk [4].
+    // v2: append links to v1's manifest (sharing v1's chunk through the chain)
+    // and adds its own chunk [4].
     w.commit(Commit::Append, &batch(&[4]), &reg).unwrap();
-    let v2_manifest = art.pin().unwrap().manifest().clone();
-    let shared = v2_manifest.chunks[0];
-    let v2_exclusive = v2_manifest.chunks[1];
+    let pin2 = art.pin().unwrap();
+    let v2_manifest = pin2.manifest().clone();
+    let table = pin2.data_chunks().unwrap();
+    drop(pin2);
+    let shared = table[0];
+    let v2_exclusive = v2_manifest.chunks[0];
     assert_eq!(shared, v1_data, "v2 must share v1's chunk");
+    let v1_link = v2_manifest.prev.expect("v2 links to v1");
+    let v1_manifest_chunk = shm_core::ChunkDesc {
+        segment_id: v1_link.mref.segment_id(),
+        offset: v1_link.mref.offset(),
+        ..shm_core::ChunkDesc::ZERO
+    };
 
     // Attach a pool to inspect chunk control words.
     let pool = shm_core::Pool::attach(&fx.data_seg).unwrap();
 
-    // After v2 is current, v1 (non-current, unpinned) is reclaimed on commit.
-    // The shared chunk survives (still referenced by v2); v1's manifest chunk is
-    // freed. The shared data chunk is still PUBLISHED.
+    // After v2 is current, v1 (non-current, unpinned) is retired on commit:
+    // its one reference (on its manifest) is released, but v2's link still
+    // holds that manifest, so nothing of v1 is freed — the shared data chunk
+    // stays PUBLISHED with its single listing-manifest reference.
     assert_eq!(
         pool.ctrl(&shared).unwrap().state(),
         PUBLISHED,
         "shared chunk must survive v1 retirement"
     );
-    // The shared chunk's refcount is exactly 1 now (only v2 references it).
-    assert_eq!(pool.ctrl(&shared).unwrap().refcount(), 1);
+    assert_eq!(
+        pool.ctrl(&shared).unwrap().refcount(),
+        1,
+        "a data chunk's refcount is the number of manifests listing it"
+    );
+    assert_eq!(pool.ctrl(&v1_manifest_chunk).unwrap().state(), PUBLISHED);
+    assert_eq!(
+        pool.ctrl(&v1_manifest_chunk).unwrap().refcount(),
+        1,
+        "v1's manifest is held only by v2's link once v1 retired"
+    );
 
     // v3: replace wholesale with [9]. v2 becomes non-current and (unpinned) is
-    // reclaimed: BOTH the shared chunk and v2's exclusive chunk lose their last
-    // reference and return to FREE.
+    // reclaimed: the cascade frees v2's manifest + exclusive chunk, follows the
+    // link, and frees v1's manifest + the shared chunk.
     w.commit(Commit::Replace, &batch(&[9]), &reg).unwrap();
     drop(w);
-    // No live pins on v2 → its chunks are reclaimed.
+    // No live pins on v2 → the whole chain is reclaimed.
     assert_eq!(
         pool.ctrl(&shared).unwrap().state(),
         FREE,
@@ -191,6 +247,11 @@ fn reclamation_frees_exclusive_chunk_but_keeps_shared() {
         pool.ctrl(&v2_exclusive).unwrap().state(),
         FREE,
         "v2's exclusive chunk must be freed"
+    );
+    assert_eq!(
+        pool.ctrl(&v1_manifest_chunk).unwrap().state(),
+        FREE,
+        "the cascade must free v1's manifest"
     );
 
     // v3 is readable.
@@ -460,6 +521,7 @@ fn journalled_pin_records_and_clean_drop_releases() {
         recs,
         vec![JournalRecord::ArtifactPin {
             artifact_id: 102,
+            incarnation: shm_artifact::FIRST_INCARNATION,
             version: 1
         }]
     );
@@ -511,10 +573,12 @@ fn release_leaked_pin_retires_a_crashed_readers_version() {
     for rec in journal.replay() {
         if let JournalRecord::ArtifactPin {
             artifact_id,
+            incarnation,
             version,
         } = rec
         {
             assert_eq!(artifact_id, 103);
+            assert_eq!(incarnation, shm_artifact::FIRST_INCARNATION);
             if art.release_leaked_pin(version).unwrap() {
                 released += 1;
             }
@@ -655,6 +719,7 @@ fn journalled_exclusive_records_and_clean_drop_releases() {
             recs,
             vec![JournalRecord::WriteLease {
                 artifact_id: 110,
+                incarnation: shm_artifact::FIRST_INCARNATION,
                 fence: 0
             }]
         );
@@ -871,14 +936,25 @@ fn multi_chunk_append_shares_prior_chunks_across_versions() {
     let m2 = pin2.manifest();
     assert_eq!(
         m2.chunks.len(),
-        2 * v1_chunks,
-        "append concatenates both batches' chunks"
+        v1_chunks,
+        "the head manifest lists only v2's own chunks"
     );
-    assert_eq!(m2.batch_spans.len(), 2, "two batches after append");
-    assert_eq!(m2.batch_spans[0] as usize, v1_chunks);
-    assert_eq!(m2.batch_spans[1] as usize, v1_chunks);
+    assert_eq!(m2.batch_spans, vec![v1_chunks as u32], "one own batch");
+    assert_eq!(m2.total_batches, 2, "two batches across the chain");
+    let chain = pin2.chain().unwrap();
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].batch_spans[0] as usize, v1_chunks);
+    assert_eq!(
+        pin2.data_chunks().unwrap().len(),
+        2 * v1_chunks,
+        "the table is both batches' chunks, in order"
+    );
 
-    // v2 reads back as the two batches concatenated in row order.
+    // v2 reads back as the two batches, zero-copy, then concatenated in row order.
+    let batches = pin2.as_arrow_batches(&reg).unwrap();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(&batches[0], &b1);
+    assert_eq!(&batches[1], &b1);
     let out = pin2.as_arrow(&reg).unwrap();
     assert_eq!(out.num_rows(), 2 * b1.num_rows());
     drop(pin2);
@@ -958,4 +1034,585 @@ fn nested_struct_list_version_round_trips_zero_copy() {
     // Recommit-then-retire is idempotent in the pool: only v2 occupies chunks.
     assert!(used >= 2, "nested version occupies data + manifest chunks");
     assert_eq!(&art.pin().unwrap().as_arrow(&reg).unwrap(), &b);
+}
+
+// ---- P0.3 (ADR-0010, G4): evict-current as an empty Replace commit ----
+
+/// The core G4 property: `evict_current` retires the current version's chunks
+/// (the thing `try_retire_version` alone can never do while it is current),
+/// keeps the lineage alive, and the version sequence continues monotonically —
+/// no version number is ever reissued.
+#[test]
+fn evict_current_reclaims_and_the_version_sequence_continues() {
+    let fx = Fixture::new();
+    let art = fx.artifact(41);
+    let reg = registry();
+
+    let baseline = free_total(&fx.data_seg);
+    let v1 = art
+        .commit_optimistic(7, 0, Commit::Replace, &batch(&[1, 2, 3]), &reg)
+        .unwrap();
+    assert_eq!(v1, 1);
+    let used_v1 = baseline - free_total(&fx.data_seg);
+    assert!(used_v1 >= 2, "v1 holds a data chunk and a manifest chunk");
+
+    // Evict the CURRENT version: an empty Replace supersedes it and the
+    // standard install-path retire frees v1's chunks immediately (unpinned).
+    let v2 = art.evict_current_optimistic(7, v1).unwrap();
+    assert_eq!(v2, 2, "the empty version continues the sequence");
+    assert_eq!(art.current_version(), 2);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        1,
+        "v1's chunks are back; only the empty version's 32-byte manifest chunk remains"
+    );
+
+    // A reader of the evicted-current entry looks exactly like a reader of a
+    // never-committed one: the pin resolves, as_arrow reports VersionGone.
+    let pin = art.pin().expect("empty version is pinnable");
+    assert_eq!(pin.version(), 2);
+    assert_eq!(pin.manifest().chunks.len(), 0, "zero-chunk manifest round-trips");
+    assert_eq!(pin.manifest().batch_spans.len(), 0);
+    assert!(matches!(
+        pin.as_arrow(&reg),
+        Err(shm_artifact::Error::VersionGone)
+    ));
+    drop(pin);
+
+    // The lineage is still live: the next commit continues at 3 (never
+    // reissuing 1 or 2) and reads back normally.
+    let v3 = art
+        .commit_optimistic(7, 2, Commit::Replace, &batch(&[9]), &reg)
+        .unwrap();
+    assert_eq!(v3, 3);
+    let pin = art.pin().unwrap();
+    assert_eq!(col(&pin.as_arrow(&reg).unwrap()), vec![9]);
+    drop(pin);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        2,
+        "the empty v2 manifest was itself retired when v3 superseded it"
+    );
+}
+
+/// A reader pinned on the evicted version keeps its frozen view (RCU
+/// isolation) and the version's chunks; the retire happens on pin drop.
+#[test]
+fn evict_current_with_a_pinned_reader_drains_on_pin_drop() {
+    let fx = Fixture::new();
+    let art = fx.artifact(42);
+    let reg = registry();
+
+    let baseline = free_total(&fx.data_seg);
+    art.commit_optimistic(7, 0, Commit::Replace, &batch(&[5, 6]), &reg)
+        .unwrap();
+    let used_v1 = baseline - free_total(&fx.data_seg);
+    let pin = art.pin().unwrap();
+
+    let v2 = art.evict_current_optimistic(7, 1).unwrap();
+    assert_eq!(v2, 2);
+    // The pinned version survives the evict, frozen.
+    assert_eq!(col(&pin.as_arrow(&reg).unwrap()), vec![5, 6]);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        used_v1 + 1,
+        "nothing of v1 freed while the pin is live (+1 for the empty manifest)"
+    );
+
+    drop(pin);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        1,
+        "the last pin drop retired the evicted version"
+    );
+}
+
+/// Nothing committed ⇒ nothing to evict: `VersionGone`, and the entry is
+/// untouched. A conflicting concurrent commit linearises the loser as
+/// `Conflict`, exactly like any optimistic commit race.
+#[test]
+fn evict_current_on_empty_errors_and_conflicts_are_clean() {
+    let fx = Fixture::new();
+    let art = fx.artifact(43);
+    let reg = registry();
+
+    assert!(matches!(
+        art.evict_current_optimistic(7, 0),
+        Err(shm_artifact::Error::VersionGone)
+    ));
+
+    art.commit_optimistic(7, 0, Commit::Replace, &batch(&[1]), &reg)
+        .unwrap();
+    let baseline = free_total(&fx.data_seg);
+    // A racing committer moved current first: the evict is a clean loser and
+    // stages nothing.
+    assert!(matches!(
+        art.evict_current_optimistic(7, /* stale expect */ 9),
+        Err(shm_artifact::Error::Conflict {
+            expected: 9,
+            actual: 1
+        })
+    ));
+    assert_eq!(free_total(&fx.data_seg), baseline, "a lost evict leaks nothing");
+    assert_eq!(art.current_version(), 1);
+
+    // The leased form: evicting twice stacks empty versions monotonically.
+    let mut committer = art.open_exclusive(7).unwrap();
+    assert_eq!(committer.evict_current().unwrap(), 2);
+    assert_eq!(committer.evict_current().unwrap(), 3);
+    drop(committer);
+    assert_eq!(art.current_version(), 3);
+}
+
+/// Churn: alternate commit / evict_current far past `MAX_LIVE_VERSIONS` under
+/// a concurrent pinning reader — no slot leak, no pin underflow, and the pool
+/// census returns to its baseline (+ the final empty version's manifest).
+#[test]
+fn evict_current_churn_past_max_live_versions_with_concurrent_readers() {
+    let fx = Fixture::new();
+    let art = Arc::new(fx.artifact(44));
+    let reg = Arc::new(registry());
+    let baseline = free_total(&fx.data_seg);
+
+    let stop = Arc::new(AtomicU32::new(0));
+    let reader = {
+        let art = Arc::clone(&art);
+        let reg = Arc::clone(&reg);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let mut reads = 0u64;
+            while stop.load(Ordering::Acquire) == 0 {
+                match art.pin() {
+                    Ok(pin) => {
+                        // An empty (evicted-current) version reads VersionGone;
+                        // a data version must read coherently.
+                        if let Ok(b) = pin.as_arrow(&reg) {
+                            assert_eq!(b.num_rows(), 2);
+                        }
+                        reads += 1;
+                    }
+                    Err(shm_artifact::Error::VersionGone) => {}
+                    Err(e) => panic!("reader saw {e:?}"),
+                }
+            }
+            reads
+        })
+    };
+
+    // 2 versions per iteration x 200 = 400 versions >> MAX_LIVE_VERSIONS (64).
+    let mut current = 0u64;
+    for i in 0..200 {
+        current = art
+            .commit_optimistic(7, current, Commit::Replace, &batch(&[i, i + 1]), &reg)
+            .unwrap();
+        current = art.evict_current_optimistic(7, current).unwrap();
+    }
+    stop.store(1, Ordering::Release);
+    let reads = reader.join().unwrap();
+    assert!(reads > 0, "the reader actually raced the churn");
+
+    assert_eq!(art.current_version(), 400);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        1,
+        "only the final empty version's manifest chunk is outstanding"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0013 — chained manifests: `Commit::Append` in O(new data)
+// ---------------------------------------------------------------------------
+
+/// A fixture + artifact over a pool whose **largest class is 256 bytes**, with
+/// `chunks` chunks. A flat manifest re-listing every prior chunk (24 B each)
+/// outgrows 256 B after eight appends, so a long Append lineage here is only
+/// possible with chained manifests (every manifest is 64 B + its own chunks).
+fn lineage_artifact(name_id: u32, chunks: u32) -> (Fixture, Artifact) {
+    let pool = PoolConfig::power_of_two(256, 256, chunks);
+    let fx = Fixture::with_data_size(256 * chunks as usize + (1 << 20));
+    let art = fx.artifact_with(name_id, &pool);
+    (fx, art)
+}
+
+/// (a) 1000 appends in a pool whose largest class is 256 B — impossible with a
+/// flat manifest (the 1000th would be ~24 KB). Every version costs exactly one
+/// data chunk + one 92-byte manifest, and the whole table reads back through
+/// the chain.
+#[test]
+fn append_1000_in_a_pool_whose_largest_class_is_256_bytes() {
+    let (fx, art) = lineage_artifact(300, 4096);
+    let reg = registry();
+    let baseline = free_total(&fx.data_seg);
+
+    let mut w = art.open_exclusive(7).unwrap();
+    assert_eq!(w.commit(Commit::Replace, &batch(&[0]), &reg).unwrap(), 1);
+    for i in 1..=1000i64 {
+        assert_eq!(
+            w.commit(Commit::Append, &batch(&[i]), &reg).unwrap(),
+            i as u64 + 1
+        );
+    }
+    drop(w);
+    assert_eq!(art.current_version(), 1001);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        2 * 1001,
+        "exactly one data chunk + one manifest chunk per chain member"
+    );
+
+    let pin = art.pin().unwrap();
+    assert_eq!(pin.manifest().chunks.len(), 1, "pin parses the head only");
+    assert_eq!(pin.manifest().depth, 1000);
+    assert_eq!(pin.manifest().total_batches, 1001);
+    let chain = pin.chain().unwrap();
+    assert_eq!(chain.len(), 1001);
+    assert!(
+        chain.windows(2).all(|w| w[0].version + 1 == w[1].version),
+        "chain is oldest-first and contiguous"
+    );
+    assert_eq!(pin.data_chunks().unwrap().len(), 1001);
+    assert_eq!(pin.as_arrow_batches(&reg).unwrap().len(), 1001);
+    let expect: Vec<i64> = (0..=1000).collect();
+    assert_eq!(col(&pin.as_arrow(&reg).unwrap()), expect);
+}
+
+/// (b) A `Replace` after a long lineage frees the whole chain back to
+/// baseline: one release on the retired head's manifest, then the cascade
+/// walks every link to the root.
+#[test]
+fn replace_after_a_long_lineage_frees_the_whole_chain() {
+    let (fx, art) = lineage_artifact(301, 1024);
+    let reg = registry();
+    let baseline = free_total(&fx.data_seg);
+
+    let mut w = art.open_exclusive(7).unwrap();
+    w.commit(Commit::Replace, &batch(&[0]), &reg).unwrap();
+    for i in 1..=200i64 {
+        w.commit(Commit::Append, &batch(&[i]), &reg).unwrap();
+    }
+    assert_eq!(baseline - free_total(&fx.data_seg), 2 * 201);
+
+    assert_eq!(w.commit(Commit::Replace, &batch(&[9]), &reg).unwrap(), 202);
+    drop(w);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        2,
+        "only v202's data + manifest remain after the cascade"
+    );
+    assert_eq!(col(&art.pin().unwrap().as_arrow(&reg).unwrap()), vec![9]);
+}
+
+/// (c) A reader pinned on a prefix of the chain survives the cascade: the
+/// cascade frees the suffix and stops at the pinned manifest (still held by
+/// the pinned version's own reference); the pin drop then frees the prefix.
+#[test]
+fn pinned_prefix_survives_the_cascade() {
+    let (fx, art) = lineage_artifact(302, 1024);
+    let reg = registry();
+    let baseline = free_total(&fx.data_seg);
+
+    let mut w = art.open_exclusive(7).unwrap();
+    w.commit(Commit::Replace, &batch(&[1]), &reg).unwrap();
+    for i in 2..=5i64 {
+        w.commit(Commit::Append, &batch(&[i]), &reg).unwrap();
+    }
+    let held = art.pin().unwrap();
+    assert_eq!(held.version(), 5);
+    for i in 6..=20i64 {
+        w.commit(Commit::Append, &batch(&[i]), &reg).unwrap();
+    }
+    assert_eq!(baseline - free_total(&fx.data_seg), 2 * 20);
+
+    // v21 (Replace) retires v20: the cascade frees v20..v6 and stops at v5.
+    assert_eq!(w.commit(Commit::Replace, &batch(&[99]), &reg).unwrap(), 21);
+    drop(w);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        2 + 2 * 5,
+        "v21 plus the pinned v1..v5 prefix remain"
+    );
+    assert_eq!(col(&held.as_arrow(&reg).unwrap()), vec![1, 2, 3, 4, 5]);
+    assert_eq!(held.chain().unwrap().len(), 5);
+
+    drop(held);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        2,
+        "the pin drop retired v5 and the cascade freed the prefix"
+    );
+}
+
+/// (d) Optimistic `Append` vs `Replace` racing for the same `expect`, 1000
+/// rounds: exactly one wins each round, the loser's rollback releases its link
+/// through the cascade, and the census is exact after every round.
+#[test]
+fn optimistic_append_vs_replace_conflict_census_exact() {
+    let (fx, art) = lineage_artifact(303, 4096);
+    let art = Arc::new(art);
+    let reg = Arc::new(registry());
+    let baseline = free_total(&fx.data_seg);
+
+    let mut current = art
+        .commit_optimistic(7, 0, Commit::Replace, &batch(&[0]), &reg)
+        .unwrap();
+    let mut appends_won = 0usize;
+    for round in 0..1000u64 {
+        let barrier = Arc::new(Barrier::new(2));
+        let (a, r) = thread::scope(|s| {
+            let a = {
+                let art = art.clone();
+                let reg = reg.clone();
+                let b = barrier.clone();
+                s.spawn(move || {
+                    b.wait();
+                    art.commit_optimistic(11, current, Commit::Append, &batch(&[round as i64]), &reg)
+                })
+            };
+            let r = {
+                let art = art.clone();
+                let reg = reg.clone();
+                let b = barrier.clone();
+                s.spawn(move || {
+                    b.wait();
+                    art.commit_optimistic(12, current, Commit::Replace, &batch(&[-1]), &reg)
+                })
+            };
+            (a.join().unwrap(), r.join().unwrap())
+        });
+        match (&a, &r) {
+            (Ok(v), Err(shm_artifact::Error::Conflict { .. })) => {
+                appends_won += 1;
+                current = *v;
+            }
+            (Err(shm_artifact::Error::Conflict { .. }), Ok(v)) => current = *v,
+            other => panic!("round {round}: expected exactly one winner, got {other:?}"),
+        }
+        assert_eq!(current, round + 2);
+        // Census: exactly the live chain is in use — two chunks per member —
+        // and nothing the loser staged or linked leaked.
+        let depth = art.pin().unwrap().manifest().depth as usize;
+        assert_eq!(
+            baseline - free_total(&fx.data_seg),
+            2 * (depth + 1),
+            "round {round}: census off for a chain of depth {depth}"
+        );
+    }
+    eprintln!("append-vs-replace: appends won {appends_won}/1000 rounds");
+
+    // Collapse: a final Replace frees everything but itself.
+    art.commit_optimistic(7, current, Commit::Replace, &batch(&[1]), &reg)
+        .unwrap();
+    assert_eq!(baseline - free_total(&fx.data_seg), 2);
+}
+
+/// (e) `as_arrow_batches` is zero-copy per batch across the chain (every
+/// buffer points into the data segment); `as_arrow` on a multi-batch version
+/// concatenates, which is a copy — and says so.
+#[test]
+fn as_arrow_batches_is_zero_copy_per_batch_and_as_arrow_copies() {
+    let fx = Fixture::new();
+    let art = fx.artifact(304);
+    let reg = registry();
+
+    let mut w = art.open_exclusive(7).unwrap();
+    w.commit(Commit::Replace, &batch(&[1, 2]), &reg).unwrap();
+    w.commit(Commit::Append, &batch(&[3]), &reg).unwrap();
+    w.commit(Commit::Append, &batch(&[4, 5, 6]), &reg).unwrap();
+    drop(w);
+
+    let pin = art.pin().unwrap();
+    let base = fx.data_seg.base_ptr() as usize;
+    let end = base + fx.data_seg.size();
+    let batches = pin.as_arrow_batches(&reg).unwrap();
+    assert_eq!(batches.len(), 3);
+    assert_eq!(col(&batches[0]), vec![1, 2]);
+    assert_eq!(col(&batches[1]), vec![3]);
+    assert_eq!(col(&batches[2]), vec![4, 5, 6]);
+    for (i, b) in batches.iter().enumerate() {
+        let p = b.column(0).to_data().buffers()[0].as_ptr() as usize;
+        assert!(
+            (base..end).contains(&p),
+            "batch {i}'s value buffer escaped the segment (copied)"
+        );
+    }
+    assert_eq!(pin.data_chunks().unwrap().len(), 3, "one chunk per batch here");
+
+    let one = pin.as_arrow(&reg).unwrap();
+    assert_eq!(col(&one), vec![1, 2, 3, 4, 5, 6]);
+    let p = one.column(0).to_data().buffers()[0].as_ptr() as usize;
+    assert!(
+        !(base..end).contains(&p),
+        "a concatenated multi-batch read is a copy, not a view"
+    );
+}
+
+/// (f) A manifest may only link to an **older** version: a self-link and a
+/// forward link are refused at write time (and by the parser / walker — see
+/// the `manifest` unit tests), staging nothing.
+#[test]
+fn self_link_and_forward_link_are_rejected() {
+    let fx = Fixture::new();
+    let art = fx.artifact(305);
+    let reg = registry();
+    art.commit_optimistic(7, 0, Commit::Replace, &batch(&[1]), &reg)
+        .unwrap();
+    let baseline = free_total(&fx.data_seg);
+    let head = art.pin().unwrap().manifest().clone();
+    assert_eq!(head.version, 1);
+
+    let pool = shm_core::Pool::attach(&fx.data_seg).unwrap();
+    let alloc = shm_arrow::PoolAllocator::new(&pool, &fx.data_seg);
+    let link = head.link_from(shm_core::PackedRef(0x0000_0001_0000_1000), 0);
+    // Version 1 linking to version 1: a self-link.
+    assert!(matches!(
+        write_manifest(&alloc, 305, 1, head.schema_id, &[], &[], Some(&link)),
+        Err(shm_artifact::Error::Unsupported(_))
+    ));
+    // Version 0 linking to version 1: a forward link.
+    assert!(matches!(
+        write_manifest(&alloc, 305, 0, head.schema_id, &[], &[], Some(&link)),
+        Err(shm_artifact::Error::Unsupported(_))
+    ));
+    assert_eq!(
+        free_total(&fx.data_seg),
+        baseline,
+        "a refused link allocates nothing"
+    );
+}
+
+/// (g) Item-J replay on an Append lineage: a leaked journalled pin on the
+/// chain head keeps the whole chain alive past a `Replace`; releasing it via
+/// `release_leaked_pin` retires the head and cascades the chain.
+#[test]
+fn leaked_pin_replay_on_an_append_lineage_cascades() {
+    let (fx, art) = lineage_artifact(306, 1024);
+    let reg = registry();
+    let jseg = journal_segment();
+    BorrowJournal::create(&jseg, 64).unwrap();
+    let baseline = free_total(&fx.data_seg);
+
+    let mut cur = art
+        .commit_optimistic(7, 0, Commit::Replace, &batch(&[1]), &reg)
+        .unwrap();
+    for i in 2..=10i64 {
+        cur = art
+            .commit_optimistic(7, cur, Commit::Append, &batch(&[i]), &reg)
+            .unwrap();
+    }
+    let pin = art.pin_journaled(&jseg).unwrap();
+    assert_eq!(pin.version(), 10);
+    std::mem::forget(pin); // the reader "crashes" holding v10
+
+    cur = art
+        .commit_optimistic(7, cur, Commit::Replace, &batch(&[0]), &reg)
+        .unwrap();
+    assert_eq!(cur, 11);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        2 * 10 + 2,
+        "the leaked pin keeps the 10-deep chain alive"
+    );
+
+    let journal = BorrowJournal::attach(&jseg).unwrap();
+    let mut released = 0;
+    for rec in journal.replay() {
+        if let JournalRecord::ArtifactPin { version, .. } = rec {
+            if art.release_leaked_pin(version).unwrap() {
+                released += 1;
+            }
+        }
+    }
+    assert_eq!(released, 1);
+    assert_eq!(art.version_pin_count(10), None);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        2,
+        "the replayed release retired v10 and the cascade freed the chain"
+    );
+}
+
+/// (h) `evict_all` on a lineage: unpinned members cascade immediately, a
+/// pinned member (and its prefix) drains on pin drop, and the pool returns to
+/// baseline.
+#[test]
+fn evict_all_on_a_lineage_returns_the_pool_to_baseline() {
+    let (fx, art) = lineage_artifact(307, 1024);
+    let reg = registry();
+    let baseline = free_total(&fx.data_seg);
+
+    let mut w = art.open_exclusive(7).unwrap();
+    w.commit(Commit::Replace, &batch(&[1]), &reg).unwrap();
+    for i in 2..=21i64 {
+        w.commit(Commit::Append, &batch(&[i]), &reg).unwrap();
+    }
+    let held = art.pin().unwrap();
+    assert_eq!(held.version(), 21);
+    for i in 22..=26i64 {
+        w.commit(Commit::Append, &batch(&[i]), &reg).unwrap();
+    }
+    drop(w);
+    assert_eq!(baseline - free_total(&fx.data_seg), 2 * 26);
+
+    art.evict_all().unwrap();
+    assert_eq!(art.current_version(), 0);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        2 * 21,
+        "v26..v22 cascaded down to the pinned v21; its chain survives the pin"
+    );
+    let expect: Vec<i64> = (1..=21).collect();
+    assert_eq!(col(&held.as_arrow(&reg).unwrap()), expect);
+
+    drop(held);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        0,
+        "the pin drop retired v21 and the cascade returned everything"
+    );
+    // Idempotent.
+    art.evict_all().unwrap();
+    assert_eq!(free_total(&fx.data_seg), baseline);
+}
+
+/// (i) An `Append` whose schema differs from the prior version's is rejected
+/// (`Unsupported`), installs nothing and leaks nothing; a `Replace` with the
+/// new schema starts a fresh root.
+#[test]
+fn append_with_a_different_schema_is_rejected() {
+    let fx = Fixture::new();
+    let art = fx.artifact(308);
+    let schema_b: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "w",
+        DataType::Int32,
+        false,
+    )]));
+    let reg = SchemaRegistry::with_schemas(&[schema(), schema_b.clone()]);
+    art.commit_optimistic(7, 0, Commit::Replace, &batch(&[1]), &reg)
+        .unwrap();
+    let baseline = free_total(&fx.data_seg);
+
+    let other = RecordBatch::try_new(
+        schema_b,
+        vec![Arc::new(arrow_array::Int32Array::from(vec![2]))],
+    )
+    .unwrap();
+    assert!(matches!(
+        art.commit_optimistic(7, 1, Commit::Append, &other, &reg),
+        Err(shm_artifact::Error::Unsupported(_))
+    ));
+    assert_eq!(art.current_version(), 1);
+    assert_eq!(
+        free_total(&fx.data_seg),
+        baseline,
+        "the rejected Append returned its staged chunk"
+    );
+
+    assert_eq!(
+        art.commit_optimistic(7, 1, Commit::Replace, &other, &reg)
+            .unwrap(),
+        2
+    );
+    let pin = art.pin().unwrap();
+    assert_eq!(pin.manifest().depth, 0, "a Replace is a new root");
+    assert_eq!(pin.as_arrow(&reg).unwrap(), other);
 }

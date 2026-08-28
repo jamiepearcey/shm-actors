@@ -146,6 +146,12 @@ impl ShmU32 {
     pub fn fetch_sub(&self, v: u32, order: Ordering) -> u32 {
         self.0.fetch_sub(v, order)
     }
+
+    /// Atomically store `v`, returning the previous value.
+    #[inline]
+    pub fn swap(&self, v: u32, order: Ordering) -> u32 {
+        self.0.swap(v, order)
+    }
 }
 
 impl ShmU64 {

@@ -36,6 +36,8 @@ pub use hooks::{
     DoorbellNotifier, DoorbellParker, NoopNotifier, Notifier, Parker, YieldParker,
     DEFAULT_DOORBELL_TIMEOUT,
 };
+#[cfg(target_os = "linux")]
+pub use hooks::{FutexNotifier, FutexParker};
 pub use publish::Publisher;
 pub use ring::{
     required_bytes, slots_offset, Ring, RingHeader, Slot, MAX_RELIABLE, RELIABLE_UNUSED, RING_MAGIC,

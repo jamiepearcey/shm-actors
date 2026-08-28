@@ -11,18 +11,37 @@
 //! # Slot lifecycle (the CAS state machine)
 //!
 //! ```text
-//!   FREE ──publish (CAS FREE→LIVE)──▶ LIVE ──evict (CAS LIVE→TOMBSTONE)──▶ TOMBSTONE
+//!   FREE ──alloc+publish──▶ LIVE ──evict──▶ TOMBSTONE ──sweep──▶ RECLAIMING
+//!     ▲                                         ▲                    │
+//!     └──────── free-list push ─────────────────┴── not quiescent ────┘
 //! ```
 //!
-//! Slots are **append-only**: a monotonic `next_slot` bump hands each creator a
-//! brand-new index it exclusively owns, so publishing a slot is race-free across
-//! processes (no two creators contend for the same index). A slot's `head_off`
-//! (where its [`ArtifactHead`](shm_artifact::ArtifactHead) lives in the head
-//! segment) and `artifact_id` (its lineage id) are pure functions of the index —
-//! `idx * head_stride` and `artifact_id_base + idx` — so they are globally unique
-//! and monotonic, and a coordinator can route a journaled entry pin back to its
-//! head by index alone. Eviction tombstones the slot and never reuses it; a
-//! re-`create` of the same key appends a *new* slot with a *new* lineage id.
+//! A slot's `head_off` (where its [`ArtifactHead`](shm_artifact::ArtifactHead)
+//! lives in the head segment) and `artifact_id` (the id a journal record routes
+//! by) are pure functions of the index — `idx * head_stride` and
+//! `artifact_id_base + idx`. A creator gets an index it exclusively owns, either
+//! by a monotonic `next_slot` bump or by popping the free list, so publishing is
+//! race-free across processes.
+//!
+//! # Reclamation (ADR-0008 P0.1)
+//!
+//! Slots were **append-only** through v0.5: `evict` tombstoned a slot and never
+//! returned it, which made `capacity` a cap on entries created *for the
+//! coordinator's lifetime*. Under the entry churn an actor system generates that
+//! is an outage waiting on a clock, so `TOMBSTONE → FREE` now exists — with two
+//! properties that make it safe:
+//!
+//! - **Deferred, never immediate.** `Artifact::evict_all` retires versions
+//!   *conditionally*: one still pinned by a live reader is left for that reader's
+//!   pin-drop. So the evictor cannot know the entry is finished; a **sweep**
+//!   decides, under [`SLOT_RECLAIMING`], which no creator allocates from.
+//! - **Identified by `(artifact_id, incarnation)`, not by index.** Since the
+//!   index is reused, `artifact_id` names a *slot*, not an occupant. Each slot
+//!   carries a `gen` — the incarnation stamped into the next occupant's
+//!   `ArtifactHead` — so a handle or journal record from a previous occupant is
+//!   detected rather than silently retargeted at the current one. A slot whose
+//!   `gen` would wrap is retired permanently instead of freed: one slot lost,
+//!   and no incarnation is ever reused.
 
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 
@@ -31,15 +50,39 @@ use shm_core::{Segment, ShmU32, ShmU64};
 
 use crate::error::{Error, Result};
 
-/// Catalog header magic: little-endian bytes of `b"SHMSTOR1"`.
-pub const CATALOG_MAGIC: u64 = u64::from_le_bytes(*b"SHMSTOR1");
+/// Catalog header magic: little-endian bytes of `b"SHMSTOR2"`.
+///
+/// Bumped from `SHMSTOR1` for ADR-0008 P0.1: the header gained a free-list head
+/// and each slot gained `gen`/`next_free`, so a v0.5 catalog is rejected rather
+/// than misread.
+pub const CATALOG_MAGIC: u64 = u64::from_le_bytes(*b"SHMSTOR2");
 
 /// Slot state: unused and claimable (also the zero-initialised value).
 pub const SLOT_FREE: u32 = 0;
 /// Slot state: tracks a live keyed entry.
 pub const SLOT_LIVE: u32 = 1;
-/// Slot state: the entry was evicted; the slot is retired and never reused.
+/// Slot state: the entry was evicted. The slot is awaiting a sweep, which will
+/// return it to [`SLOT_FREE`] once its entry is quiescent.
 pub const SLOT_TOMBSTONE: u32 = 2;
+/// Slot state: a sweep owns this slot exclusively and is deciding whether its
+/// entry is quiescent enough to reclaim (ADR-0008 P0.1). No creator allocates
+/// from this state, so the quiescence check cannot race a new occupant.
+pub const SLOT_RECLAIMING: u32 = 3;
+
+/// Free-list terminator: "no next slot".
+pub const FREE_NIL: u32 = u32::MAX;
+
+/// The first incarnation stamped into a never-yet-recycled slot. Matches
+/// [`shm_artifact::FIRST_INCARNATION`]; `0` is reserved for "not in service".
+pub const FIRST_GEN: u32 = 1;
+
+/// Pack the free-list head: `{tag:32 | idx:32}`. The tag is bumped on every
+/// push and pop, which is what makes the Treiber stack ABA-safe — the same shape
+/// [`Pool`](shm_core::Pool) uses for its chunk free lists.
+#[inline]
+const fn pack_free_head(idx: u32, tag: u32) -> u64 {
+    ((tag as u64) << 32) | (idx as u64)
+}
 
 /// The kind of referent a [`CatalogSlot`] (and, in the G1 stage, a `TypedRef`)
 /// names. The discriminants are the frozen ABI values from ADR-0007.
@@ -81,7 +124,7 @@ impl RefKind {
 
 /// One catalog entry: a keyed pointer to an [`ArtifactHead`](shm_artifact::ArtifactHead).
 ///
-/// # Layout (20 bytes, all fields atomic)
+/// # Layout (28 bytes, all fields atomic)
 ///
 /// | field         | type       | meaning                                        |
 /// |---------------|------------|------------------------------------------------|
@@ -89,12 +132,23 @@ impl RefKind {
 /// | `artifact_id` | `AtomicU32`| the entry's lineage id (`base + slot index`)   |
 /// | `head_off`    | `AtomicU32`| byte offset of the `ArtifactHead` in the head seg |
 /// | `kind`        | `AtomicU32`| [`RefKind`] discriminant (a `u16` value widened)|
-/// | `state`       | `AtomicU32`| `FREE` / `LIVE` / `TOMBSTONE` — the CAS gate    |
+/// | `state`       | `AtomicU32`| `FREE`/`LIVE`/`TOMBSTONE`/`RECLAIMING` — the CAS gate |
+/// | `gen`         | `AtomicU32`| incarnation of the next occupant (ADR-0008)     |
+/// | `next_free`   | `AtomicU32`| free-list link (live only while FREE + listed)  |
 ///
 /// ADR-0007 diagrams the field as `kind: u16, _pad: u16`; here the `u16` kind and
 /// its pad are folded into one 4-byte atomic word so the whole slot is built from
-/// uniform [`ShmU32`] atoms (the `shm-core` placed-by-hand convention) — the
-/// on-shm size (20 B) and the logical field set are unchanged.
+/// uniform [`ShmU32`] atoms (the `shm-core` placed-by-hand convention).
+///
+/// ADR-0008 P0.1 grew the slot 20 B → 28 B (`gen` + `next_free`). `next_free`
+/// is only meaningful while the slot sits on the free list, so it *could*
+/// overlay a word that is dead in that state (`head_off`, say) and keep the
+/// slot at 24 B — rejected deliberately: [`find_live_by_key`] reads only
+/// `state` and (short-circuited) `key_id` per slot, so with sub-line slots
+/// either layout touches essentially the same cache lines and the 4 bytes buy
+/// ~14% fewer lines over a full scan of a large catalog — while the overlay
+/// couples the free-list handshake to which fields `publish_slot` happens to
+/// rewrite. Not worth it at any plausible `store_capacity`.
 #[repr(C)]
 pub struct CatalogSlot {
     /// Coordinator-interned key id (`0` = none / raw).
@@ -107,9 +161,16 @@ pub struct CatalogSlot {
     pub kind: ShmU32,
     /// Lifecycle state; the single CAS gate publishing/retiring the slot.
     pub state: ShmU32,
+    /// The incarnation the **next** occupant of this slot will be stamped with
+    /// (ADR-0008 P0.1). Advanced by each reclaim, so no two occupants of one
+    /// slot ever share an incarnation.
+    pub gen: ShmU32,
+    /// Free-list link while this slot is [`SLOT_FREE`] and on the list;
+    /// [`FREE_NIL`] terminates. Meaningless in any other state.
+    pub next_free: ShmU32,
 }
 
-const _: () = assert!(core::mem::size_of::<CatalogSlot>() == 20);
+const _: () = assert!(core::mem::size_of::<CatalogSlot>() == 28);
 const _: () = assert!(core::mem::align_of::<CatalogSlot>() == 4);
 
 impl CatalogSlot {
@@ -156,6 +217,12 @@ impl CatalogSlot {
         self.kind.store(u32::from(kind.as_u16()), Release);
     }
 
+    /// The incarnation the next occupant of this slot will carry.
+    #[inline]
+    pub fn gen(&self) -> u32 {
+        self.gen.load(Acquire)
+    }
+
     /// Publish the slot: CAS `state` `FREE → LIVE`. `true` iff this caller won.
     #[inline]
     pub fn publish(&self) -> bool {
@@ -173,6 +240,50 @@ impl CatalogSlot {
             .compare_exchange(SLOT_LIVE, SLOT_TOMBSTONE, AcqRel, Acquire)
             .is_ok()
     }
+
+    /// Undo a tombstone that turns out to have hit the wrong occupant: CAS
+    /// `state` `TOMBSTONE → LIVE`. `true` iff this caller performed the
+    /// transition; `false` means a sweep already took the slot (`RECLAIMING`,
+    /// or beyond) and the caller must re-observe [`state`](Self::state).
+    ///
+    /// Only the evictor that *won* the tombstone CAS and then found the
+    /// occupant changed underneath it (`gen`/`key_id` no longer what it scanned
+    /// — see `KeyedStore::evict`) may call this.
+    #[inline]
+    pub(crate) fn untombstone(&self) -> bool {
+        self.state
+            .compare_exchange(SLOT_TOMBSTONE, SLOT_LIVE, AcqRel, Acquire)
+            .is_ok()
+    }
+
+    /// Take exclusive ownership for a sweep: CAS `state` `TOMBSTONE → RECLAIMING`.
+    /// `true` iff this caller won and must now either
+    /// [`finish_reclaim`](Self::finish_reclaim) or [`abort_reclaim`](Self::abort_reclaim).
+    #[inline]
+    fn begin_reclaim(&self) -> bool {
+        self.state
+            .compare_exchange(SLOT_TOMBSTONE, SLOT_RECLAIMING, AcqRel, Acquire)
+            .is_ok()
+    }
+
+    /// Give the slot back to the tombstone pool: the entry was not quiescent, so
+    /// a later sweep must try again.
+    #[inline]
+    fn abort_reclaim(&self) {
+        self.state.store(SLOT_TOMBSTONE, Release);
+    }
+
+    /// Clear the slot's fields and advance `gen`, returning the incarnation the
+    /// next occupant will carry — or `None` if `gen` would wrap, in which case
+    /// the slot stays `RECLAIMING` **forever** rather than risking a reused
+    /// incarnation. The caller stores `FREE` only on `Some`.
+    #[inline]
+    fn finish_reclaim(&self) -> Option<u32> {
+        let next = self.gen.load(Acquire).checked_add(1)?;
+        self.key_id.store(0, Release);
+        self.gen.store(next, Release);
+        Some(next)
+    }
 }
 
 /// On-segment catalog header (placed at the payload base).
@@ -183,12 +294,16 @@ struct CatalogHeader {
     next_slot: ShmU32,
     head_stride: ShmU32,
     artifact_id_base: ShmU32,
+    /// ABA-safe Treiber head over reclaimed slots: `{tag:32 | idx:32}`,
+    /// `idx == FREE_NIL` when empty (ADR-0008 P0.1).
+    free_head: ShmU64,
 }
 
 /// Byte offset of the slot array within the catalog segment payload.
 #[inline]
 const fn slots_offset() -> usize {
-    // Header is 8+4+4+4+4 = 24 bytes; `CatalogSlot` needs 4-byte alignment.
+    // `CatalogSlot` needs 4-byte alignment; the header is 8-aligned and its own
+    // size already rounds to that, so this only guards a future field edit.
     let hdr = core::mem::size_of::<CatalogHeader>();
     (hdr + 3) & !3
 }
@@ -249,6 +364,7 @@ impl<'s> Catalog<'s> {
                 next_slot: ShmU32::new(0),
                 head_stride: ShmU32::new(head_stride),
                 artifact_id_base: ShmU32::new(artifact_id_base),
+                free_head: ShmU64::new(pack_free_head(FREE_NIL, 0)),
             });
             let slots = base.add(slots_offset()).cast::<CatalogSlot>();
             for i in 0..capacity as usize {
@@ -258,6 +374,8 @@ impl<'s> Catalog<'s> {
                     head_off: ShmU32::new(0),
                     kind: ShmU32::new(0),
                     state: ShmU32::new(SLOT_FREE),
+                    gen: ShmU32::new(FIRST_GEN),
+                    next_free: ShmU32::new(FREE_NIL),
                 });
             }
         }
@@ -308,8 +426,9 @@ impl<'s> Catalog<'s> {
         self.header().artifact_id_base.load(Acquire)
     }
 
-    /// The number of slots appended so far (`>= ` the live entry count, since a
-    /// tombstoned slot is never reused).
+    /// The append **high-water mark**: how far `next_slot` ever advanced. Bounds
+    /// every scan over the table. Reclaimed slots are recycled below it rather
+    /// than growing it, so under steady churn this stops rising.
     #[inline]
     pub fn next_slot(&self) -> u32 {
         self.header().next_slot.load(Acquire)
@@ -323,14 +442,105 @@ impl<'s> Catalog<'s> {
         unsafe { &*self.slots.add(idx as usize) }
     }
 
-    /// Claim the next append-only slot index, or [`Error::CatalogFull`] once the
-    /// fixed table is exhausted.
+    /// Claim a slot index the caller exclusively owns: pop a reclaimed one,
+    /// else bump the append high-water mark. [`Error::CatalogFull`] once neither
+    /// can supply one.
+    ///
+    /// The free list is tried **first** so a store under steady create/evict
+    /// churn stops growing `next_slot` at all — which is the property that keeps
+    /// [`find_live_by_key`](Self::find_live_by_key)'s scan bounded. An un-churned
+    /// store never touches the list and behaves exactly as the append-only
+    /// version did.
     pub fn alloc_slot(&self) -> Result<u32> {
+        if let Some(idx) = self.pop_free() {
+            return Ok(idx);
+        }
         let idx = self.header().next_slot.fetch_add(1, AcqRel);
         if idx as usize >= self.capacity {
+            // Undo the bump so a full catalog does not run `next_slot` away from
+            // the high-water mark it is supposed to record.
+            self.header().next_slot.fetch_sub(1, AcqRel);
             return Err(Error::CatalogFull(self.capacity as u32));
         }
         Ok(idx)
+    }
+
+    /// Pop a reclaimed slot off the free list. Delegates to the loom-checked
+    /// [`treiber_pop`](shm_core::pool::treiber_pop) `shm-core` uses for its
+    /// chunk free lists (the ABA-safe `{tag:32 | idx:32}` CAS loop is
+    /// identical); the intrusive next-link lives in the slot's `next_free`.
+    fn pop_free(&self) -> Option<u32> {
+        shm_core::pool::treiber_pop(&self.header().free_head, |idx| {
+            self.slot(idx).next_free.load(Acquire)
+        })
+    }
+
+    /// Push a reclaimed slot onto the free list (the loom-checked
+    /// [`treiber_push`](shm_core::pool::treiber_push)). The caller must own
+    /// `idx` exclusively (it is `RECLAIMING`), so writing its link before the
+    /// head CAS publishes it is safe.
+    fn push_free(&self, idx: u32) {
+        shm_core::pool::treiber_push(&self.header().free_head, idx, |idx, next| {
+            self.slot(idx).next_free.store(next, Release);
+        });
+    }
+
+    /// Try to return one tombstoned slot to the free list.
+    ///
+    /// `quiescent` is asked **only** while this sweep holds the slot in
+    /// [`SLOT_RECLAIMING`], where no creator can allocate it — so a `true`
+    /// answer cannot be invalidated by a new occupant appearing underneath. It
+    /// receives the slot's `artifact_id`/`head_off` and must report whether that
+    /// entry still holds anything (a live version, a pin, a write lease); it may
+    /// also *drive* the entry toward quiescence first, as the store's predicate
+    /// does by re-running the teardown. The caller supplies it because the
+    /// catalog does not own the head segment.
+    ///
+    /// Returns `true` iff the slot was reclaimed. A slot whose `gen` would wrap
+    /// is deliberately **not** reclaimed and never will be: see the module doc.
+    pub fn try_reclaim<F>(&self, idx: u32, quiescent: F) -> bool
+    where
+        F: FnOnce(u32, u32) -> bool,
+    {
+        let slot = self.slot(idx);
+        if !slot.begin_reclaim() {
+            return false; // not tombstoned, or another sweep owns it
+        }
+        if !quiescent(slot.artifact_id(), slot.head_off()) {
+            slot.abort_reclaim();
+            return false;
+        }
+        match slot.finish_reclaim() {
+            Some(_) => {
+                slot.state.store(SLOT_FREE, Release);
+                self.push_free(idx);
+                true
+            }
+            None => {
+                // `gen` exhausted: leave the slot in RECLAIMING forever rather
+                // than hand a future occupant a recycled incarnation.
+                false
+            }
+        }
+    }
+
+    /// Sweep every appended slot, reclaiming each tombstone whose entry
+    /// `quiescent` reports finished. Returns how many slots were freed.
+    ///
+    /// Driven from the coordinator's existing lease-monitor tick: no new thread,
+    /// no new timer. `evict` attempts its own slot inline first, so this only
+    /// ever picks up entries that were still busy at eviction time.
+    pub fn reclaim_tombstones<F>(&self, mut quiescent: F) -> usize
+    where
+        F: FnMut(u32, u32) -> bool,
+    {
+        let n = self.next_slot().min(self.capacity as u32);
+        (0..n)
+            .filter(|&idx| {
+                self.slot(idx).state() == SLOT_TOMBSTONE
+                    && self.try_reclaim(idx, &mut quiescent)
+            })
+            .count()
     }
 
     /// The `head_off` for slot `idx` (`idx * head_stride`).
@@ -479,6 +689,62 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_recycles_the_index_and_advances_the_incarnation() {
+        let base = 73_000 + (std::process::id() & 0x3ff);
+        let seg = catalog_seg(base, 4);
+        let cat = Catalog::init(&seg, 4, 2048, 1 << 28).expect("init");
+
+        let i0 = cat.alloc_slot().unwrap();
+        let gen0 = cat.slot(i0).gen();
+        cat.publish_slot(i0, 100, RefKind::Dataset);
+        assert!(cat.slot(i0).tombstone());
+
+        // A busy entry is refused and left exactly as it was found.
+        assert!(!cat.try_reclaim(i0, |_, _| false));
+        assert_eq!(cat.slot(i0).state(), SLOT_TOMBSTONE);
+        assert_eq!(cat.slot(i0).gen(), gen0, "an aborted sweep advances nothing");
+
+        // A finished one comes back with the next incarnation staged.
+        assert!(cat.try_reclaim(i0, |_, _| true));
+        assert_eq!(cat.slot(i0).state(), SLOT_FREE);
+        assert_eq!(cat.slot(i0).gen(), gen0 + 1);
+        assert_eq!(cat.slot(i0).key_id(), 0, "the recycled slot forgets its key");
+
+        // The next allocation reuses the index instead of growing the table.
+        let i1 = cat.alloc_slot().unwrap();
+        assert_eq!(i1, i0, "the free list is preferred over the high-water bump");
+        assert_eq!(cat.next_slot(), 1, "and the high-water mark did not move");
+
+        seg.unlink().ok();
+    }
+
+    #[test]
+    fn a_slot_whose_incarnation_would_wrap_is_retired_forever() {
+        let base = 74_000 + (std::process::id() & 0x3ff);
+        let seg = catalog_seg(base, 2);
+        let cat = Catalog::init(&seg, 2, 2048, 1 << 28).expect("init");
+
+        let idx = cat.alloc_slot().unwrap();
+        cat.publish_slot(idx, 1, RefKind::Dataset);
+        assert!(cat.slot(idx).tombstone());
+        // Jump `gen` to the last value it can hold.
+        cat.slot(idx).gen.store(u32::MAX, Release);
+
+        assert!(
+            !cat.try_reclaim(idx, |_, _| true),
+            "a quiescent slot is still refused when its incarnation cannot advance"
+        );
+        assert_eq!(
+            cat.slot(idx).state(),
+            SLOT_RECLAIMING,
+            "it is parked, not returned: one slot lost beats a reused incarnation"
+        );
+        assert_eq!(cat.alloc_slot().unwrap(), 1, "the free list stayed empty");
+
+        seg.unlink().ok();
+    }
+
+    #[test]
     fn alloc_slot_exhausts_cleanly() {
         let base = 72_000 + (std::process::id() & 0x3ff);
         let seg = catalog_seg(base, 2);
@@ -486,6 +752,11 @@ mod tests {
         assert_eq!(cat.alloc_slot().unwrap(), 0);
         assert_eq!(cat.alloc_slot().unwrap(), 1);
         assert!(matches!(cat.alloc_slot(), Err(Error::CatalogFull(2))));
+        assert_eq!(
+            cat.next_slot(),
+            2,
+            "a refused allocation leaves the high-water mark at capacity"
+        );
         seg.unlink().ok();
     }
 }

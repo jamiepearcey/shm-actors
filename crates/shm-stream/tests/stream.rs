@@ -210,19 +210,29 @@ fn append_shares_prior_chunk() {
 
     let pin_v2 = art.pin().unwrap();
     assert_eq!(pin_v2.version(), 2);
-    assert_eq!(pin_v2.manifest().chunks.len(), 2);
-    // v2's first chunk IS v1's chunk (shared, not copied).
-    assert_eq!(
-        pin_v2.manifest().chunks[0],
-        v1_chunk,
-        "v2 must share v1's chunk"
-    );
+    // v2's manifest lists only the staged chunk and links to v1's manifest
+    // (ADR-0013); the table is the chain, and its first chunk IS v1's chunk
+    // (shared through the link, not copied).
+    assert_eq!(pin_v2.manifest().chunks.len(), 1);
+    assert_eq!(pin_v2.manifest().prev.map(|l| l.version), Some(1));
+    let table = pin_v2.data_chunks().unwrap();
+    assert_eq!(table.len(), 2);
+    assert_eq!(table[0], v1_chunk, "v2 must share v1's chunk");
     assert_eq!(col(&pin_v2.as_arrow(&reg).unwrap()), vec![1, 2, 3, 4, 5]);
 
-    // The shared chunk is PUBLISHED and referenced by both live versions.
+    // The shared chunk is PUBLISHED, referenced once (by the one manifest that
+    // lists it); v1's manifest is what carries two references — v1's own and
+    // v2's link.
     let pool = Pool::attach(&fx.data_seg).unwrap();
     assert_eq!(pool.ctrl(&v1_chunk).unwrap().state(), PUBLISHED);
-    assert_eq!(pool.ctrl(&v1_chunk).unwrap().refcount(), 2);
+    assert_eq!(pool.ctrl(&v1_chunk).unwrap().refcount(), 1);
+    let v1_link = pin_v2.manifest().prev.unwrap();
+    let v1_manifest = shm_core::ChunkDesc {
+        segment_id: v1_link.mref.segment_id(),
+        offset: v1_link.mref.offset(),
+        ..shm_core::ChunkDesc::ZERO
+    };
+    assert_eq!(pool.ctrl(&v1_manifest).unwrap().refcount(), 2);
 }
 
 /// Replace mode: the committed version contains ONLY the staged batches.

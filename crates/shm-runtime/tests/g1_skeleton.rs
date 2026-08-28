@@ -217,10 +217,10 @@ fn g1_crash_reclaim_same_process_deterministic() {
     worker_a.start_heartbeat(Duration::from_millis(150));
     worker_a.open_store().unwrap();
     worker_a.open_task_queue().unwrap();
-    let claimed = {
-        let tq = worker_a.task_queue().unwrap();
-        tq.claim(CLAIM_LEASE).expect("task queued")
-    };
+    // The claim borrows the queue handle (a `ClaimedTask<'q>`), so the handle
+    // must outlive it — it cannot be dropped at the end of an inner block.
+    let tq = worker_a.task_queue().unwrap();
+    let claimed = tq.claim(CLAIM_LEASE).expect("task queued");
     let a_tref = worker_a.task_ref(&claimed).unwrap();
     worker_a.resolve_schema(a_tref.schema_id).unwrap();
     let (_e, pin, batch) = worker_a
@@ -237,7 +237,9 @@ fn g1_crash_reclaim_same_process_deterministic() {
     // claim without completing (its lease will lapse → requeue).
     std::mem::forget(pin);
     drop(batch);
-    drop(claimed);
+    // `ClaimedTask<'q>` has no drop glue now that it borrows the queue (ADR-0012);
+    // abandoning the claim without completing it is the point of this step.
+    let _abandoned = claimed;
 
     // Drive the exact crash-reclaim: journal replay releases the leaked entry pin.
     coord

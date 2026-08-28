@@ -131,9 +131,11 @@ impl<'a> StreamWriter<'a> {
     /// - `registry` — the schema registry (seeded identically to any reader's,
     ///   per the v0.1 in-process contract).
     /// - `owner` — this writer's non-zero actor id (the loan/lease owner).
-    /// - `commit_kind` — [`Commit::Append`] (extend the table: `v(n+1)` = the
-    ///   retained prior chunks + the staged chunks) or [`Commit::Replace`]
-    ///   (supersede wholesale: `v(n+1)` = the staged chunks only).
+    /// - `commit_kind` — [`Commit::Append`] (extend the table: `v(n+1)`'s
+    ///   manifest lists the staged chunks and *links* to `v(n)`'s manifest, so
+    ///   the table is the chain — O(new data) per commit, ADR-0013) or
+    ///   [`Commit::Replace`] (supersede wholesale: `v(n+1)` = the staged chunks
+    ///   only, a new chain root).
     ///   [`Commit::Patch`] is rejected with [`Error::Unsupported`] (deferred to
     ///   v0.3) so no chunk is ever staged for a commit that cannot install.
     /// - `coordination` — [`Coordination::Exclusive`] takes the write lease now
@@ -276,12 +278,16 @@ impl<'a> StreamWriter<'a> {
     /// Install every staged chunk **atomically** as the next artifact version,
     /// consuming the transaction; returns the new version number.
     ///
-    /// For [`Commit::Append`] the new version extends the prior one (its manifest
-    /// is the prior version's retained chunks — reference-counted, shared, not
-    /// copied — followed by the staged chunks). For [`Commit::Replace`] the new
-    /// version's manifest is the staged chunks alone. The install is a single
-    /// linearising CAS in `shm-artifact`; readers only ever see version `n` then
-    /// version `n+1`, never a partial batch.
+    /// For [`Commit::Append`] the new version extends the prior one: its
+    /// manifest lists the staged chunks and carries one reference-counted link
+    /// to the prior version's manifest (ADR-0013 chained manifests) — nothing
+    /// prior is copied or re-listed, so the commit costs O(staged data)
+    /// regardless of the table's history; a reader walks the chain
+    /// ([`VersionPin::as_arrow_batches`](shm_artifact::VersionPin::as_arrow_batches)).
+    /// For [`Commit::Replace`] the new version's manifest is the staged chunks
+    /// alone (a new chain root). The install is a single linearising CAS in
+    /// `shm-artifact`; readers only ever see version `n` then version `n+1`,
+    /// never a partial batch.
     ///
     /// On success the staged chunks are handed to the new version (reclaimed
     /// thereafter by the artifact's pin/refcount rules) and this writer's journal

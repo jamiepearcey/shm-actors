@@ -399,12 +399,12 @@ fn journal_tagged_entries_roundtrip_all_kinds() {
     // WriteLease — item K adds the third).
     let c0 = jrn.record(mk_desc(64)).unwrap();
     let a0 = jrn
-        .record_artifact_pin(/*artifact_id*/ 7, /*version*/ 0x1_0000_0002)
+        .record_artifact_pin(/*artifact_id*/ 7, /*incarnation*/ 1, /*version*/ 0x1_0000_0002)
         .unwrap();
     let c1 = jrn.record(mk_desc(128)).unwrap();
-    let a1 = jrn.record_artifact_pin(42, 5).unwrap();
+    let a1 = jrn.record_artifact_pin(42, 1, 5).unwrap();
     let w0 = jrn
-        .record_write_lease(/*artifact_id*/ 9, /*fence*/ 3)
+        .record_write_lease(/*artifact_id*/ 9, /*incarnation*/ 1, /*fence*/ 3)
         .unwrap();
     assert_eq!(jrn.len(), 5);
     assert!(
@@ -418,23 +418,32 @@ fn journal_tagged_entries_roundtrip_all_kinds() {
     // Replay decodes each slot back into its typed record — including a large
     // (> 2^32) version, proving the u64 payload survives the u32-word packing.
     let mut chunks: Vec<u32> = Vec::new();
-    let mut arts: Vec<(u32, u64)> = Vec::new();
-    let mut leases: Vec<(u32, u32)> = Vec::new();
+    let mut arts: Vec<(u32, u32, u64)> = Vec::new();
+    let mut leases: Vec<(u32, u32, u32)> = Vec::new();
     for rec in jrn.replay() {
         match rec {
             JournalRecord::ChunkPin(d) => chunks.push(d.offset),
             JournalRecord::ArtifactPin {
                 artifact_id,
+                incarnation,
                 version,
-            } => arts.push((artifact_id, version)),
-            JournalRecord::WriteLease { artifact_id, fence } => leases.push((artifact_id, fence)),
+            } => arts.push((artifact_id, incarnation, version)),
+            JournalRecord::WriteLease {
+                artifact_id,
+                incarnation,
+                fence,
+            } => leases.push((artifact_id, incarnation, fence)),
         }
     }
     chunks.sort_unstable();
     arts.sort_unstable();
     assert_eq!(chunks, vec![64, 128]);
-    assert_eq!(arts, vec![(7, 0x1_0000_0002u64), (42, 5)]);
-    assert_eq!(leases, vec![(9, 3)], "the write-lease entry round-trips");
+    assert_eq!(arts, vec![(7, 1, 0x1_0000_0002u64), (42, 1, 5)]);
+    assert_eq!(
+        leases,
+        vec![(9, 1, 3)],
+        "the write-lease entry round-trips, incarnation included"
+    );
 
     // Releasing the write-lease slot frees it (proving record/release/replay
     // works for the new kind alongside the others): 5 → 4 entries, and no
@@ -459,7 +468,7 @@ fn journal_tagged_entries_roundtrip_all_kinds() {
     // JournalFull backpressure still applies once every slot is taken.
     jrn.release(a0).unwrap();
     assert_eq!(jrn.len(), 3);
-    while jrn.record_artifact_pin(1, 1).is_ok() {}
+    while jrn.record_artifact_pin(1, 1, 1).is_ok() {}
     assert!(matches!(jrn.record(mk_desc(1)), Err(Error::JournalFull)));
 
     // A second attached handle sees the identical tagged contents (POD in shm).
@@ -498,4 +507,41 @@ fn platform_create_attach_unlink_and_doorbell() {
     plat.doorbell_wait(b.as_raw_fd()).unwrap();
 
     assert_eq!(plat.death_detection(), shm_core::DeathDetection::LeaseBased);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0011 (Holon P0.4): adopted-fd segments are unnamed
+// ---------------------------------------------------------------------------
+
+/// An `SCM_RIGHTS` receiver's [`Segment::from_raw_fd`] handle must be UNNAMED:
+/// its `unlink` is a no-op and can never remove the creating process's
+/// namespace entry (before ADR-0011 it resolved and unlinked the creator's
+/// name). This is also the invariant memfd-backed segments rely on — they have
+/// no namespace entry at all.
+#[test]
+fn adopted_fd_segment_is_unnamed_and_unlink_is_a_noop() {
+    use std::os::fd::{BorrowedFd, IntoRawFd};
+
+    let id = uid();
+    let _ = Segment::attach(id).and_then(|s| s.unlink());
+    let seg = Segment::create(id, 8192).expect("segment create");
+
+    // Duplicate the fd exactly as an SCM_RIGHTS transfer would install it.
+    // SAFETY: `seg` keeps the fd open across the borrow.
+    let dup = unsafe { BorrowedFd::borrow_raw(seg.as_raw_fd()) }
+        .try_clone_to_owned()
+        .expect("dup segment fd");
+    // SAFETY: `dup` is a live, owned duplicate of a real segment fd whose
+    // ownership transfers into the adopted handle exactly once.
+    let adopted = unsafe { Segment::from_raw_fd(dup.into_raw_fd(), id) }.expect("adopt fd");
+    assert_eq!(adopted.id(), id);
+
+    // The adopted handle's unlink is a no-op...
+    adopted.unlink().expect("unnamed unlink must succeed as a no-op");
+    // ...so the creator's name must STILL resolve afterwards.
+    let reattach = Segment::attach(id)
+        .expect("the creator's shm name must survive an adopted handle's unlink");
+    drop(reattach);
+    drop(adopted);
+    seg.unlink().expect("creator unlink");
 }

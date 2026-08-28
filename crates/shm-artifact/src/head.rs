@@ -12,13 +12,30 @@ use core::sync::atomic::Ordering::{Acquire, SeqCst};
 use shm_core::substrate::fence;
 use shm_core::{ShmU32, ShmU64};
 
-/// Head magic: little-endian bytes of `b"SHMAHEA2"`.
+/// Head magic: little-endian bytes of `b"SHMAHEA3"`.
 ///
-/// Bumped from `SHMAHEAD` for the v0.3 / ADR-0003 item K layout change: the plain
-/// `writer_owner: AtomicU32` became a **fenced write lease** packed into one
-/// [`AtomicU64`](core::sync::atomic::AtomicU64) (`owner << 32 | fence`), which
-/// grows the region, so a v0.2 head is rejected by the magic check.
-pub const HEAD_MAGIC: u64 = u64::from_le_bytes(*b"SHMAHEA2");
+/// Bumped from `SHMAHEA2` for the Phase 0 / ADR-0008 layout change: the head
+/// gained an [`incarnation`](ArtifactHead::incarnation) word, so a head region
+/// can be **recycled** by the keyed store's catalog and a handle held across
+/// that recycle is detected rather than silently retargeted.
+///
+/// (`SHMAHEA2` itself replaced `SHMAHEAD` at v0.3 / ADR-0003 item K, when the
+/// plain `writer_owner: AtomicU32` became a fenced write lease packed into one
+/// [`AtomicU64`](core::sync::atomic::AtomicU64).)
+pub const HEAD_MAGIC: u64 = u64::from_le_bytes(*b"SHMAHEA3");
+
+/// Sentinel `incarnation` value meaning "this head is not in service": either
+/// never initialised, or **retired** by a catalog sweep that is returning its
+/// slot to the free list (ADR-0008 P0.1). Every operation validates the head's
+/// incarnation against the one its handle adopted, so an operation arriving
+/// against a retired — or already re-occupied — head fails
+/// [`Error::Stale`](crate::Error::Stale) instead of corrupting the new occupant.
+pub const NO_INCARNATION: u32 = 0;
+
+/// The incarnation stamped on a head that is created once and never recycled
+/// (every `Artifact::create`/`attach` artifact, as opposed to a keyed-store
+/// entry whose slot the catalog may reclaim).
+pub const FIRST_INCARNATION: u32 = 1;
 
 /// Sentinel `current` value meaning "no version has been committed yet".
 pub const NO_VERSION: u64 = 0;
@@ -162,6 +179,25 @@ impl PinSlot {
         self.pins.fetch_sub(1, SeqCst)
     }
 
+    /// Decrement the pin count **only if it is non-zero**, returning the
+    /// previous value; `None` if it was already zero. The guard for release
+    /// paths that cannot prove they hold a pin — a leaked-pin replay, a task
+    /// binding release — where an unconditional `fetch_sub` on a count that
+    /// another releaser already took to zero would free a version under a live
+    /// reader or wrap to `u32::MAX`.
+    pub fn try_unpin(&self) -> Option<u32> {
+        let mut cur = self.pins.load(SeqCst);
+        loop {
+            if cur == 0 {
+                return None;
+            }
+            match self.pins.compare_exchange(cur, cur - 1, SeqCst, SeqCst) {
+                Ok(prev) => return Some(prev),
+                Err(now) => cur = now,
+            }
+        }
+    }
+
     /// **Reclaimer, step 1 — elect + publish the hazard flag.** One `SeqCst` CAS
     /// `SLOT_LIVE → SLOT_FREEING`; `true` means this caller is the sole elected
     /// reclaimer and has published `FREEING` **before** the pin scan. Ordered
@@ -219,7 +255,16 @@ impl PinSlot {
 /// | `manifest_desc` | `AtomicU64`                 | packed [`PackedRef`](shm_core::PackedRef) to the current manifest |
 /// | `write_lease`   | `AtomicU64`                 | fenced exclusive lease `pack_lease(owner, fence)` (owner 0 = free) |
 /// | `schema_id`     | `AtomicU32`                 | interned Arrow schema id (informational) |
+/// | `incarnation`   | `AtomicU32`                 | occupant in service (0 = none; ADR-0008 P0.1) |
 /// | `pins`          | `[PinSlot; MAX_LIVE_VERSIONS]` | live-version pin table     |
+///
+/// `incarnation` (added at `SHMAHEA3`) fills the alignment padding that
+/// previously sat between `schema_id` and `pins`, so the head's size — and the
+/// keyed store's `head_stride` — did not change. It also lands on the same
+/// cache line as `current`/`manifest_desc`/`write_lease`, which is deliberate:
+/// every operation that re-validates it has just touched (or is about to touch)
+/// those words, so the check rides a line that is already resident, and the
+/// word itself is written only at commission/retire — never on the hot path.
 ///
 /// # Fenced write lease (ADR-0003 item K)
 ///
@@ -283,9 +328,24 @@ pub struct ArtifactHead {
     /// The interned Arrow schema id of the artifact's data (set on first commit;
     /// informational — the authoritative id is in each manifest).
     pub schema_id: ShmU32,
+    /// Which **occupant** of this head region is in service (ADR-0008 P0.1).
+    ///
+    /// [`NO_INCARNATION`] means the region is not in service. A handle adopts
+    /// this value when it attaches and re-validates it on every operation, which
+    /// is what makes a head region safe to recycle: see
+    /// [`is_incarnation`](Self::is_incarnation).
+    pub incarnation: ShmU32,
     /// Fixed table of live-version pin counters for reclamation.
     pub pins: [PinSlot; MAX_LIVE_VERSIONS],
 }
+
+// Frozen ABI: the `SHMAHEA3` incarnation word occupies what was padding at
+// `SHMAHEA2`, so the head's size (and the keyed store's 64-byte-rounded
+// `head_stride`) is unchanged. Gated on `not(loom)` like the `PinSlot` asserts.
+#[cfg(not(loom))]
+const _: () = assert!(
+    core::mem::size_of::<ArtifactHead>() == 40 + MAX_LIVE_VERSIONS * core::mem::size_of::<PinSlot>()
+);
 
 impl ArtifactHead {
     /// The number of payload bytes an [`ArtifactHead`] occupies. A management
@@ -308,6 +368,7 @@ impl ArtifactHead {
             manifest_desc: ShmU64::new(0),
             write_lease: ShmU64::new(pack_lease(OWNER_NONE, 0)),
             schema_id: ShmU32::new(0),
+            incarnation: ShmU32::new(NO_INCARNATION),
             pins: core::array::from_fn(|_| PinSlot {
                 version: ShmU64::new(0),
                 manifest: ShmU64::new(0),
@@ -340,6 +401,122 @@ impl ArtifactHead {
         self.magic.load(Ordering::Acquire) == HEAD_MAGIC
     }
 
+    /// The occupant currently in service ([`NO_INCARNATION`] if none).
+    #[inline]
+    pub fn incarnation(&self) -> u32 {
+        self.incarnation.load(Ordering::Acquire)
+    }
+
+    /// **Reader/writer half of the recycle handshake.** Is `expected` still the
+    /// occupant in service?
+    ///
+    /// The load is `SeqCst` because it is the second half of a Dekker pairing
+    /// with [`retire`](Self::retire): an operation *registers itself first*
+    /// (publishes a pin, claims a version slot, takes the write lease) and only
+    /// then calls this. A sweep reclaiming the region swaps in
+    /// [`NO_INCARNATION`] `SeqCst` and only then scans for registrations. So
+    /// for any operation and any sweep, either the sweep observes the
+    /// registration and aborts, or the operation observes the retirement and
+    /// backs out — never both missing.
+    ///
+    /// The pairing needs all four accesses in the `SeqCst` total order, which
+    /// is why the registering *writes* are `SeqCst` RMWs
+    /// ([`PinSlot::publish_pin`], [`claim_slot`](Self::claim_slot),
+    /// [`acquire_write_lease`](Self::acquire_write_lease)) and the sweep's
+    /// quiescence loads ([`is_quiescent`](Self::is_quiescent)) are `SeqCst`
+    /// too: an `AcqRel` registration followed by this `SeqCst` load is *not*
+    /// enough — the model lets the sweep's scan miss the registration while
+    /// the registration's thread misses the retirement.
+    ///
+    /// As with the pin hazard handshake, each side additionally carries an
+    /// explicit `fence(SeqCst)` between its store and its load — the
+    /// StoreLoad barrier loom needs to model the total order (see [`fence`]).
+    /// On the pin path that fence is the one already inside
+    /// [`PinSlot::accept_pin`], so `pin_inner` calls this method bare; every
+    /// other operation revalidates through
+    /// [`revalidate_incarnation`](Self::revalidate_incarnation), which fences
+    /// first, and the sweep scans through [`is_quiescent`](Self::is_quiescent),
+    /// which does the same.
+    #[inline]
+    pub fn is_incarnation(&self, expected: u32) -> bool {
+        self.incarnation.load(SeqCst) == expected
+    }
+
+    /// **Operation half of the recycle handshake, fenced.** Like
+    /// [`is_incarnation`](Self::is_incarnation), but opens with a
+    /// `fence(SeqCst)` — the StoreLoad barrier between the caller's
+    /// *registration* RMW (a slot claim, a lease acquire) and this load,
+    /// mirroring [`PinSlot::accept_pin`]'s fence on the pin path (see
+    /// [`fence`] for why it is explicit). Use this at every
+    /// register-then-revalidate site whose registration does not already sit
+    /// behind such a fence.
+    #[inline]
+    pub fn revalidate_incarnation(&self, expected: u32) -> bool {
+        fence(SeqCst);
+        self.is_incarnation(expected)
+    }
+
+    /// **Sweep half of the recycle handshake.** Take the region out of service,
+    /// returning the incarnation that was in it.
+    ///
+    /// `SeqCst`, and ordered *before* the sweep's quiescence scan — see
+    /// [`is_incarnation`](Self::is_incarnation).
+    #[inline]
+    pub fn retire(&self) -> u32 {
+        self.incarnation.swap(NO_INCARNATION, SeqCst)
+    }
+
+    /// **Sweep half of the recycle handshake, step 2 — the quiescence scan.**
+    /// `true` iff the head holds nothing a reclaimer would destroy: no current
+    /// version, every pin slot `SLOT_FREE` with a zero pin count, and the
+    /// write lease unowned.
+    ///
+    /// Must be called *after* [`retire`](Self::retire). Opens with a
+    /// `fence(SeqCst)`: the StoreLoad barrier between the retire swap and
+    /// these loads (the sweep's mirror of [`revalidate_incarnation`](Self::revalidate_incarnation)
+    /// — see [`fence`]). Every load is `SeqCst`, each pairing against one
+    /// registration RMW: `publish_pin` for the pin counts, `claim_slot` for
+    /// the slot states, `acquire_write_lease` for the lease — so none of them
+    /// may be weakened (see [`is_incarnation`](Self::is_incarnation) for the
+    /// Dekker argument).
+    pub fn is_quiescent(&self) -> bool {
+        fence(SeqCst);
+        if self.current.load(SeqCst) != NO_VERSION {
+            return false;
+        }
+        if lease_owner(self.write_lease.load(SeqCst)) != OWNER_NONE {
+            return false;
+        }
+        self.pins
+            .iter()
+            .all(|s| s.state.load(SeqCst) == SLOT_FREE && s.pin_scan() == 0)
+    }
+
+    /// Put the region into service as `incarnation`. Called last by a create, so
+    /// it is the release edge publishing the freshly initialised head.
+    #[inline]
+    pub fn commission(&self, incarnation: u32) {
+        self.incarnation.store(incarnation, Ordering::Release);
+    }
+
+    /// Find the [`SLOT_LIVE`] slot tracking `version` **whose manifest is
+    /// `manifest_bits`** — the endorsed slot. Two optimistic committers can
+    /// transiently claim duplicate slots for one version; only the one the
+    /// install CAS endorsed (its manifest was `head.manifest_desc`) owns that
+    /// version's references. Retiring "the first slot with this version" could
+    /// retire a stale duplicate and strand the real one (ADR-0013 review F3).
+    pub fn find_slot_with_manifest(&self, version: u64, manifest_bits: u64) -> Option<usize> {
+        for (i, slot) in self.pins.iter().enumerate() {
+            if slot.state.load(Ordering::Acquire) == SLOT_LIVE
+                && slot.version.load(Ordering::Acquire) == version
+                && slot.manifest.load(Ordering::Acquire) == manifest_bits
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     /// Find the index of the [`SLOT_LIVE`] slot tracking `version`, if any.
     pub fn find_slot(&self, version: u64) -> Option<usize> {
         for (i, slot) in self.pins.iter().enumerate() {
@@ -369,11 +546,19 @@ impl ArtifactHead {
     /// globally balanced, never-negative sum across reuse — a transient stale
     /// bump merely defers a retire (self-healed when that reader's `fetch_sub`
     /// re-runs it), and a freshly initialised slot already reads `0`.
+    ///
+    /// The winning CAS is `SeqCst` because it doubles as the **committer's
+    /// registration** in the ADR-0008 recycle handshake: the commit re-validates
+    /// the incarnation *after* this claim, and the Dekker pairing against the
+    /// sweep's `retire`-then-scan only holds if the registering write itself
+    /// participates in the `SeqCst` total order (an `AcqRel` claim and a `SeqCst`
+    /// incarnation load can otherwise both miss the sweep). Same cost on
+    /// x86-64/aarch64 as `AcqRel`.
     pub fn claim_slot(&self, version: u64, manifest: u64) -> Option<usize> {
         for (i, slot) in self.pins.iter().enumerate() {
             if slot
                 .state
-                .compare_exchange(SLOT_FREE, SLOT_LIVE, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(SLOT_FREE, SLOT_LIVE, SeqCst, Ordering::Acquire)
                 .is_ok()
             {
                 slot.manifest.store(manifest, Ordering::Release);
@@ -392,12 +577,16 @@ impl ArtifactHead {
     ///
     /// A single CAS transitions a free lease `{OWNER_NONE, fence}` to
     /// `{owner, fence}` **without changing the fence** — so the returned token is
-    /// exactly the fence a matching release will later advance past. The CAS uses
-    /// `AcqRel` on success (publishing the acquisition and synchronising with the
-    /// prior releaser's `Release`) and `Acquire` on failure (to re-read a fresh
-    /// value). A spurious CAS failure with the lease still free (a concurrent
-    /// release bumped the fence) simply retries under the new fence; a failure
-    /// with a live owner returns `None`.
+    /// exactly the fence a matching release will later advance past. The CAS is
+    /// `SeqCst` on success: besides publishing the acquisition (and
+    /// synchronising with the prior releaser's `Release`), it is the **writer's
+    /// registration** in the ADR-0008 recycle handshake — `open_exclusive*`
+    /// re-validates the incarnation *after* it, and the Dekker pairing against
+    /// the sweep's `retire`-then-scan needs the registering write in the
+    /// `SeqCst` total order (same cost as `AcqRel` on x86-64/aarch64). Failure
+    /// is `Acquire` (to re-read a fresh value). A spurious CAS failure with the
+    /// lease still free (a concurrent release bumped the fence) simply retries
+    /// under the new fence; a failure with a live owner returns `None`.
     pub fn acquire_write_lease(&self, owner: u32) -> Option<u32> {
         loop {
             let cur = self.write_lease.load(Ordering::Acquire);
@@ -408,7 +597,7 @@ impl ArtifactHead {
             match self.write_lease.compare_exchange(
                 cur,
                 pack_lease(owner, fence),
-                Ordering::AcqRel,
+                SeqCst,
                 Ordering::Acquire,
             ) {
                 Ok(_) => return Some(fence),

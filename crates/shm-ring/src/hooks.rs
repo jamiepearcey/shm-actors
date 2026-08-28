@@ -125,3 +125,131 @@ impl Parker for DoorbellParker {
         let _ = shm_core::doorbell_park(self.read.as_raw_fd(), self.timeout);
     }
 }
+
+// ---- ADR-0011 (Holon P0.4) futex-backed hooks — Linux only ----
+//
+// The futex doorbell of record for the ABI-reserved `RingHeader.doorbell_seq`
+// word (and `shm-task`'s identically reserved twin). Unlike the pipe doorbell
+// there is no fd to grant: the wake word rides inside the already-mapped ring
+// region, so a notify is one `fetch_add` + one `FUTEX_WAKE` and a park is one
+// `FUTEX_WAIT` — no descriptor plumbing at all.
+//
+// Liveness argument (same shape as the pipe parker's): `recv` registers as a
+// waiter and re-checks the ring BEFORE parking. A publish that lands entirely
+// between that re-check and the parker's own seq load makes the parker wait on
+// the *new* seq value — a missed wake — which the bounded timeout recovers: the
+// parker returns at worst one timeout later and `recv` observes the advanced
+// head. A publish that lands after the seq load fails the futex value check
+// (`EAGAIN`) or wakes the waiter; either way no wake is lost. A two-phase
+// prepare/park API that closes the window entirely is deliberately deferred to
+// Holon Phase 1's mailbox work (ACTOR-FRAMEWORK-DESIGN §5) — it would need a
+// new `Parker` contract and the pipe parker already documents this exact
+// bounded-recovery trade.
+
+#[cfg(target_os = "linux")]
+mod futex_hooks {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use super::{Notifier, Parker, DEFAULT_DOORBELL_TIMEOUT};
+
+    /// A [`Notifier`] that bumps a shared futex word and `FUTEX_WAKE`s every
+    /// waiter parked on it (Linux only; ADR-0011).
+    ///
+    /// Holds a raw pointer into the mapped region (like
+    /// [`DoorbellNotifier`](super::DoorbellNotifier) holds a borrowed fd) so a
+    /// wait-free publisher can carry it inline as a `Copy` value.
+    #[derive(Clone, Copy, Debug)]
+    pub struct FutexNotifier {
+        word: *const AtomicU32,
+    }
+
+    // SAFETY: the pointer targets an atomic in a `MAP_SHARED` mapping the
+    // constructor's contract keeps alive; all access is atomic.
+    unsafe impl Send for FutexNotifier {}
+    // SAFETY: as above — shared access is atomic-only.
+    unsafe impl Sync for FutexNotifier {}
+
+    impl FutexNotifier {
+        /// Wrap a ring's doorbell word (e.g.
+        /// [`Ring::doorbell_word`](crate::Ring::doorbell_word)).
+        ///
+        /// # Safety
+        ///
+        /// The mapping containing `word` must stay mapped for the notifier's
+        /// entire lifetime (the notifier holds a raw pointer to it).
+        pub unsafe fn new(word: &AtomicU32) -> FutexNotifier {
+            FutexNotifier { word }
+        }
+    }
+
+    impl Notifier for FutexNotifier {
+        fn notify(&self) {
+            // SAFETY: constructor contract — the mapping outlives `self`.
+            let word = unsafe { &*self.word };
+            word.fetch_add(1, Ordering::Release);
+            // Best-effort broadcast: a failed wake must never fail a publish (a
+            // dropped wakeup is bounded-recovered by the parker's timeout).
+            let _ = shm_core::futex_wake(word, i32::MAX);
+        }
+    }
+
+    /// A [`Parker`] that `FUTEX_WAIT`s on a shared doorbell word with a bounded
+    /// timeout (Linux only; ADR-0011).
+    ///
+    /// Reads the word, then waits only while it still holds that value: a
+    /// notify between the read and the wait fails the kernel's value check and
+    /// returns immediately. The bounded timeout covers the one remaining miss
+    /// window (a notify completing entirely before the read) — see the module
+    /// note above.
+    #[derive(Clone, Copy, Debug)]
+    pub struct FutexParker {
+        word: *const AtomicU32,
+        timeout: Duration,
+    }
+
+    // SAFETY: as for `FutexNotifier` — atomic-only access to a mapping the
+    // constructor's contract keeps alive.
+    unsafe impl Send for FutexParker {}
+    // SAFETY: as above.
+    unsafe impl Sync for FutexParker {}
+
+    impl FutexParker {
+        /// Park on a doorbell word with the [`DEFAULT_DOORBELL_TIMEOUT`].
+        ///
+        /// # Safety
+        ///
+        /// The mapping containing `word` must stay mapped for the parker's
+        /// entire lifetime (the parker holds a raw pointer to it).
+        pub unsafe fn new(word: &AtomicU32) -> FutexParker {
+            FutexParker {
+                word,
+                timeout: DEFAULT_DOORBELL_TIMEOUT,
+            }
+        }
+
+        /// Park on a doorbell word with a custom bounded timeout.
+        ///
+        /// # Safety
+        ///
+        /// As for [`FutexParker::new`].
+        pub unsafe fn with_timeout(word: &AtomicU32, timeout: Duration) -> FutexParker {
+            FutexParker { word, timeout }
+        }
+    }
+
+    impl Parker for FutexParker {
+        fn park(&self) {
+            // SAFETY: constructor contract — the mapping outlives `self`.
+            let word = unsafe { &*self.word };
+            let observed = word.load(Ordering::Acquire);
+            // Wake/timeout/mismatch are all treated alike: the caller (`recv`)
+            // re-checks the ring either way, and an error degrades to the
+            // bounded-timeout re-check — same contract as `DoorbellParker`.
+            let _ = shm_core::futex_wait(word, observed, Some(self.timeout));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use futex_hooks::{FutexNotifier, FutexParker};

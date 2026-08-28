@@ -31,6 +31,8 @@ pub mod desc;
 pub mod error;
 pub mod journal;
 pub mod platform;
+#[cfg(target_os = "linux")]
+pub mod platform_linux;
 pub mod pod;
 pub mod pool;
 pub mod segment;
@@ -47,6 +49,21 @@ pub use platform::{
     doorbell_pair, doorbell_park, doorbell_ring, DeathDetection, DoorbellPair, Platform,
     PosixPlatform,
 };
+#[cfg(target_os = "linux")]
+pub use platform_linux::{
+    futex_wait, futex_wake, monotonic_now_nanos, pidfd_open, socket_peer_pid, LinuxPlatform,
+};
+
+/// The best [`Platform`] for the OS this build targets (ADR-0011): the Linux
+/// fast-path platform on Linux, the POSIX baseline everywhere else. Code that
+/// wants the fast paths without a cfg of its own instantiates this alias.
+#[cfg(target_os = "linux")]
+pub type NativePlatform = platform_linux::LinuxPlatform;
+/// The best [`Platform`] for the OS this build targets (ADR-0011): the Linux
+/// fast-path platform on Linux, the POSIX baseline everywhere else. Code that
+/// wants the fast paths without a cfg of its own instantiates this alias.
+#[cfg(not(target_os = "linux"))]
+pub type NativePlatform = platform::PosixPlatform;
 pub use pod::SharedPod;
 pub use pool::{Pool, PoolConfig, SizeClass};
 pub use segment::{Segment, SegmentHeader, LAYOUT_VERSION, SEGMENT_MAGIC};

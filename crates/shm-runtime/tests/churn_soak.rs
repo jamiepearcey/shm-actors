@@ -202,9 +202,19 @@ fn churn_soak_no_leak() {
     // --- Quiescence: stop all churn, let every crashed worker's lease lapse and
     //     its journal replay, then census. The pool must return to the one-live-
     //     version baseline: any un-reclaimed chunk / leaked pin / stuck lease's
-    //     staged chunks would leave `free` below it forever. ---
+    //     staged chunks would leave `free` below it forever.
+    //
+    //     The churn mix includes `Append` (ADR-0013), so the version the churn
+    //     left current may head a manifest *chain* whose members are all
+    //     legitimately live. The survivor's clean `Replace` supersedes it, and
+    //     this census is therefore also the retire cascade's census: the whole
+    //     chain — every member's data + manifest chunk and every link — must
+    //     come back. A stale `expect` (a worker's last commit landing late) is
+    //     just retried by the poll. ---
     drop(workers);
     let recovered = wait_until(Duration::from_secs(15), || {
+        let current = coord.artifact_current_version(CHURN_ARTIFACT).unwrap_or(0);
+        let _ = commit_one(&survivor, current);
         coord.artifact_free_total(CHURN_ARTIFACT) == Some(baseline)
     });
     let final_free = coord.artifact_free_total(CHURN_ARTIFACT).unwrap_or(0);
@@ -242,9 +252,18 @@ fn churn_soak_no_leak() {
         current + 1,
         "the artifact still installs clean versions after the soak"
     );
-    assert_eq!(
-        coord.artifact_free_total(CHURN_ARTIFACT),
-        Some(baseline),
-        "the clean post-soak version has the same one-version footprint (still zero leak)"
+    // Retiring the predecessor is *deferred*, not synchronous: the install only
+    // reclaims it if it is unpinned at that instant, and otherwise leaves the
+    // retire to the pin-drop that follows. So the census here is the same
+    // `wait_until` the quiescence census above uses. Asserting instantly made
+    // this line fail ~12% of runs (it did so on the pre-P0.1 tree too) — a race
+    // in the test, not in the reclaimer: the footprint always converged.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            coord.artifact_free_total(CHURN_ARTIFACT) == Some(baseline)
+        }),
+        "the clean post-soak version settles to the same one-version footprint \
+         (still zero leak): free={:?} baseline={baseline}",
+        coord.artifact_free_total(CHURN_ARTIFACT)
     );
 }

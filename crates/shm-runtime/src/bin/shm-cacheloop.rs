@@ -876,12 +876,20 @@ fn run_churn(opts: &Opts) -> i32 {
         let op = rng.below(6);
         match op {
             0 | 1 => {
-                // Optimistic commit (Replace) over the current version. Concurrent
-                // committers race; the loser rolls back cleanly (freeing staged).
+                // Optimistic commit over the current version — Replace (a new
+                // chain root) or Append (links the prior manifest, ADR-0013) —
+                // so the kill -9 census covers manifest chains and their
+                // cascade. Concurrent committers race; the loser rolls back
+                // cleanly (freeing staged, releasing its link).
+                let kind = if op == 0 {
+                    Commit::Replace
+                } else {
+                    Commit::Append
+                };
                 let expect = node.artifact(art).map(|a| a.current_version()).unwrap_or(0);
                 if let Ok(stream) = node.stream(art) {
                     if let Ok(mut w) = stream.writer(
-                        Commit::Replace,
+                        kind,
                         Coordination::Optimistic {
                             expect_version: expect,
                         },

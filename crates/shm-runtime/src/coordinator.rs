@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use core::sync::atomic::Ordering;
 
@@ -71,6 +71,15 @@ struct ActorEntry {
     journal_seg: Arc<Segment>,
     last_heartbeat: Instant,
     liveness: Liveness,
+    /// Linux (ADR-0011): a pidfd watching the actor's process, obtained at
+    /// registration (`SO_PEERCRED` → `pidfd_open`). The lease monitor parks its
+    /// tick in `poll(2)` over these, so an actor's death is noticed
+    /// near-instantly instead of a lease-deadline later. `None` when the pid or
+    /// pidfd could not be obtained — leases remain the correctness backstop
+    /// either way (a pidfd detects exit, never a wedged-but-alive actor, and
+    /// the pid→pidfd_open window races pid reuse).
+    #[cfg(target_os = "linux")]
+    pidfd: Option<std::os::fd::OwnedFd>,
 }
 
 /// A topic's ring segment plus its broadcast doorbell.
@@ -126,6 +135,9 @@ struct CoordState {
     /// Count of leaked artifact **write leases** force-released by journal replay
     /// (item K observability).
     write_leases_reclaimed: u64,
+    /// Count of task-lifecycle-tied retained-ref **bindings** released by the
+    /// coordinator's reap backstop (ADR-0010 P0.3 observability).
+    task_bindings_reclaimed: u64,
     created_seg_ids: Vec<u32>,
     /// Master schema catalog (ADR-0003 item E): the process-independent
     /// [`shm_arrow::schema_content_hash`] → issued `schema_id`. The coordinator
@@ -290,6 +302,7 @@ impl Coordinator {
                 reclaimed: Vec::new(),
                 artifact_pins_reclaimed: 0,
                 write_leases_reclaimed: 0,
+                task_bindings_reclaimed: 0,
                 created_seg_ids: vec![
                     payload_id,
                     task_queue_id,
@@ -485,6 +498,22 @@ impl Coordinator {
         self.shared.state.lock().unwrap().write_leases_reclaimed
     }
 
+    /// Count of task-lifecycle-tied retained-ref bindings released by the
+    /// coordinator's reap backstop (ADR-0010 P0.3 observability).
+    pub fn task_bindings_reclaimed(&self) -> u64 {
+        self.shared.state.lock().unwrap().task_bindings_reclaimed
+    }
+
+    /// Drive one task-**binding** reap sweep (ADR-0010 P0.3) with an explicit
+    /// grace period, releasing each won binding against the keyed store and
+    /// returning how many were released. Exposes the exact backstop path the
+    /// lease monitor runs each tick (which uses
+    /// [`RuntimeConfig::task_binding_grace`]) so a test can drive it
+    /// deterministically.
+    pub fn reap_task_bindings_with_grace(&self, now_nanos: u64, grace_nanos: u64) -> usize {
+        reap_task_bindings(&self.shared, now_nanos, grace_nanos)
+    }
+
     /// The current exclusive write-lease owner actor id on a hosted artifact, or
     /// `None` if the artifact is unknown. `0` means the lease is free. Lets a test
     /// prove a dead exclusive writer's lease was force-released by crash replay
@@ -569,6 +598,26 @@ impl Coordinator {
     /// monitor runs, for deterministic same-process tests.
     pub fn reap_tasks(&self, now_nanos: u64) -> ReapReport {
         self.shared.task_queue.reap(now_nanos)
+    }
+
+    /// Drive one keyed-store tombstone sweep, returning how many slots it
+    /// returned to the free list (ADR-0008 P0.1). Exposes the exact path the
+    /// monitor runs, for deterministic same-process tests.
+    pub fn sweep_store_tombstones(&self) -> usize {
+        sweep_store_tombstones(&self.shared)
+    }
+
+    /// The lifecycle state of every **appended** store catalog slot
+    /// (`SLOT_FREE`/`SLOT_LIVE`/`SLOT_TOMBSTONE`/`SLOT_RECLAIMING`), in slot
+    /// order. Observability for the ADR-0008 P0.1 reclamation census: a test
+    /// proves an evicted slot *returned to `FREE`* — not merely that its chunks
+    /// came back — before trusting the store to survive churn.
+    pub fn store_slot_states(&self) -> Vec<u32> {
+        let Ok(cat) = Catalog::attach(&self.shared.store_catalog_seg) else {
+            return Vec::new();
+        };
+        let n = cat.next_slot().min(cat.capacity() as u32);
+        (0..n).map(|i| cat.slot(i).state()).collect()
     }
 }
 
@@ -738,6 +787,8 @@ fn register_actor(shared: &Arc<CoordShared>, name: &str, stream: &UnixStream) ->
                 journal_seg: journal_seg.clone(),
                 last_heartbeat: Instant::now(),
                 liveness: Liveness::Alive,
+                #[cfg(target_os = "linux")]
+                pidfd: peer_pidfd(stream),
             },
         );
     }
@@ -1027,6 +1078,75 @@ fn handle_pinned(shared: &Arc<CoordShared>, desc: &ChunkDesc) {
 
 // ---- Lease monitor + crash reclamation ----
 
+/// Park the lease monitor for one tick.
+///
+/// Non-Linux: a plain sleep; kernel death notification does not exist, so the
+/// returned set is always empty and leases alone govern death (the
+/// [`DeathDetection::LeaseBased`](shm_core::DeathDetection) policy).
+#[cfg(not(target_os = "linux"))]
+fn wait_tick(_shared: &Arc<CoordShared>, tick: Duration) -> Vec<u32> {
+    std::thread::sleep(tick);
+    Vec::new()
+}
+
+/// Park the lease monitor for one tick — in `poll(2)` over every alive,
+/// registered actor's pidfd (Linux, ADR-0011), so a watched actor's exit ends
+/// the tick early. Returns the actor ids whose pidfd became readable (the
+/// kernel's exit notification); the caller drives them through the exact same
+/// mark-dead → journal-replay reclaim path a lease expiry does.
+#[cfg(target_os = "linux")]
+fn wait_tick(shared: &Arc<CoordShared>, tick: Duration) -> Vec<u32> {
+    use std::os::fd::{AsRawFd, RawFd};
+    let watched: Vec<(u32, RawFd)> = {
+        let st = shared.state.lock().unwrap();
+        st.actors
+            .iter()
+            .filter(|(_, a)| a.liveness == Liveness::Alive)
+            .filter_map(|(id, a)| a.pidfd.as_ref().map(|fd| (*id, fd.as_raw_fd())))
+            .collect()
+    };
+    if watched.is_empty() {
+        std::thread::sleep(tick);
+        return Vec::new();
+    }
+    let mut pfds: Vec<libc::pollfd> = watched
+        .iter()
+        .map(|(_, fd)| libc::pollfd {
+            fd: *fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let ms = tick.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: `pfds` is a valid, exclusively-borrowed pollfd array; `poll` only
+    // reads/writes those entries. The fds stay open for the call: the OwnedFds
+    // live in `state.actors`, which only drops entries under the same lock, and
+    // even a racing close would only yield POLLNVAL (filtered out below).
+    let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
+    if n <= 0 {
+        // Timeout, EINTR, or error: report nothing; the lease clock still runs.
+        return Vec::new();
+    }
+    watched
+        .iter()
+        .zip(&pfds)
+        // A pidfd reports exit as POLLIN; include POLLERR/POLLHUP defensively.
+        .filter(|(_, p)| p.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0)
+        .map(|((id, _), _)| *id)
+        .collect()
+}
+
+/// Obtain a pidfd for the peer of a freshly-registered actor's control socket
+/// (Linux, ADR-0011): `SO_PEERCRED` names the pid, `pidfd_open` watches it.
+/// Best-effort: `None` on any failure (leases are the backstop). An in-process
+/// node yields a pidfd on the coordinator's own pid — harmless, it never fires.
+#[cfg(target_os = "linux")]
+fn peer_pidfd(stream: &UnixStream) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let pid = shm_core::platform_linux::socket_peer_pid(stream.as_raw_fd()).ok()?;
+    shm_core::platform_linux::pidfd_open(pid).ok()
+}
+
 /// Periodically expire leases, reclaim dead actors' journals, and reap lapsed
 /// task claims.
 ///
@@ -1040,16 +1160,23 @@ fn lease_monitor(shared: Arc<CoordShared>) {
     let tick = shared.config.monitor_tick;
     let deadline = shared.config.lease_deadline;
     while shared.running() {
-        std::thread::sleep(tick);
+        // One monitor tick. On Linux the sleep is a `poll(2)` over the
+        // registered actors' pidfds (ADR-0011), so a watched actor's exit ends
+        // the tick early and names it; elsewhere it is a plain sleep and the
+        // returned set is always empty. Either way the lease clock below stays
+        // the correctness backstop — a pidfd never fires for a wedged-but-alive
+        // actor, and not every actor has one.
+        let kernel_dead = wait_tick(&shared, tick);
         let now = Instant::now();
 
-        // Collect actors whose lease has expired, marking them Dead under lock.
+        // Collect actors whose lease has expired — or whose death the kernel
+        // just reported — marking them Dead under lock.
         let mut dead: Vec<(u32, Arc<Segment>)> = Vec::new();
         {
             let mut st = shared.state.lock().unwrap();
             for (id, a) in st.actors.iter_mut() {
-                if a.liveness == Liveness::Alive && now.duration_since(a.last_heartbeat) > deadline
-                {
+                let lapsed = now.duration_since(a.last_heartbeat) > deadline;
+                if a.liveness == Liveness::Alive && (lapsed || kernel_dead.contains(id)) {
                     a.liveness = Liveness::Dead;
                     dead.push((*id, a.journal_seg.clone()));
                 }
@@ -1072,7 +1199,65 @@ fn lease_monitor(shared: Arc<CoordShared>) {
         if had_death {
             shared.task_queue.reap(now_nanos());
         }
+
+        // Release task-lifecycle-tied retained-ref bindings whose requester
+        // never acked (ADR-0010 P0.3): the backstop that makes a task's
+        // input/output hold die with the TASK rather than leak. Runs before
+        // the store sweep below so a binding released this tick can already
+        // unblock a tombstoned entry's reclamation in the same tick.
+        let grace = shared.config.task_binding_grace.as_nanos() as u64;
+        reap_task_bindings(&shared, now_nanos(), grace);
+
+        // Return keyed-store slots whose entries have gone quiescent (ADR-0008
+        // P0.1). Eviction sweeps its own slot inline, so this only collects
+        // entries that were still pinned when they were evicted — including by a
+        // reader just declared dead above, which is why it runs after the
+        // reclaim pass rather than before it.
+        sweep_store_tombstones(&shared);
     }
+}
+
+/// One task-binding reap sweep (ADR-0010 P0.3): win the exactly-once release
+/// of every stale armed binding in the task queue's lease side table, then
+/// release each against the keyed store's entry (`attach_at_incarnation` +
+/// `release_leaked_pin` — the item-J route; a stale incarnation drops the
+/// binding). Returns how many bindings were released against the store.
+fn reap_task_bindings(shared: &Arc<CoordShared>, now_nanos: u64, grace_nanos: u64) -> usize {
+    let won = shared.task_queue.reap_bindings(now_nanos, grace_nanos);
+    if won.is_empty() {
+        return 0;
+    }
+    let mut released = 0usize;
+    for b in &won {
+        if shm_store::release_task_binding(
+            &shared.store_catalog_seg,
+            &shared.store_head_seg,
+            &shared.store_data_seg,
+            b.artifact_id,
+            b.incarnation,
+            b.version,
+        ) {
+            released += 1;
+        }
+    }
+    let mut st = shared.state.lock().unwrap();
+    st.task_bindings_reclaimed += released as u64;
+    released
+}
+
+/// Sweep the keyed store's catalog for tombstoned slots whose entries have gone
+/// quiescent, returning them to the free list (ADR-0008 P0.1).
+///
+/// Best-effort by design: a store that is not provisioned, or a catalog that
+/// momentarily will not attach, simply reclaims nothing this tick. There is
+/// always another tick, and nothing is lost by skipping one.
+fn sweep_store_tombstones(shared: &Arc<CoordShared>) -> usize {
+    shm_store::sweep_tombstones(
+        &shared.store_catalog_seg,
+        &shared.store_head_seg,
+        &shared.store_data_seg,
+    )
+    .unwrap_or(0)
 }
 
 /// Replay a dead actor's borrow journal and reclaim everything it held: every
@@ -1133,14 +1318,19 @@ fn reclaim_dead(
             }
             JournalRecord::ArtifactPin {
                 artifact_id,
+                incarnation,
                 version,
             } => {
-                if reclaim_artifact_pin(shared, artifact_id, version) {
+                if reclaim_artifact_pin(shared, artifact_id, incarnation, version) {
                     artifact_pins += 1;
                 }
             }
-            JournalRecord::WriteLease { artifact_id, .. } => {
-                if reclaim_write_lease(shared, artifact_id) {
+            JournalRecord::WriteLease {
+                artifact_id,
+                incarnation,
+                ..
+            } => {
+                if reclaim_write_lease(shared, artifact_id, incarnation) {
                     write_leases += 1;
                 }
             }
@@ -1159,8 +1349,13 @@ fn reclaim_dead(
 /// retire path a clean [`VersionPin`](shm_artifact::VersionPin) drop takes, so a
 /// leaked pin's version is retired (and its chunks reclaimed) exactly as if the
 /// reader had dropped it. Returns `true` iff a live slot was decremented.
-fn reclaim_artifact_pin(shared: &Arc<CoordShared>, artifact_id: u32, version: u64) -> bool {
-    match attach_artifact_by_id(shared, artifact_id) {
+fn reclaim_artifact_pin(
+    shared: &Arc<CoordShared>,
+    artifact_id: u32,
+    incarnation: u32,
+    version: u64,
+) -> bool {
+    match attach_artifact_by_id(shared, artifact_id, incarnation) {
         Some(art) => art.release_leaked_pin(version).unwrap_or(false),
         None => false,
     }
@@ -1170,8 +1365,8 @@ fn reclaim_artifact_pin(shared: &Arc<CoordShared>, artifact_id: u32, version: u6
 /// its hosted artifact and force-release its fenced exclusive write lease (with a
 /// fence bump), so a dead exclusive writer no longer wedges the artifact and its
 /// late commit is fenced out. Returns `true` iff a lease was actually held.
-fn reclaim_write_lease(shared: &Arc<CoordShared>, artifact_id: u32) -> bool {
-    match attach_artifact_by_id(shared, artifact_id) {
+fn reclaim_write_lease(shared: &Arc<CoordShared>, artifact_id: u32, incarnation: u32) -> bool {
+    match attach_artifact_by_id(shared, artifact_id, incarnation) {
         Some(art) => art.release_leaked_write_lease(),
         None => false,
     }
@@ -1185,9 +1380,17 @@ fn reclaim_write_lease(shared: &Arc<CoordShared>, artifact_id: u32) -> bool {
 /// (ADR-0007 G3): the store is the registry of record via the segments the
 /// coordinator owns, so a dead actor's leaked entry pin / write lease is released
 /// against the entry's `ArtifactHead` exactly like a normal artifact's.
-fn attach_artifact_by_id(shared: &Arc<CoordShared>, artifact_id: u32) -> Option<Artifact> {
+/// `incarnation` is the occupant the record was written against (ADR-0008 P0.1).
+/// A keyed-store slot can be reclaimed and re-created between a crash and its
+/// replay, so routing by `artifact_id` alone would release a borrow belonging to
+/// the slot's *next* occupant; a mismatch drops the record instead.
+fn attach_artifact_by_id(
+    shared: &Arc<CoordShared>,
+    artifact_id: u32,
+    incarnation: u32,
+) -> Option<Artifact> {
     if artifact_id >= STORE_ARTIFACT_ID_BASE {
-        return attach_store_entry_by_id(shared, artifact_id);
+        return attach_store_entry_by_id(shared, artifact_id, incarnation);
     }
     let (name_id, head, data) = {
         let st = shared.state.lock().unwrap();
@@ -1195,19 +1398,25 @@ fn attach_artifact_by_id(shared: &Arc<CoordShared>, artifact_id: u32) -> Option<
         let a = st.artifacts.get(&name)?;
         (a.name_id, a.head_seg.clone(), a.data_seg.clone())
     };
-    Artifact::attach(name_id, head, data).ok()
+    let artifact = Artifact::attach(name_id, head, data).ok()?;
+    (artifact.incarnation() == incarnation).then_some(artifact)
 }
 
 /// Route a keyed-store lineage `artifact_id` to its entry's `ArtifactHead` by
 /// reading the store catalog (which the coordinator maps): find the slot for the
 /// id, take its `head_off`, and attach a handle at that offset over the store's
 /// shared head + data segments.
-fn attach_store_entry_by_id(shared: &Arc<CoordShared>, artifact_id: u32) -> Option<Artifact> {
+fn attach_store_entry_by_id(
+    shared: &Arc<CoordShared>,
+    artifact_id: u32,
+    incarnation: u32,
+) -> Option<Artifact> {
     let cat = Catalog::attach(&shared.store_catalog_seg).ok()?;
     let idx = cat.slot_for_artifact_id(artifact_id)?;
     let head_off = cat.slot(idx).head_off() as usize;
-    Artifact::attach_at(
+    Artifact::attach_at_incarnation(
         artifact_id,
+        incarnation,
         shared.store_head_seg.clone(),
         head_off,
         shared.store_data_seg.clone(),
@@ -1331,13 +1540,24 @@ fn alloc_artifact_data_id() -> u32 {
 }
 
 /// Create a segment, clearing a stale name from a prior crashed run first.
+///
+/// Goes through the [`Platform`] seam's hardened creation (ADR-0011): on Linux
+/// this yields an anonymous **sealed memfd** — no namespace entry to go stale,
+/// and a hostile `ftruncate` on any granted fd fails `EPERM` instead of
+/// SIGBUS-ing mapped readers. On POSIX platforms it is a plain named
+/// `shm_open` segment, where `EEXIST` means a leftover from a crashed prior
+/// run (unlink and retry once). Every coordinator segment is distributed by fd
+/// over `SCM_RIGHTS`, so namelessness on Linux costs nothing.
 fn create_segment(id: u32, size: usize) -> Result<Segment> {
-    match Segment::create(id, size) {
+    use shm_core::{NativePlatform, Platform};
+    let plat = NativePlatform::new();
+    match plat.segment_create_sealed(id, size) {
         Ok(seg) => Ok(seg),
         Err(shm_core::Error::Nix(nix::errno::Errno::EEXIST)) => {
-            // Leftover from a previous run; unlink and retry once.
+            // Leftover from a previous run; unlink and retry once. (Unreachable
+            // on Linux: a memfd has no name to collide on.)
             let _ = Segment::unlink_by_id(id);
-            Ok(Segment::create(id, size)?)
+            Ok(plat.segment_create_sealed(id, size)?)
         }
         Err(e) => Err(e.into()),
     }

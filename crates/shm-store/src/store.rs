@@ -30,6 +30,15 @@ pub trait KeyResolver {
     fn intern_key(&self, key: &[u8]) -> Result<u32>;
 }
 
+/// How many times `evict` retries its undo CAS when a sweep holds the slot
+/// `RECLAIMING`. Bounded rather than unbounded: a `gen`-exhausted slot is parked
+/// in `RECLAIMING` forever by design, and an unbounded retry against that never
+/// terminates.
+const UNTOMBSTONE_RETRIES: u32 = 512;
+
+/// How many of those retries spin before switching to `yield_now`.
+const SPIN_BEFORE_YIELD: u32 = 64;
+
 /// The maximum length, in bytes, of a store key.
 pub const MAX_KEY_LEN: usize = 1024;
 
@@ -135,10 +144,15 @@ impl<'a> KeyedStore<'a> {
         let idx = cat.alloc_slot()?;
         let artifact_id = cat.artifact_id_for(idx);
         let head_off = cat.head_off_for(idx);
+        // The slot carries the incarnation its next occupant is stamped with, so
+        // a handle or journal record left over from the slot's *previous*
+        // occupant cannot be mistaken for one of ours (ADR-0008 P0.1).
+        let incarnation = cat.slot(idx).gen();
         // Initialise the entry's ArtifactHead in the shared head segment over the
         // shared data pool (the coordinator laid the pool once).
         let artifact = Artifact::create_at(
             artifact_id,
+            incarnation,
             self.head_seg.clone(),
             head_off as usize,
             self.data_seg.clone(),
@@ -175,9 +189,29 @@ impl<'a> KeyedStore<'a> {
     /// reclaiming chunks by refcount — see [`Artifact::evict_all`]). Idempotent:
     /// evicting an absent or already-tombstoned key is a clean no-op.
     ///
-    /// Retiring the lineage `artifact_id` is implicit: the tombstoned slot is
-    /// never reused, so a later [`create`](Self::create) of the same key appends a
-    /// fresh slot with a fresh lineage id.
+    /// Then it attempts to **reclaim the slot** (ADR-0008 P0.1). That succeeds
+    /// only if the entry came out of `evict_all` quiescent — the common case,
+    /// where nothing was pinned. An entry still held by a live reader stays
+    /// tombstoned and is picked up by
+    /// [`reclaim_tombstones`](Self::reclaim_tombstones) once that reader lets go.
+    ///
+    /// # Binding to the occupant (ADR-0008 P0.1)
+    ///
+    /// Because slots recycle, "the slot at `idx`" is not a stable identity: in
+    /// the window between the key scan and the tombstone CAS the slot can in
+    /// principle be evicted by someone else, swept, and re-created. So the
+    /// teardown binds to the **occupant**, not the slot:
+    ///
+    /// - `gen` is read *before* the CAS and re-checked *after* it. `gen`
+    ///   advances only when a sweep frees the slot, so an unchanged `gen`
+    ///   proves the CAS hit the occupant that was current at the read.
+    /// - `key_id` is re-checked too: an unchanged `gen` can still name an
+    ///   occupant that replaced the scanned one before the `gen` read. Same
+    ///   key ⇒ evicting it is simply this eviction linearised after the
+    ///   re-create; different key ⇒ wrong entry, so the tombstone is undone.
+    /// - The teardown attaches with [`Artifact::attach_at_incarnation`] against
+    ///   that proven `gen` (never "whatever is live now"), so even a sweep
+    ///   completing underneath cannot retarget `evict_all` at a next occupant.
     pub fn evict(&self, key: &[u8]) -> Result<()> {
         let key_id = self.key_id(key)?;
         let cat = self.catalog()?;
@@ -186,17 +220,101 @@ impl<'a> KeyedStore<'a> {
             None => return Ok(()), // absent or already tombstoned
         };
         let slot = cat.slot(idx);
+        let expected = slot.gen();
         if !slot.tombstone() {
             return Ok(()); // lost the race to another evictor; still evicted
         }
-        let artifact = Artifact::attach_at(
+        if slot.gen() != expected || slot.key_id() != key_id {
+            // A full recycle slipped between the scan and the CAS: the slot we
+            // tombstoned is a *different* occupant (or a different key's entry).
+            // Undo; the entry this call meant to evict is already gone.
+            //
+            // The undo CAS fails while a sweep holds the slot `RECLAIMING`, so
+            // retry — but **bounded**. An unbounded spin here can hang the
+            // caller outright: a slot whose `gen` has wrapped is parked in
+            // `RECLAIMING` permanently by design, and against that the undo CAS
+            // never succeeds and the state never leaves the retry set. Bounded,
+            // the pathological case costs a few hundred pauses instead of the
+            // process.
+            //
+            // Losing the retry means the sweep frees the slot under us and the
+            // occupant we wrongly tombstoned is torn down. That is the residual
+            // window ADR-0008 already documents and accepts (closing it needs
+            // occupant identity inside the state word); this loop narrows it,
+            // it does not close it.
+            for attempt in 0..UNTOMBSTONE_RETRIES {
+                if slot.untombstone() {
+                    break;
+                }
+                match slot.state() {
+                    crate::catalog::SLOT_RECLAIMING | crate::catalog::SLOT_TOMBSTONE => {}
+                    // Already freed and possibly re-published: nothing of ours
+                    // left to restore.
+                    _ => break,
+                }
+                if attempt < SPIN_BEFORE_YIELD {
+                    std::hint::spin_loop();
+                } else {
+                    // A sweep under `RECLAIMING` runs a teardown, a retire and a
+                    // pin scan — long enough that burning a core on it is worse
+                    // than descheduling.
+                    std::thread::yield_now();
+                }
+            }
+            return Ok(());
+        }
+        // Tear down the occupant we tombstoned. `Stale` here means a concurrent
+        // sweep is holding the head retired mid-quiescence-check (or already
+        // freed the slot); either way the sweep's own teardown pass converges
+        // the entry, so it is not an error for the evictor.
+        match Artifact::attach_at_incarnation(
             slot.artifact_id(),
+            expected,
             self.head_seg.clone(),
             slot.head_off() as usize,
             self.data_seg.clone(),
-        )?;
-        artifact.evict_all()?;
+        ) {
+            Ok(artifact) => match artifact.evict_all() {
+                Ok(()) | Err(shm_artifact::Error::Stale) => {}
+                Err(e) => return Err(e.into()),
+            },
+            Err(shm_artifact::Error::Stale) => {}
+            Err(e) => return Err(e.into()),
+        }
+        self.try_reclaim_slot(&cat, idx);
         Ok(())
+    }
+
+    /// Sweep the catalog, returning every tombstoned slot whose entry has gone
+    /// quiescent to the free list. Returns how many were freed.
+    ///
+    /// Driven from the coordinator's lease-monitor tick. Eviction sweeps its own
+    /// slot inline, so this only ever collects entries that were still busy at
+    /// eviction time — held by a live reader's pin, or written to again by a
+    /// straggler handle (the sweep re-runs the teardown before it judges
+    /// quiescence, so those converge too).
+    pub fn reclaim_tombstones(&self) -> Result<usize> {
+        sweep_tombstones(&self.catalog_seg, &self.head_seg, &self.data_seg)
+    }
+
+    /// The **handoff**: the binding from `r` has been armed in the task
+    /// queue's lease table (a successful `submit_with_binding` /
+    /// `bind_output`), which now owns the pin — release the journal record
+    /// that covered the gap. Call it immediately after the arm; the window
+    /// between the two is the only moment a crash could release the pin
+    /// twice, and the guarded decrement makes that a lost release, never a
+    /// free-under-reader.
+    pub fn binding_armed(&self, r: &RetainedRef) -> Result<()> {
+        let journal = BorrowJournal::attach(&self.journal_seg)?;
+        let _ = journal.release(r.journal_slot);
+        Ok(())
+    }
+
+    /// Try to reclaim the one slot at `idx` (already tombstoned).
+    fn try_reclaim_slot(&self, cat: &Catalog<'_>, idx: u32) {
+        cat.try_reclaim(idx, |artifact_id, head_off| {
+            entry_is_finished(&self.head_seg, &self.data_seg, artifact_id, head_off)
+        });
     }
 
     // ---- G1: resolve a typed-ref envelope (ADR-0007) ----
@@ -322,6 +440,24 @@ impl Entry {
         self.commit(Commit::Replace, batch)
     }
 
+    /// **P0.3 (ADR-0010, G4) — evict the entry's *current* version without
+    /// evicting the entry.** Commits an **empty** `Replace` version under the
+    /// entry's journaled exclusive write lease; the evicted version retires
+    /// through the standard handshake (a pinned reader drains via pin drop).
+    /// The entry stays `LIVE` in the catalog — its key still resolves, and the
+    /// next commit continues the version sequence — which is exactly what
+    /// ArrowRef's `clear_on_ack` needs for a retained task *output*: drop the
+    /// data, keep the address. Readers of the evicted-current entry see
+    /// `VersionGone`, identical to a never-committed entry. Returns the new
+    /// (empty) version number; fails `VersionGone` when nothing is committed.
+    pub fn evict_current(&self) -> Result<u64> {
+        let journal = BorrowJournal::attach(&self.journal_seg)?;
+        let mut committer = self
+            .artifact
+            .open_exclusive_journaled(self.owner, &journal)?;
+        Ok(committer.evict_current()?)
+    }
+
     /// Pin the entry's current version through the actor's borrow journal (ADR-0003
     /// item J), delegating to [`Artifact::pin_journaled`] so a `kill -9` mid-pin is
     /// crash-reclaimed by the coordinator. The pin is released on drop.
@@ -337,5 +473,181 @@ impl Entry {
         let pin = self.pin()?;
         let batch = pin.as_arrow(&self.registry)?;
         Ok((pin, batch))
+    }
+
+    /// **P0.3 (ADR-0010, G12) — retain the current version for a task's
+    /// lifetime.** Takes a guard-less, **unjournaled** retained pin on the
+    /// entry's current version ([`Artifact::retain_pin`]) and returns the
+    /// `{artifact_id, incarnation, version}` triple the caller arms into the
+    /// task queue's lease side table (`shm_task::TaskQueue::submit_with_binding`
+    /// / `shm_task::ClaimedTask::bind_output`).
+    ///
+    /// Deliberately *not* journaled in this actor's borrow journal: the pin
+    /// must survive this actor's death — the task still needs its input — and
+    /// die with the **task** instead, released exactly-once (at requester ack,
+    /// or by the coordinator's reap backstop) through
+    /// [`release_task_binding`]. While the binding is armed the entry cannot
+    /// go quiescent, so its catalog slot cannot recycle out from under it.
+    pub fn retain_current(&self) -> Result<RetainedRef> {
+        let version = self.artifact.retain_pin()?;
+        let artifact_id = self.artifact.name_id();
+        let incarnation = self.artifact.incarnation();
+        // Journal the retain until it is armed (ADR-0010 addendum). Between
+        // `retain_current` and a successful `submit_with_binding` /
+        // `bind_output` nothing else tracks this pin: a crash, or an arm that
+        // fails `LeaseTableFull`/`QueueFull`, would leak the version and its
+        // slot forever. As an `ArtifactPin` record it is reclaimed by the
+        // item-J replay exactly like a reader's pin. The record is released
+        // at the handoff ([`KeyedStore::binding_armed`]) once the lease table
+        // owns the pin.
+        let journal = BorrowJournal::attach(&self.journal_seg)?;
+        let journal_slot = journal.record_artifact_pin(artifact_id, incarnation, version)?;
+        Ok(RetainedRef {
+            artifact_id,
+            incarnation,
+            version,
+            journal_slot,
+        })
+    }
+
+    /// The handoff, from the entry: see [`KeyedStore::binding_armed`].
+    pub fn binding_armed(&self, r: &RetainedRef) -> Result<()> {
+        let journal = BorrowJournal::attach(&self.journal_seg)?;
+        let _ = journal.release(r.journal_slot);
+        Ok(())
+    }
+
+    /// Undo a [`retain_current`](Self::retain_current) whose arm **failed**:
+    /// release the retained pin (through the guarded leaked-pin path) and its
+    /// journal record.
+    pub fn release_retained(&self, r: RetainedRef) -> Result<bool> {
+        let journal = BorrowJournal::attach(&self.journal_seg)?;
+        let _ = journal.release(r.journal_slot);
+        Ok(self.artifact.release_leaked_pin(r.version)?)
+    }
+}
+
+/// A retained-ref binding produced by [`Entry::retain_current`] (ADR-0010):
+/// the opaque triple the task fabric carries in its lease side table and
+/// [`release_task_binding`] later routes back to the entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedRef {
+    /// The keyed-store lineage id (routes to a catalog slot).
+    pub artifact_id: u32,
+    /// The entry occupant the pin was taken against (ADR-0008 P0.1).
+    pub incarnation: u32,
+    /// The pinned version.
+    pub version: u64,
+    /// The borrow-journal slot holding this retain until it is armed; see
+    /// [`KeyedStore::binding_armed`].
+    pub journal_slot: usize,
+}
+
+/// **P0.3 (ADR-0010, G12) — release one task-tied retained-ref binding.**
+/// Routes `artifact_id` to its catalog slot, attaches **at the recorded
+/// incarnation** ([`Artifact::attach_at_incarnation`]), and decrements the
+/// retained pin through the same retire path a clean pin drop takes
+/// ([`Artifact::release_leaked_pin`]) — exactly the coordinator's item-J crash
+/// route. A binding whose incarnation no longer matches (the entry was evicted
+/// and its slot recycled — only reachable if the binding was already released
+/// once, since an armed binding blocks quiescence) is **dropped**, so a task
+/// lease can never decrement a slot's next occupant. Returns `true` iff a pin
+/// was actually released.
+///
+/// Segment-level (like [`sweep_tombstones`]) because the **coordinator** runs
+/// the reap backstop from its monitor tick with the store's segments and no
+/// actor journal.
+pub fn release_task_binding(
+    catalog_seg: &Arc<Segment>,
+    head_seg: &Arc<Segment>,
+    data_seg: &Arc<Segment>,
+    artifact_id: u32,
+    incarnation: u32,
+    version: u64,
+) -> bool {
+    let Ok(cat) = Catalog::attach(catalog_seg) else {
+        return false;
+    };
+    let Some(idx) = cat.slot_for_artifact_id(artifact_id) else {
+        return false;
+    };
+    let head_off = cat.slot(idx).head_off() as usize;
+    match Artifact::attach_at_incarnation(
+        artifact_id,
+        incarnation,
+        head_seg.clone(),
+        head_off,
+        data_seg.clone(),
+    ) {
+        Ok(artifact) => artifact.release_leaked_pin(version).unwrap_or(false),
+        Err(_) => false, // stale incarnation (or nothing live): drop the binding
+    }
+}
+
+/// Sweep a store's catalog over its raw segments, returning every tombstoned
+/// slot whose entry has gone quiescent to the free list. Returns how many were
+/// freed (ADR-0008 P0.1).
+///
+/// Segment-level rather than a [`KeyedStore`] method because the **coordinator**
+/// runs this from its lease-monitor tick, and it has the store's segments but no
+/// business holding a key resolver or an actor journal.
+pub fn sweep_tombstones(
+    catalog_seg: &Arc<Segment>,
+    head_seg: &Arc<Segment>,
+    data_seg: &Arc<Segment>,
+) -> Result<usize> {
+    let cat = Catalog::attach(catalog_seg)?;
+    Ok(cat.reclaim_tombstones(|artifact_id, head_off| {
+        entry_is_finished(head_seg, data_seg, artifact_id, head_off)
+    }))
+}
+
+/// The sweep's quiescence predicate, run while the catalog holds the slot in
+/// `RECLAIMING` (so no new occupant can appear underneath it — attaching and
+/// adopting the incarnation found *is* therefore safe here, unlike anywhere
+/// else).
+///
+/// First it **re-runs the teardown** ([`Artifact::evict_all`], idempotent and
+/// cheap on an already-empty entry). Eviction is a level, not an edge: a
+/// straggler handle held across the evict can still install a version *after*
+/// the evictor's own teardown (its commit registers, re-validates the
+/// incarnation — still in service — and succeeds), and without this pass such
+/// an entry would never go quiescent and its slot would leak forever. Tearing
+/// down again on every sweep makes the tombstone converge no matter how late
+/// the straggler was; once the slot is finally freed, the straggler's *next*
+/// operation fails `Stale`.
+///
+/// Then it takes the head **out of service**, and only then scans: retiring
+/// before scanning is the sweep half of the recycle handshake, so an operation
+/// racing this either registers in time to be seen by the scan — and the sweep
+/// backs off — or observes the retirement and backs out itself (ADR-0008 P0.1).
+/// A sweep that backs off restores the incarnation it took.
+fn entry_is_finished(
+    head_seg: &Arc<Segment>,
+    data_seg: &Arc<Segment>,
+    artifact_id: u32,
+    head_off: u32,
+) -> bool {
+    let artifact = match Artifact::attach_at(
+        artifact_id,
+        head_seg.clone(),
+        head_off as usize,
+        data_seg.clone(),
+    ) {
+        Ok(a) => a,
+        // Nothing attachable here (e.g. the previous occupant was reclaimed and
+        // no new one commissioned). Leave it for the next pass rather than
+        // guessing.
+        Err(_) => return false,
+    };
+    if artifact.evict_all().is_err() {
+        return false;
+    }
+    let held = artifact.retire_head();
+    if artifact.is_quiescent() {
+        true
+    } else {
+        artifact.commission_head(held);
+        false
     }
 }

@@ -73,7 +73,11 @@ fn segment_name(id: u32) -> Result<CString> {
 /// [`Segment::unlink`] explicitly so passing a segment to another process does
 /// not destroy it when one handle drops.
 pub struct Segment {
-    name: CString,
+    /// The segment's `shm_open` name, when it has one. `None` for segments
+    /// adopted from a raw fd ([`Segment::from_raw_fd`]) and for anonymous
+    /// sealed-memfd segments ([`Segment::create_sealed`] on Linux, ADR-0011):
+    /// those have no namespace entry, so `unlink` on them is a no-op.
+    name: Option<CString>,
     id: u32,
     fd: OwnedFd,
     ptr: NonNull<u8>,
@@ -124,7 +128,51 @@ impl Segment {
         }
 
         Ok(Segment {
-            name,
+            name: Some(name),
+            id,
+            fd,
+            ptr,
+            size,
+            map_len: size,
+            generation,
+        })
+    }
+
+    /// Create a brand-new **anonymous, sealed** segment of `size` bytes for
+    /// `id` (Linux only, ADR-0011): `memfd_create` + `ftruncate` +
+    /// `F_ADD_SEALS(F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL)`.
+    ///
+    /// The object has **no namespace entry** — [`Segment::unlink`] is a no-op
+    /// and [`Segment::attach`] can never resolve it — so it can only be
+    /// distributed by fd (`SCM_RIGHTS` → [`Segment::from_raw_fd`]), which is
+    /// exactly how the runtime distributes every segment. The seals make a
+    /// hostile `ftruncate` on any granted fd fail with `EPERM` instead of
+    /// SIGBUS-ing mapped readers; writes stay unsealed (segments are mutable
+    /// shared state).
+    #[cfg(target_os = "linux")]
+    pub fn create_sealed(id: u32, size: usize) -> Result<Segment> {
+        if size < HEADER_SIZE {
+            return Err(Error::LayoutOverflow("segment smaller than header"));
+        }
+        let fd = crate::platform_linux::memfd_sealed_fd(id, size)?;
+        let ptr = map_fd(&fd, size)?;
+        let generation = 1u64;
+
+        // SAFETY: `ptr` is a fresh mapping of `size >= HEADER_SIZE` bytes,
+        // 8-aligned (page aligned), so writing a 32-byte `SegmentHeader` at the
+        // base is in-bounds and well aligned.
+        unsafe {
+            ptr.as_ptr().cast::<SegmentHeader>().write(SegmentHeader {
+                magic: SEGMENT_MAGIC,
+                layout_version: LAYOUT_VERSION,
+                segment_id: id,
+                generation,
+                size: size as u64,
+            });
+        }
+
+        Ok(Segment {
+            name: None,
             id,
             fd,
             ptr,
@@ -168,7 +216,7 @@ impl Segment {
         }
 
         Ok(Segment {
-            name,
+            name: Some(name),
             id,
             fd,
             ptr,
@@ -189,8 +237,9 @@ impl Segment {
     /// [`Error::LayoutMismatch`].
     ///
     /// The returned `Segment` takes ownership of `fd` and will close it on drop.
-    /// It is created without a resolvable name, so [`Segment::unlink`] on it is a
-    /// no-op-by-absence responsibility of the creating process, not the receiver.
+    /// It is created **unnamed** — [`Segment::unlink`] on it is a no-op — so an
+    /// adopted handle can never remove the creating process's namespace entry
+    /// (and a memfd-backed segment has no entry to remove at all).
     ///
     /// # Safety
     ///
@@ -227,7 +276,7 @@ impl Segment {
         }
 
         Ok(Segment {
-            name: segment_name(id)?,
+            name: None,
             id,
             fd,
             ptr,
@@ -240,9 +289,13 @@ impl Segment {
     /// Remove the segment name from the filesystem namespace (`shm_unlink`).
     ///
     /// Existing mappings (including this one) remain valid until unmapped; this
-    /// only prevents new [`Segment::attach`] calls from resolving the name.
+    /// only prevents new [`Segment::attach`] calls from resolving the name. A
+    /// no-op for unnamed segments ([`Segment::from_raw_fd`] /
+    /// [`Segment::create_sealed`]): they have no namespace entry to remove.
     pub fn unlink(&self) -> Result<()> {
-        shm_unlink(self.name.as_c_str())?;
+        if let Some(name) = &self.name {
+            shm_unlink(name.as_c_str())?;
+        }
         Ok(())
     }
 

@@ -44,6 +44,19 @@ pub enum Error {
     /// failed the task (another attempt now owns it). At-least-once in action.
     #[error("claim lost: the task was reaped and re-dispatched")]
     Lost,
+
+    /// Every lease-side-table record is armed (unacked task bindings hold
+    /// them), so no new task-tied binding could be taken. Intentional
+    /// backpressure, like [`QueueFull`](Error::QueueFull): ack (or let the
+    /// reap backstop release) outstanding bindings first (ADR-0010, P0.3).
+    #[error("lease table full: no free task-binding record")]
+    LeaseTableFull,
+
+    /// [`ack`](crate::TaskQueue::ack) was called on a task that is still live
+    /// (`QUEUED`/`CLAIMED`): its bindings cannot be released out from under it.
+    /// Wait for a terminal outcome first (ADR-0010, P0.3).
+    #[error("task is not terminal: cannot ack a live task's bindings")]
+    NotTerminal,
 }
 
 /// Convenience alias for `Result<T, shm_task::Error>`.

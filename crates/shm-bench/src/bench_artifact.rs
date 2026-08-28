@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use shm_artifact::{Artifact, Commit};
 use shm_arrow::SchemaRegistry;
+use shm_artifact::{Artifact, Commit};
 use shm_core::{PoolConfig, Segment, SizeClass};
 
 use crate::stats::{measure, Stats};
@@ -75,7 +75,10 @@ pub fn run() {
         // Int64 column: 8 bytes/row. Give the pool a class big enough for one chunk.
         let need = rows * 8 + 4096;
         let cls = (need as u32).next_power_of_two();
-        let (art, h, d) = make_artifact((cls as usize) * 4 + (1 << 20), &PoolConfig::power_of_two(cls, cls, 3));
+        let (art, h, d) = make_artifact(
+            (cls as usize) * 4 + (1 << 20),
+            &PoolConfig::power_of_two(cls, cls, 3),
+        );
         {
             let mut w = art.open_exclusive(7).unwrap();
             w.commit(Commit::Replace, &batch(rows), &reg).unwrap();
@@ -83,6 +86,50 @@ pub fn run() {
         let pin = art.pin().unwrap();
         let s = measure(2_000, 20_000, || pin.as_arrow(&reg).unwrap());
         println!("  rows={rows:>8}: {}", s.line_ns());
+        drop(pin);
+        cleanup(h, d);
+    }
+
+    // ---- pin + per-batch read cost vs Append chain depth (ADR-0013) ----
+    println!(
+        "pin()+drop and as_arrow_batches() vs Append depth (pin flat = O(own manifest); read linear in batches only):"
+    );
+    for &depth in &[1u64, 100, 1000, 10_000] {
+        // One 256 B class holds both a 4-row data chunk and a 92 B manifest;
+        // every chain member costs exactly two chunks, so size for 2·depth.
+        let pool = PoolConfig {
+            classes: vec![
+                SizeClass {
+                    chunk_size: 256,
+                    chunk_count: 2 * depth as u32 + 64,
+                },
+                SizeClass {
+                    chunk_size: 512,
+                    chunk_count: 16,
+                },
+            ],
+        };
+        let (art, h, d) = make_artifact(1 << 26, &pool);
+        let small = batch(4);
+        {
+            let mut w = art.open_exclusive(7).unwrap();
+            w.commit(Commit::Replace, &small, &reg).unwrap();
+            while art.current_version() < depth {
+                w.commit(Commit::Append, &small, &reg).unwrap();
+            }
+        }
+        let pin_stats = measure(20_000, 100_000, || art.pin().unwrap());
+        let pin = art.pin().unwrap();
+        debug_assert_eq!(pin.manifest().depth as u64 + 1, depth);
+        let read_iters = (2_000_000 / depth as usize).clamp(200, 20_000);
+        let read_stats = measure(read_iters / 10, read_iters, || {
+            pin.as_arrow_batches(&reg).unwrap()
+        });
+        println!(
+            "  depth={depth:>6}: pin  {}\n                read {}",
+            pin_stats.line_ns(),
+            read_stats.line_ns()
+        );
         drop(pin);
         cleanup(h, d);
     }
@@ -97,21 +144,49 @@ pub fn run() {
 /// print the median at several table sizes to show flatness (O(1) turnover).
 fn commit_series(kind: Commit, label: &str, reg: &SchemaRegistry) {
     let count = 1000usize;
-    // Append accumulates a small data chunk per commit (they pile up: ~`count`
-    // live at once) and rewrites the version manifest, which grows O(#chunks) —
-    // so late manifests need progressively larger chunk classes (only a couple
-    // are live at a time). Small classes get many chunks; big classes get few.
+    // Append accumulates a small data chunk + a 92 B manifest per commit (they
+    // pile up: ~`count` chain members live at once). With chained manifests
+    // (ADR-0013) a manifest lists only its own chunks, so no class larger than
+    // the data chunk is ever needed; the larger classes below are kept only so
+    // the pool shape matches the pre-ADR-0013 series this compares against.
     let pool = PoolConfig {
         classes: vec![
-            SizeClass { chunk_size: 256, chunk_count: 4096 },
-            SizeClass { chunk_size: 512, chunk_count: 4096 },
-            SizeClass { chunk_size: 1024, chunk_count: 64 },
-            SizeClass { chunk_size: 2048, chunk_count: 64 },
-            SizeClass { chunk_size: 4096, chunk_count: 64 },
-            SizeClass { chunk_size: 8192, chunk_count: 32 },
-            SizeClass { chunk_size: 16384, chunk_count: 32 },
-            SizeClass { chunk_size: 32768, chunk_count: 16 },
-            SizeClass { chunk_size: 65536, chunk_count: 16 },
+            SizeClass {
+                chunk_size: 256,
+                chunk_count: 4096,
+            },
+            SizeClass {
+                chunk_size: 512,
+                chunk_count: 4096,
+            },
+            SizeClass {
+                chunk_size: 1024,
+                chunk_count: 64,
+            },
+            SizeClass {
+                chunk_size: 2048,
+                chunk_count: 64,
+            },
+            SizeClass {
+                chunk_size: 4096,
+                chunk_count: 64,
+            },
+            SizeClass {
+                chunk_size: 8192,
+                chunk_count: 32,
+            },
+            SizeClass {
+                chunk_size: 16384,
+                chunk_count: 32,
+            },
+            SizeClass {
+                chunk_size: 32768,
+                chunk_count: 16,
+            },
+            SizeClass {
+                chunk_size: 65536,
+                chunk_count: 16,
+            },
         ],
     };
     let (art, h, d) = make_artifact(1 << 26, &pool);
@@ -126,7 +201,12 @@ fn commit_series(kind: Commit, label: &str, reg: &SchemaRegistry) {
         }
     }
     // Windowed medians to expose any growth with table size.
-    let windows = [(0usize, 10usize), (100, 110), (500, 510), (count - 10, count)];
+    let windows = [
+        (0usize, 10usize),
+        (100, 110),
+        (500, 510),
+        (count - 10, count),
+    ];
     print!("  {label:8}: ");
     for (lo, hi) in windows {
         let mut w: Vec<f64> = samples[lo..hi].to_vec();
