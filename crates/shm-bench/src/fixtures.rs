@@ -51,8 +51,12 @@ impl RingFixture {
         // SAFETY: the payload region stays mapped for the fixture's lifetime and
         // no other party initializes it concurrently.
         let ring = unsafe {
-            Ring::init(seg.segment.payload_ptr(), seg.segment.payload_len(), capacity)
-                .expect("init ring")
+            Ring::init(
+                seg.segment.payload_ptr(),
+                seg.segment.payload_len(),
+                capacity,
+            )
+            .expect("init ring")
         };
         RingFixture { _seg: seg, ring }
     }
@@ -70,7 +74,10 @@ impl PoolFixture {
     pub fn new(seg_size: usize) -> PoolFixture {
         let seg = SegFixture::new(seg_size);
         let segment = seg.segment.clone();
-        PoolFixture { _id_guard: seg, segment }
+        PoolFixture {
+            _id_guard: seg,
+            segment,
+        }
     }
 
     /// Attach a [`Pool`] over this fixture's segment for `config`.

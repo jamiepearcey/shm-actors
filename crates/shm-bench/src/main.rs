@@ -38,9 +38,20 @@ fn machine_context() {
             .unwrap_or_else(|| "?".to_string())
     }
     println!("shm-bench — MEASURED numbers, macOS dev profile (NOT the Linux target)");
-    println!("build: {}", if cfg!(debug_assertions) { "DEBUG (run with --release!)" } else { "release" });
+    println!(
+        "build: {}",
+        if cfg!(debug_assertions) {
+            "DEBUG (run with --release!)"
+        } else {
+            "release"
+        }
+    );
     println!("cpu:   {}", sysctl("machdep.cpu.brand_string"));
-    println!("cores: {} logical / {} physical", sysctl("hw.ncpu"), sysctl("hw.physicalcpu"));
+    println!(
+        "cores: {} logical / {} physical",
+        sysctl("hw.ncpu"),
+        sysctl("hw.physicalcpu")
+    );
     let os = std::process::Command::new("sw_vers")
         .arg("-productVersion")
         .output()
@@ -75,7 +86,9 @@ fn main() {
             bench_task::run();
         }
         other => {
-            eprintln!("unknown suite '{other}'; use one of: xproc ring pool artifact arrow task all");
+            eprintln!(
+                "unknown suite '{other}'; use one of: xproc ring pool artifact arrow task all"
+            );
             std::process::exit(2);
         }
     }

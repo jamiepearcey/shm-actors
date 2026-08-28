@@ -38,7 +38,14 @@ impl Stats {
             samples[i.min(n - 1)]
         };
         let mean = samples.iter().sum::<f64>() / n as f64;
-        Stats { n, min: samples[0], p50: rank(0.50), p99: rank(0.99), max: samples[n - 1], mean }
+        Stats {
+            n,
+            min: samples[0],
+            p50: rank(0.50),
+            p99: rank(0.99),
+            max: samples[n - 1],
+            mean,
+        }
     }
 
     /// Render as a compact one-line latency summary in nanoseconds.

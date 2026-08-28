@@ -13,7 +13,10 @@ use crate::fixtures::RingFixture;
 use crate::stats::{fmt_rate, measure, Stats};
 
 fn desc(i: u64) -> ChunkDesc {
-    ChunkDesc { offset: i as u32, ..ChunkDesc::ZERO }
+    ChunkDesc {
+        offset: i as u32,
+        ..ChunkDesc::ZERO
+    }
 }
 
 /// Single-thread publish→try_recv of one 24-byte descriptor. This is the pure
@@ -215,8 +218,10 @@ pub fn doorbell_latency(rounds: usize) -> Stats {
     // Shutdown: publish the sentinel and wake.
     ready.store(false, Ordering::Release);
     thread::sleep(Duration::from_millis(2));
-    Publisher::with_notifier(fx.ring.clone(), DoorbellNotifier::new(write_fd))
-        .publish(ChunkDesc { offset: u32::MAX, ..ChunkDesc::ZERO });
+    Publisher::with_notifier(fx.ring.clone(), DoorbellNotifier::new(write_fd)).publish(ChunkDesc {
+        offset: u32::MAX,
+        ..ChunkDesc::ZERO
+    });
     consumer.join().unwrap();
     drop(db);
     Stats::from_ns(samples)

@@ -27,7 +27,11 @@ fn batch(rows: usize) -> RecordBatch {
     let b = Int64Array::from((0..rows as i64).map(|x| x * 2).collect::<Vec<_>>());
     let c = Float64Array::from((0..rows).map(|x| x as f64).collect::<Vec<_>>());
     let d = Float64Array::from((0..rows).map(|x| x as f64 * 0.5).collect::<Vec<_>>());
-    RecordBatch::try_new(schema(), vec![Arc::new(a), Arc::new(b), Arc::new(c), Arc::new(d)]).unwrap()
+    RecordBatch::try_new(
+        schema(),
+        vec![Arc::new(a), Arc::new(b), Arc::new(c), Arc::new(d)],
+    )
+    .unwrap()
 }
 
 fn next_id() -> u32 {

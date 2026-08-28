@@ -27,7 +27,10 @@ const THRU_N: u64 = 5_000_000;
 const CAP: u32 = 1 << 16;
 
 fn desc(i: u64) -> ChunkDesc {
-    ChunkDesc { offset: i as u32, ..ChunkDesc::ZERO }
+    ChunkDesc {
+        offset: i as u32,
+        ..ChunkDesc::ZERO
+    }
 }
 
 /// Child: echo pings for the latency phase, then count the throughput stream and
@@ -59,7 +62,10 @@ fn child_role(ring_a: Ring, ring_b: Ring) -> ! {
             None => {}
         }
     }
-    pub_b.publish(ChunkDesc { offset: skipped as u32, ..ChunkDesc::ZERO });
+    pub_b.publish(ChunkDesc {
+        offset: skipped as u32,
+        ..ChunkDesc::ZERO
+    });
 
     // Exit without running destructors (which is what a real worker teardown or
     // a crash would do); the parent owns unlink.
@@ -123,8 +129,10 @@ pub fn run() {
     let seg_a = Segment::create(id_a, size).expect("seg a");
     let seg_b = Segment::create(id_b, size).expect("seg b");
     // SAFETY: fresh, exclusively-owned payloads; no concurrent initializer.
-    let ring_a = unsafe { Ring::init(seg_a.payload_ptr(), seg_a.payload_len(), CAP) }.expect("ring a");
-    let ring_b = unsafe { Ring::init(seg_b.payload_ptr(), seg_b.payload_len(), CAP) }.expect("ring b");
+    let ring_a =
+        unsafe { Ring::init(seg_a.payload_ptr(), seg_a.payload_len(), CAP) }.expect("ring a");
+    let ring_b =
+        unsafe { Ring::init(seg_b.payload_ptr(), seg_b.payload_len(), CAP) }.expect("ring b");
 
     // Fork. This function is only called before any bench thread is spawned, so
     // the child inherits a single-threaded, quiescent address space.
@@ -138,8 +146,10 @@ pub fn run() {
         let c_seg_a = Segment::attach(id_a).expect("attach a");
         let c_seg_b = Segment::attach(id_b).expect("attach b");
         // SAFETY: both were Ring::init'd by the parent before the fork.
-        let c_ring_a = unsafe { Ring::attach(c_seg_a.payload_ptr(), c_seg_a.payload_len()) }.expect("attach ring a");
-        let c_ring_b = unsafe { Ring::attach(c_seg_b.payload_ptr(), c_seg_b.payload_len()) }.expect("attach ring b");
+        let c_ring_a = unsafe { Ring::attach(c_seg_a.payload_ptr(), c_seg_a.payload_len()) }
+            .expect("attach ring a");
+        let c_ring_b = unsafe { Ring::attach(c_seg_b.payload_ptr(), c_seg_b.payload_len()) }
+            .expect("attach ring b");
         child_role(c_ring_a, c_ring_b);
     }
 

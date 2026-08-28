@@ -46,16 +46,16 @@ use std::time::{Duration, Instant};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-use shm_arrow::{
-    read_batch, serialized_len, write_batch, PinGuard, PoolAllocator, SchemaRegistry,
-};
+use shm_arrow::{read_batch, serialized_len, write_batch, PinGuard, PoolAllocator, SchemaRegistry};
 use shm_artifact::{Artifact, Commit};
 use shm_core::{ChunkDesc, Pool, PoolConfig, Segment};
 use shm_task::{now_nanos, TaskQueue, TaskStatus};
 
 pub mod arrowref_mock;
 
-use arrowref_mock::{AckPolicy, OutputPolicy, RetainedInputRef, RetainedOutputRef, TaskRequest, TaskResult};
+use arrowref_mock::{
+    AckPolicy, OutputPolicy, RetainedInputRef, RetainedOutputRef, TaskRequest, TaskResult,
+};
 
 /// Boxed error alias — the shm-* crates use `thiserror`, so every error already
 /// implements [`std::error::Error`].
@@ -97,6 +97,11 @@ pub struct SpikeReport {
     pub output_read_zero_copy: bool,
     /// The retained input was reclaimed on "ack" (refcount → 0 → FREE).
     pub cleared_on_ack: bool,
+    /// The retained OUTPUT (the current artifact version) was evicted on
+    /// "ack" via `evict_current` — the G4 gap, closed by ADR-0010 (P0.3):
+    /// the empty superseding version retired the output's chunks and a
+    /// subsequent read reports `VersionGone`.
+    pub output_cleared_on_ack: bool,
     /// End-to-end submit→retained-output→read latency.
     pub round_trip: Duration,
 }
@@ -164,7 +169,11 @@ pub fn run_spike() -> Result<SpikeReport, SpikeError> {
     // bytes, kept mapped by the `Arc<Segment>` for every handle's lifetime, and
     // initialised exactly once here.
     let submit_queue = unsafe {
-        TaskQueue::init(queue_seg.payload_ptr(), queue_seg.payload_len(), QUEUE_CAPACITY)?
+        TaskQueue::init(
+            queue_seg.payload_ptr(),
+            queue_seg.payload_len(),
+            QUEUE_CAPACITY,
+        )?
     };
     let deadline = now_nanos().wrapping_add(5_000_000_000);
     let handle = submit_queue.submit(input_desc, deadline)?;
@@ -225,10 +234,23 @@ pub fn run_spike() -> Result<SpikeReport, SpikeError> {
     // --- "Ack" with clear-on-ack: release the retained input (refcount → 0). ---
     // ArrowRef's `AckPolicy::clear_on_ack` evicts the retained output on ack; the
     // shm-actors analogue of "clear a retained ref" is dropping the last
-    // reference so the chunk is reclaimed. We clear the retained INPUT here (the
-    // output is still `current` in the artifact and cannot be retired while
-    // current — itself gap G4).
+    // reference so the chunk is reclaimed. We clear the retained INPUT here.
     let cleared_on_ack = clear_retained_chunk(&payload_seg, &input_desc)?;
+
+    // --- "Ack" with clear-on-ack on the OUTPUT (G4, closed by ADR-0010). ---
+    // At spike time the current artifact version could not be retired
+    // (`try_retire_version` early-outs while current), so clear-on-ack could
+    // only be demonstrated on the input. `evict_current` (P0.3) commits an
+    // empty superseding version: the output's chunks are reclaimed through the
+    // standard retire path and a fresh read reports the version gone —
+    // ArrowRef's `remove_dataset_if_unleased` semantics on the output side.
+    drop(pin);
+    let empty_version = out_artifact.evict_current_optimistic(REQUESTER_ID, version)?;
+    let output_cleared_on_ack = empty_version == version + 1
+        && matches!(
+            out_artifact.pin().and_then(|p| p.as_arrow(&registry)),
+            Err(shm_artifact::Error::VersionGone)
+        );
 
     let output = RetainedOutputRef {
         dataset: "task_results".to_string(),
@@ -245,6 +267,7 @@ pub fn run_spike() -> Result<SpikeReport, SpikeError> {
         input_read_zero_copy,
         output_read_zero_copy,
         cleared_on_ack,
+        output_cleared_on_ack,
         round_trip,
     })
 }
@@ -260,8 +283,7 @@ fn worker_body(
 ) -> Result<TaskResult, SpikeError> {
     // SAFETY: `queue_seg` was initialised by `TaskQueue::init` in the requester
     // and stays mapped for this handle's lifetime via the shared `Arc`.
-    let queue =
-        unsafe { TaskQueue::attach(queue_seg.payload_ptr(), queue_seg.payload_len())? };
+    let queue = unsafe { TaskQueue::attach(queue_seg.payload_ptr(), queue_seg.payload_len())? };
     let out_artifact = Artifact::attach(OUT_NAME_ID, out_head_seg, out_data_seg)?;
     let payload_pool = Pool::attach(&payload_seg)?;
 
@@ -269,7 +291,9 @@ fn worker_body(
     // a bounded deadline — the same `claim` the runtime's `claim_blocking` wraps.
     let claim_deadline = Instant::now() + Duration::from_secs(5);
     let claimed = loop {
-        if let Some(task) = queue.claim_with_lease(WORKER_ID, now_nanos().wrapping_add(2_000_000_000)) {
+        if let Some(task) =
+            queue.claim_with_lease(WORKER_ID, now_nanos().wrapping_add(2_000_000_000))
+        {
             break task;
         }
         if Instant::now() >= claim_deadline {
@@ -296,8 +320,13 @@ fn worker_body(
     // Retain the output as a new artifact VERSION (Append). The bytes are written
     // once into the artifact's data segment; nothing goes through the queue.
     let expect = out_artifact.current_version();
-    let version =
-        out_artifact.commit_optimistic(WORKER_ID, expect, Commit::Append, &output_batch, &registry)?;
+    let version = out_artifact.commit_optimistic(
+        WORKER_ID,
+        expect,
+        Commit::Append,
+        &output_batch,
+        &registry,
+    )?;
 
     // Drop the input lease now the compute output is independent of it.
     ctrl.release_shared();
@@ -363,7 +392,10 @@ fn double_first_column(batch: &RecordBatch) -> Result<RecordBatch, SpikeError> {
         .downcast_ref::<Int64Array>()
         .ok_or("input column 0 is not Int64")?;
     let doubled = Int64Array::from_iter_values(col.values().iter().map(|v| v * 2));
-    Ok(RecordBatch::try_new(batch.schema(), vec![Arc::new(doubled)])?)
+    Ok(RecordBatch::try_new(
+        batch.schema(),
+        vec![Arc::new(doubled)],
+    )?)
 }
 
 fn verify_doubled(input: &RecordBatch, output: &RecordBatch) -> Result<(), SpikeError> {
@@ -447,9 +479,7 @@ fn fresh_segment(size: usize) -> Result<Arc<Segment>, SpikeError> {
     static BASE: OnceLock<u32> = OnceLock::new();
     let base = *BASE.get_or_init(|| (std::process::id() & 0x000F_FFFF) << 8);
     for _ in 0..64 {
-        let id = base
-            .wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed))
-            & 0x7FFF_FFFF;
+        let id = base.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed)) & 0x7FFF_FFFF;
         // Best-effort clear of a stale name from a prior crashed run.
         let _ = Segment::unlink_by_id(id);
         match Segment::create(id, size) {
@@ -473,7 +503,10 @@ mod tests {
 
         // Descriptor-only control: the queue carried a 24-byte descriptor, not the
         // Arrow payload.
-        assert_eq!(report.control_msg_bytes, 24, "control message is a ChunkDesc");
+        assert_eq!(
+            report.control_msg_bytes, 24,
+            "control message is a ChunkDesc"
+        );
         assert!(
             report.input_payload_bytes > 8 * 1024,
             "input payload is substantial ({} bytes)",
@@ -489,9 +522,16 @@ mod tests {
         assert_eq!(report.output.version, 1, "first retained output version");
         assert_eq!(report.output_rows, ROWS, "all rows produced");
         assert!(report.input_read_zero_copy, "input read straight from shm");
-        assert!(report.output_read_zero_copy, "output read straight from shm");
+        assert!(
+            report.output_read_zero_copy,
+            "output read straight from shm"
+        );
 
         // Clear-on-ack reclaimed the retained input.
         assert!(report.cleared_on_ack, "retained input reclaimed on ack");
+        assert!(
+            report.output_cleared_on_ack,
+            "retained OUTPUT evicted on ack via evict_current (G4 / ADR-0010)"
+        );
     }
 }

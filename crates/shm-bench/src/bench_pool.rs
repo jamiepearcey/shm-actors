@@ -24,7 +24,12 @@ pub fn run() {
     // Budget: K*(chunk payload + a ChunkCtrl word + slack) rounded up.
     let seg_size = (K * (CHUNK as usize + 64) + (1 << 16)).next_power_of_two();
     let fx = PoolFixture::new(seg_size);
-    let pool = fx.pool(&PoolConfig { classes: vec![shm_core::SizeClass { chunk_size: CHUNK, chunk_count: K as u32 }] });
+    let pool = fx.pool(&PoolConfig {
+        classes: vec![shm_core::SizeClass {
+            chunk_size: CHUNK,
+            chunk_count: K as u32,
+        }],
+    });
 
     let rounds = 2000usize;
     let warm = 100usize;
