@@ -365,6 +365,14 @@ impl Artifact {
         head_ref_at(&self.head_seg, self.head_off)
     }
 
+    /// The `PackedRef` bits of the current version's manifest chunk (`0` if
+    /// nothing is committed) — the value an installed version's slot
+    /// endorses; see [`reclaim_staged_manifest`](Self::reclaim_staged_manifest).
+    #[inline]
+    pub fn current_manifest_bits(&self) -> u64 {
+        self.head().manifest_desc.load(Acquire)
+    }
+
     /// The occupant of the head region this handle is bound to (ADR-0008 P0.1).
     #[inline]
     pub fn incarnation(&self) -> u32 {
@@ -675,6 +683,22 @@ impl Artifact {
         registry: &SchemaRegistry,
         lease_fence: Option<u32>,
     ) -> Result<u64> {
+        self.commit_inner_j(expect, owner, commit, batch, registry, lease_fence, None)
+    }
+
+    /// [`commit_inner`](Self::commit_inner) with the caller's borrow journal,
+    /// so the staged manifest is crash-reclaimable (ADR-0014 §3).
+    #[allow(clippy::too_many_arguments)]
+    fn commit_inner_j(
+        &self,
+        expect: u64,
+        owner: u32,
+        commit: Commit,
+        batch: &RecordBatch,
+        registry: &SchemaRegistry,
+        lease_fence: Option<u32>,
+        journal: Option<&BorrowJournal<'_>>,
+    ) -> Result<u64> {
         debug_assert_ne!(owner, OWNER_NONE, "commit owner id must be non-zero");
         if let Commit::Patch(_) = commit {
             return Err(Error::Unsupported("Patch commit deferred to v0.2"));
@@ -692,7 +716,7 @@ impl Artifact {
         let staged = write_batch_chunks(&alloc, registry, batch)?;
         loan_all(&pool, &alloc, &staged, owner)?;
         let spans = [staged.len() as u32];
-        self.commit_staged_inner(
+        self.commit_staged_inner_j(
             expect,
             owner,
             commit,
@@ -700,6 +724,7 @@ impl Artifact {
             &spans,
             schema_id,
             lease_fence,
+            journal,
         )
     }
 
@@ -746,6 +771,59 @@ impl Artifact {
         staged_spans: &[u32],
         schema_id: u32,
         lease_fence: Option<u32>,
+    ) -> Result<u64> {
+        self.commit_staged_inner_j(
+            expect,
+            owner,
+            commit,
+            staged,
+            staged_spans,
+            schema_id,
+            lease_fence,
+            None,
+        )
+    }
+
+    /// **Optimistic staged commit with a borrow journal** (ADR-0014 §3): the
+    /// staged manifest is journaled between staging and the install CAS, so a
+    /// committer that dies in that window is torn down by replay instead of
+    /// stranding its manifest chain. `shm-stream` uses this.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_staged_optimistic_journaled(
+        &self,
+        owner: u32,
+        expect: u64,
+        commit: Commit,
+        staged: &[ChunkDesc],
+        batch_spans: &[u32],
+        schema_id: u32,
+        journal: &BorrowJournal<'_>,
+    ) -> Result<u64> {
+        self.commit_staged_inner_j(
+            expect,
+            owner,
+            commit,
+            staged,
+            batch_spans,
+            schema_id,
+            None,
+            Some(journal),
+        )
+    }
+
+    /// The one true install path, journaled (see
+    /// [`commit_staged_inner`](Self::commit_staged_inner) for the contract).
+    #[allow(clippy::too_many_arguments)]
+    fn commit_staged_inner_j(
+        &self,
+        expect: u64,
+        owner: u32,
+        commit: Commit,
+        staged: &[ChunkDesc],
+        staged_spans: &[u32],
+        schema_id: u32,
+        lease_fence: Option<u32>,
+        journal: Option<&BorrowJournal<'_>>,
     ) -> Result<u64> {
         debug_assert_ne!(owner, OWNER_NONE, "commit owner id must be non-zero");
         // Cheap early-out; the authoritative check is step 4b, after the slot
@@ -907,6 +985,23 @@ impl Artifact {
             }
         };
         let manifest_ref = PackedRef::from_desc(&manifest_desc);
+        // Crash ledger for the window between here and the install CAS
+        // (ADR-0014 §3). A full journal just means an unjournaled window, as
+        // before — never a failed commit.
+        let staged_rec = journal.and_then(|j| {
+            j.record_staged_manifest(
+                self.name_id,
+                self.incarnation,
+                manifest_ref.to_bits(),
+                manifest_desc.generation,
+            )
+            .ok()
+        });
+        let drop_rec = || {
+            if let (Some(j), Some(s)) = (journal, staged_rec) {
+                let _ = j.release(s);
+            }
+        };
 
         // 5. Claim a live-version slot (readers can find it once installed).
         let slot_idx = match head.claim_slot(target, manifest_ref.to_bits()) {
@@ -919,6 +1014,7 @@ impl Artifact {
                     Some(&manifest_desc),
                     None,
                 );
+                drop_rec();
                 return Err(Error::Unsupported("live-version table full"));
             }
         };
@@ -940,6 +1036,7 @@ impl Artifact {
                 Some(&manifest_desc),
                 None,
             );
+            drop_rec();
             return Err(Error::Stale);
         }
 
@@ -971,6 +1068,10 @@ impl Artifact {
                 if let Some(sink) = &self.watch {
                     sink(VersionEvent::new(self.name_id, target, commit.kind()));
                 }
+                // Installed: the version's slot now endorses the manifest, so
+                // the ledger entry is redundant (and replay would treat it as
+                // installed anyway — see `reclaim_staged_manifest`).
+                drop_rec();
                 Ok(target)
             }
             Err(actual) => {
@@ -982,6 +1083,7 @@ impl Artifact {
                     Some(&manifest_desc),
                     Some((slot_idx, target)),
                 );
+                drop_rec();
                 Err(Error::Conflict {
                     expected: expect,
                     actual,
@@ -1252,6 +1354,40 @@ impl Artifact {
     /// [`ArtifactPin`](shm_core::JournalRecord::ArtifactPin) journal entry, so a
     /// leaked cross-process pin retires exactly as if the reader had dropped it.
     /// Returns `true` iff a live slot for `version` was found and decremented.
+    /// **Crash replay of a [`StagedManifest`](shm_core::JournalRecord::StagedManifest)
+    /// record (ADR-0014 §3).** The committer died between staging its manifest
+    /// and the install CAS — or between the install and releasing the record.
+    /// Distinguish the two by what an install leaves behind: a live pin slot
+    /// (or the head) naming the manifest. Endorsed ⇒ installed ⇒ nothing to
+    /// do (`Ok(false)`). Otherwise release the manifest's own reference
+    /// through the cascade — own data chunks, then the link — validated
+    /// against the generation it was staged at, so a rolled-back-and-
+    /// reallocated chunk is never touched. Returns `true` iff something was
+    /// released.
+    pub fn reclaim_staged_manifest(&self, manifest: u64, generation: u32) -> Result<bool> {
+        let head = self.head();
+        if head.manifest_desc.load(Acquire) == manifest {
+            return Ok(false);
+        }
+        for slot in head.pins.iter() {
+            if slot.state.load(Acquire) == SLOT_LIVE && slot.manifest.load(Acquire) == manifest {
+                return Ok(false);
+            }
+        }
+        let pool = Pool::attach(&self.data_seg)?;
+        let mref = PackedRef(manifest);
+        let desc = manifest_chunk_desc(mref, generation);
+        match pool.ctrl(&desc) {
+            Ok(ctrl) if ctrl.validate(&desc).is_ok() && ctrl.state() == PUBLISHED => {}
+            _ => return Ok(false), // already rolled back (and possibly reused)
+        }
+        release_manifest_ref(&pool, &self.data_seg, mref, Some(generation));
+        Ok(true)
+    }
+
+    /// **Crash replay of an `ArtifactPin` record (item J).** Decrement the pin
+    /// count on `version` through the guarded [`PinSlot::try_unpin`] and retire
+    /// it if that was the last pin. `Ok(false)` if nothing tracked it.
     pub fn release_leaked_pin(&self, version: u64) -> Result<bool> {
         let head = self.head();
         let idx = match head.find_slot(version) {
@@ -1672,13 +1808,14 @@ impl Committer<'_> {
         registry: &SchemaRegistry,
     ) -> Result<u64> {
         let expect = self.artifact.head().current.load(SeqCst);
-        self.artifact.commit_inner(
+        self.artifact.commit_inner_j(
             expect,
             self.owner,
             commit,
             batch,
             registry,
             Some(self.token),
+            self.lease.as_ref().map(|l| l.journal),
         )
     }
 
@@ -1706,7 +1843,7 @@ impl Committer<'_> {
         schema_id: u32,
     ) -> Result<u64> {
         let expect = self.artifact.head().current.load(SeqCst);
-        self.artifact.commit_staged_inner(
+        self.artifact.commit_staged_inner_j(
             expect,
             self.owner,
             commit,
@@ -1714,6 +1851,7 @@ impl Committer<'_> {
             batch_spans,
             schema_id,
             Some(self.token),
+            self.lease.as_ref().map(|l| l.journal),
         )
     }
 
@@ -1766,13 +1904,18 @@ impl Drop for Committer<'_> {
         // the ledger while the lease stayed stuck (the exact wedge item K fixes).
         // A `false` result (the lease was already fenced by the coordinator) is
         // fine: the CAS is a no-op and the journal entry, if any, is still cleared.
+        // Election first (ADR-0014 §4): a journaled lease the coordinator
+        // already force-released (this committer is a zombie) is not ours to
+        // release — and the fence bump makes the token stale in any case.
+        if let Some(l) = &self.lease {
+            if let Ok(false) = l.journal.release(l.slot) {
+                return;
+            }
+        }
         let _ = self
             .artifact
             .head()
             .release_write_lease(self.owner, self.token);
-        if let Some(l) = &self.lease {
-            let _ = l.journal.release(l.slot);
-        }
     }
 }
 
@@ -1826,7 +1969,13 @@ impl Drop for PinState {
         // drop must leave nothing for the coordinator to replay.
         if let Some(jp) = &self.journal {
             if let Ok(journal) = BorrowJournal::attach(&jp.seg) {
-                let _ = journal.release(jp.slot);
+                // The journal slot IS the pin's ownership (ADR-0014 §4). If
+                // the coordinator's replay already cleared it — this actor was
+                // declared dead and is a zombie — the replay performed the
+                // decrement, and doing it again would steal a live reader's.
+                if let Ok(false) = journal.release(jp.slot) {
+                    return;
+                }
             }
         }
         let head = head_ref_at(&self.head_seg, self.head_off);

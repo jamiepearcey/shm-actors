@@ -652,12 +652,16 @@ impl Node {
     /// Release a pin taken by [`pin_and_read`](Self::pin_and_read): drop the
     /// shared refcount and clear the journal slot.
     pub fn release_pin(&self, pin: &Pin) -> Result<()> {
+        // Election first (ADR-0014 §4): if the coordinator already replayed
+        // this pin — we were declared dead — the decrement is not ours.
+        let journal = BorrowJournal::attach(&self.journal_seg)?;
+        if !journal.release(pin.slot)? {
+            return Ok(());
+        }
         let pool = Pool::attach(&self.payload_seg)?;
         if let Ok(ctrl) = pool.ctrl(&pin.desc) {
             ctrl.release_shared();
         }
-        let journal = BorrowJournal::attach(&self.journal_seg)?;
-        journal.release(pin.slot)?;
         Ok(())
     }
 

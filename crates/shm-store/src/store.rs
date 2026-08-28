@@ -30,15 +30,6 @@ pub trait KeyResolver {
     fn intern_key(&self, key: &[u8]) -> Result<u32>;
 }
 
-/// How many times `evict` retries its undo CAS when a sweep holds the slot
-/// `RECLAIMING`. Bounded rather than unbounded: a `gen`-exhausted slot is parked
-/// in `RECLAIMING` forever by design, and an unbounded retry against that never
-/// terminates.
-const UNTOMBSTONE_RETRIES: u32 = 512;
-
-/// How many of those retries spin before switching to `yield_now`.
-const SPIN_BEFORE_YIELD: u32 = 64;
-
 /// The maximum length, in bytes, of a store key.
 pub const MAX_KEY_LEN: usize = 1024;
 
@@ -221,46 +212,11 @@ impl<'a> KeyedStore<'a> {
         };
         let slot = cat.slot(idx);
         let expected = slot.gen();
-        if !slot.tombstone() {
-            return Ok(()); // lost the race to another evictor; still evicted
-        }
-        if slot.gen() != expected || slot.key_id() != key_id {
-            // A full recycle slipped between the scan and the CAS: the slot we
-            // tombstoned is a *different* occupant (or a different key's entry).
-            // Undo; the entry this call meant to evict is already gone.
-            //
-            // The undo CAS fails while a sweep holds the slot `RECLAIMING`, so
-            // retry — but **bounded**. An unbounded spin here can hang the
-            // caller outright: a slot whose `gen` has wrapped is parked in
-            // `RECLAIMING` permanently by design, and against that the undo CAS
-            // never succeeds and the state never leaves the retry set. Bounded,
-            // the pathological case costs a few hundred pauses instead of the
-            // process.
-            //
-            // Losing the retry means the sweep frees the slot under us and the
-            // occupant we wrongly tombstoned is torn down. That is the residual
-            // window ADR-0008 already documents and accepts (closing it needs
-            // occupant identity inside the state word); this loop narrows it,
-            // it does not close it.
-            for attempt in 0..UNTOMBSTONE_RETRIES {
-                if slot.untombstone() {
-                    break;
-                }
-                match slot.state() {
-                    crate::catalog::SLOT_RECLAIMING | crate::catalog::SLOT_TOMBSTONE => {}
-                    // Already freed and possibly re-published: nothing of ours
-                    // left to restore.
-                    _ => break,
-                }
-                if attempt < SPIN_BEFORE_YIELD {
-                    std::hint::spin_loop();
-                } else {
-                    // A sweep under `RECLAIMING` runs a teardown, a retire and a
-                    // pin scan — long enough that burning a core on it is worse
-                    // than descheduling.
-                    std::thread::yield_now();
-                }
-            }
+        // One CAS on `{gen, LIVE}` (ADR-0014): if the slot was recycled since
+        // we found it by key, its gen differs and the CAS fails — the entry this
+        // call meant to evict is already gone, and no other occupant was
+        // touched. There is no window and nothing to undo.
+        if !slot.tombstone_gen(expected) {
             return Ok(());
         }
         // Tear down the occupant we tombstoned. `Stale` here means a concurrent
@@ -295,19 +251,6 @@ impl<'a> KeyedStore<'a> {
     /// quiescence, so those converge too).
     pub fn reclaim_tombstones(&self) -> Result<usize> {
         sweep_tombstones(&self.catalog_seg, &self.head_seg, &self.data_seg)
-    }
-
-    /// The **handoff**: the binding from `r` has been armed in the task
-    /// queue's lease table (a successful `submit_with_binding` /
-    /// `bind_output`), which now owns the pin — release the journal record
-    /// that covered the gap. Call it immediately after the arm; the window
-    /// between the two is the only moment a crash could release the pin
-    /// twice, and the guarded decrement makes that a lost release, never a
-    /// free-under-reader.
-    pub fn binding_armed(&self, r: &RetainedRef) -> Result<()> {
-        let journal = BorrowJournal::attach(&self.journal_seg)?;
-        let _ = journal.release(r.journal_slot);
-        Ok(())
     }
 
     /// Try to reclaim the one slot at `idx` (already tombstoned).
@@ -510,11 +453,22 @@ impl Entry {
         })
     }
 
-    /// The handoff, from the entry: see [`KeyedStore::binding_armed`].
-    pub fn binding_armed(&self, r: &RetainedRef) -> Result<()> {
+    /// The **handoff**, called **before** arming the binding in the task
+    /// queue's lease table (ADR-0014 §4): release the journal record that
+    /// covered the retain, and return the binding to arm. `Err(Stale)` means
+    /// the coordinator's replay already released this pin — this actor was
+    /// declared dead — and the caller must **not** arm: the lease table would
+    /// otherwise own a pin that no longer exists and its reap would steal a
+    /// live reader's. Ordering is deliberate: releasing after the arm let a
+    /// zombie's replay and the lease reap both decrement; releasing before it
+    /// leaves only a few-instruction crash window in which one pin leaks —
+    /// a bounded leak, never a double release.
+    pub fn handoff(&self, r: &RetainedRef) -> Result<RetainedRef> {
         let journal = BorrowJournal::attach(&self.journal_seg)?;
-        let _ = journal.release(r.journal_slot);
-        Ok(())
+        if !journal.release(r.journal_slot)? {
+            return Err(Error::Artifact(shm_artifact::Error::Stale));
+        }
+        Ok(*r)
     }
 
     /// Undo a [`retain_current`](Self::retain_current) whose arm **failed**:

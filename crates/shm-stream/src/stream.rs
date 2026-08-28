@@ -249,10 +249,12 @@ impl<'a> StreamWriter<'a> {
                     // drop the loan, release the journal slot, and return the
                     // chunk to the pool.
                     for s in &batch_staged {
+                        if !self.journal.release(s.slot).unwrap_or(false) {
+                            continue; // replay already reclaimed it
+                        }
                         if let Ok(c) = self.pool.ctrl(&s.desc) {
                             let _ = c.drop_loan();
                         }
-                        let _ = self.journal.release(s.slot);
                         let _ = self.pool.free(&s.desc);
                     }
                     // Return every remaining (un-staged) chunk of this batch,
@@ -308,7 +310,15 @@ impl<'a> StreamWriter<'a> {
         let result = match &mut self.coord {
             Coord::Exclusive(committer) => committer.commit_staged(kind, &descs, &spans, schema_id),
             Coord::Optimistic { expect } => {
-                artifact.commit_staged_optimistic(owner, *expect, kind, &descs, &spans, schema_id)
+                artifact.commit_staged_optimistic_journaled(
+                    owner,
+                    *expect,
+                    kind,
+                    &descs,
+                    &spans,
+                    schema_id,
+                    self.journal,
+                )
             }
         };
 
@@ -339,12 +349,17 @@ impl<'a> StreamWriter<'a> {
     /// cleared so a second call (or `Drop` after `abort`) does nothing.
     fn free_staged(&mut self) {
         for s in &self.staged {
+            // Election first (ADR-0014 §4): if the coordinator's replay already
+            // cleared this slot it also dropped the loan and freed the chunk —
+            // a second free would corrupt the pool's free list.
+            if !self.journal.release(s.slot).unwrap_or(false) {
+                continue;
+            }
             // LOANED -> FREE (bumps generation), then re-link into the free list.
             if let Ok(ctrl) = self.pool.ctrl(&s.desc) {
                 let _ = ctrl.drop_loan();
             }
             let _ = self.pool.free(&s.desc);
-            let _ = self.journal.release(s.slot);
         }
         self.staged.clear();
     }

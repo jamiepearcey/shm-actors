@@ -59,6 +59,9 @@ fn task_bindings_survive_submitter_death_and_release_by_reap_not_replay() {
     let own_pin = in_entry.pin().expect("journaled reader pin");
     // The task's input binding: unjournaled retained pin, dies with the TASK.
     let input_binding = in_entry.retain_current().expect("retain input");
+    // Handoff BEFORE arming (ADR-0014 §4): the journal record that covered the
+    // retain is released, and the lease table becomes the pin's sole owner.
+    let input_binding = in_entry.handoff(&input_binding).expect("input handoff");
     assert_eq!(input_binding.version, 1);
     assert_eq!(
         coord.store_entry_pins(IN_KEY, 1),
@@ -80,9 +83,6 @@ fn task_bindings_survive_submitter_death_and_release_by_reap_not_replay() {
             },
         )
         .expect("submit with input binding");
-    // Handoff: the lease table now owns the input pin; release the journal
-    // record that covered the retain→arm gap (ADR-0010 addendum).
-    in_entry.binding_armed(&input_binding).expect("input handoff");
 
     // --- Worker: claim, read the input zero-copy, retain + bind the output. ---
     let mut worker =
@@ -112,7 +112,8 @@ fn task_bindings_survive_submitter_death_and_release_by_reap_not_replay() {
             .create(OUT_KEY, RefKind::Dataset, &demo_schema())
             .expect("create output");
         out.commit_replace(&batch).expect("commit output");
-        out.retain_current().expect("retain output")
+        let r = out.retain_current().expect("retain output");
+        out.handoff(&r).expect("output handoff")
     };
     task.bind_output(shm_task::LeaseBinding {
         artifact_id: out_binding.artifact_id,
@@ -120,11 +121,6 @@ fn task_bindings_survive_submitter_death_and_release_by_reap_not_replay() {
         version: out_binding.version,
     })
     .expect("bind output");
-    worker
-        .store()
-        .expect("worker store")
-        .binding_armed(&out_binding)
-        .expect("output handoff");
     task.complete(shm_core::ChunkDesc::ZERO).expect("complete");
     assert_eq!(coord.store_entry_pins(OUT_KEY, 1), Some(1), "output retained");
 

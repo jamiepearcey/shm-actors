@@ -66,6 +66,14 @@ pub const ENTRY_ARTIFACT_PIN: u32 = 2;
 /// writer) is crash-reclaimed by the coordinator force-releasing the artifact's
 /// fenced write lease.
 pub const ENTRY_WRITE_LEASE: u32 = 3;
+/// Entry-kind tag: a **staged, not-yet-installed manifest** (ADR-0014 §3),
+/// payload = `{artifact_id, incarnation, manifest PackedRef bits, generation}`.
+/// Recorded when a commit stages its manifest chunk, released after the
+/// install CAS (or rollback). A leaked one is a committer that died before
+/// installing: replay tears the version down through the manifest cascade —
+/// iff no live pin slot endorses that manifest, which is what an install
+/// leaves behind.
+pub const ENTRY_STAGED_MANIFEST: u32 = 4;
 
 /// One fixed-size, POD journal slot: a `kind` tag plus a 24-byte payload.
 ///
@@ -162,6 +170,28 @@ impl JournalEntry {
         }
     }
 
+    /// Build a staged-manifest entry (ADR-0014 §3).
+    #[inline]
+    pub fn staged_manifest(
+        artifact_id: u32,
+        incarnation: u32,
+        manifest: u64,
+        generation: u32,
+    ) -> JournalEntry {
+        JournalEntry {
+            kind: ENTRY_STAGED_MANIFEST,
+            _pad: 0,
+            w: [
+                artifact_id,
+                incarnation,
+                manifest as u32,
+                (manifest >> 32) as u32,
+                generation,
+                0,
+            ],
+        }
+    }
+
     /// Decode this entry into a typed [`JournalRecord`], or `None` for an
     /// unrecognised / empty tag.
     #[inline]
@@ -184,6 +214,12 @@ impl JournalEntry {
                 artifact_id: self.w[0],
                 incarnation: self.w[2],
                 fence: self.w[1],
+            }),
+            ENTRY_STAGED_MANIFEST => Some(JournalRecord::StagedManifest {
+                artifact_id: self.w[0],
+                incarnation: self.w[1],
+                manifest: u64::from(self.w[2]) | (u64::from(self.w[3]) << 32),
+                generation: self.w[4],
             }),
             _ => None,
         }
@@ -229,6 +265,19 @@ pub enum JournalRecord {
         incarnation: u32,
         /// The fence generation the writer acquired the lease under.
         fence: u32,
+    },
+    /// A staged, not-yet-installed manifest (ADR-0014 §3): the committer died
+    /// between staging and the install CAS. Replay tears the version down via
+    /// the manifest cascade iff no live pin slot endorses the manifest.
+    StagedManifest {
+        /// The artifact the commit targeted.
+        artifact_id: u32,
+        /// The occupant it targeted.
+        incarnation: u32,
+        /// The staged manifest chunk's `PackedRef` bits.
+        manifest: u64,
+        /// The manifest chunk's generation when staged; the release validates it.
+        generation: u32,
     },
 }
 
@@ -390,6 +439,22 @@ impl<'s> BorrowJournal<'s> {
     /// reclaimed by the coordinator force-releasing the artifact's fenced write
     /// lease. Convenience over [`record_entry`](Self::record_entry) with
     /// [`JournalEntry::write_lease`].
+    pub fn record_staged_manifest(
+        &self,
+        artifact_id: u32,
+        incarnation: u32,
+        manifest: u64,
+        generation: u32,
+    ) -> Result<usize> {
+        self.record_entry(JournalEntry::staged_manifest(
+            artifact_id,
+            incarnation,
+            manifest,
+            generation,
+        ))
+    }
+
+    /// Record an exclusive write lease (item K).
     pub fn record_write_lease(
         &self,
         artifact_id: u32,
@@ -446,15 +511,21 @@ impl<'s> BorrowJournal<'s> {
     ///
     /// Idempotent-safe against out-of-range indices (returns
     /// [`Error::OutOfBounds`]). Clearing a slot that is already free is a no-op.
-    pub fn release(&self, slot: usize) -> Result<()> {
+    pub fn release(&self, slot: usize) -> Result<bool> {
         if slot >= self.capacity {
             return Err(Error::OutOfBounds);
         }
         let w = slot / 64;
         let mask = 1u64 << (slot % 64);
-        self.word(w).fetch_and(!mask, Ordering::AcqRel);
+        // The `fetch_and` is an election: exactly one caller observes the bit
+        // set. **The journal slot is ownership of the borrow it records**
+        // (ADR-0014 §4): whoever clears the bit performs the shared-memory
+        // release, and a caller that lost — because the coordinator's replay
+        // already reclaimed a borrow it believed the actor died holding —
+        // must not release again.
+        let prev = self.word(w).fetch_and(!mask, Ordering::AcqRel);
         self.header().hint.store(slot as u32, Ordering::Relaxed);
-        Ok(())
+        Ok(prev & mask != 0)
     }
 
     /// Whether `slot` currently holds an entry.
@@ -485,6 +556,14 @@ impl<'s> BorrowJournal<'s> {
     /// actor's borrows. O(N). Yields each occupied slot decoded into a typed
     /// [`JournalRecord`] (an unrecognised tag is skipped).
     pub fn replay(&self) -> impl Iterator<Item = JournalRecord> + '_ {
+        self.replay_indexed().into_iter().map(|(_, r)| r)
+    }
+
+    /// [`replay`](Self::replay) with each record's slot index, so a replayer
+    /// can [`release`](Self::release) the slot **before** reclaiming — winning
+    /// the election against the (possibly still-running) actor's own clean
+    /// release (ADR-0014 §4).
+    pub fn replay_indexed(&self) -> Vec<(usize, JournalRecord)> {
         let mut out = Vec::new();
         for w in 0..self.words {
             let mut bits = self.word(w).load(Ordering::Acquire) & self.valid_mask(w);
@@ -496,10 +575,10 @@ impl<'s> BorrowJournal<'s> {
                 // published; `idx < capacity`.
                 let entry = unsafe { self.slots.add(idx).read() };
                 if let Some(rec) = entry.to_record() {
-                    out.push(rec);
+                    out.push((idx, rec));
                 }
             }
         }
-        out.into_iter()
+        out
     }
 }

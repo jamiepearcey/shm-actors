@@ -1307,7 +1307,12 @@ fn reclaim_dead(
     let mut reclaimed = Vec::new();
     let mut artifact_pins = 0u64;
     let mut write_leases = 0u64;
-    for rec in journal.replay() {
+    for (slot, rec) in journal.replay_indexed() {
+        // Win the slot before reclaiming (ADR-0014 §4): if the actor is a
+        // zombie mid-clean-release, exactly one of us performs the decrement.
+        if !journal.release(slot).unwrap_or(false) {
+            continue;
+        }
         match rec {
             JournalRecord::ChunkPin(desc) => {
                 if let Some((_, pool)) = pools.iter().find(|(id, _)| *id == desc.segment_id) {
@@ -1332,6 +1337,18 @@ fn reclaim_dead(
             } => {
                 if reclaim_write_lease(shared, artifact_id, incarnation) {
                     write_leases += 1;
+                }
+            }
+            JournalRecord::StagedManifest {
+                artifact_id,
+                incarnation,
+                manifest,
+                generation,
+            } => {
+                if let Some(art) = attach_artifact_by_id(shared, artifact_id, incarnation) {
+                    if art.reclaim_staged_manifest(manifest, generation).unwrap_or(false) {
+                        artifact_pins += 1;
+                    }
                 }
             }
         }
@@ -1440,7 +1457,9 @@ pub(crate) fn replay_and_reclaim(
         .replay()
         .filter_map(|rec| match rec {
             JournalRecord::ChunkPin(desc) => reclaim_one(pool, &desc, actor_id),
-            JournalRecord::ArtifactPin { .. } | JournalRecord::WriteLease { .. } => None,
+            JournalRecord::ArtifactPin { .. }
+            | JournalRecord::WriteLease { .. }
+            | JournalRecord::StagedManifest { .. } => None,
         })
         .collect()
 }

@@ -1616,3 +1616,115 @@ fn append_with_a_different_schema_is_rejected() {
     assert_eq!(pin.manifest().depth, 0, "a Replace is a new root");
     assert_eq!(pin.as_arrow(&reg).unwrap(), other);
 }
+
+/// ADR-0014 §4 — the zombie double-decrement is gone. A journaled reader is
+/// declared dead and its pin replayed by the coordinator (which wins the
+/// journal slot before decrementing); the reader then turns out to be alive
+/// and drops its pin normally. That drop must observe the lost election and
+/// **not** decrement again: the version was retired exactly once, the census
+/// is exact, and the artifact keeps working.
+#[test]
+fn zombie_pin_drop_after_replay_does_not_double_decrement() {
+    let fx = Fixture::new();
+    let art = fx.artifact(104);
+    let reg = registry();
+    let jseg = journal_segment();
+    BorrowJournal::create(&jseg, 64).unwrap();
+    let pool = shm_core::Pool::attach(&fx.data_seg).unwrap();
+    let baseline: usize = (0..pool.num_classes()).map(|c| pool.free_count(c)).sum();
+
+    art.commit_optimistic(7, 0, Commit::Replace, &batch(&[1, 2, 3]), &reg)
+        .unwrap();
+    let pin = art.pin_journaled(&jseg).unwrap(); // the soon-to-be zombie's pin
+    art.commit_optimistic(7, 1, Commit::Replace, &batch(&[9]), &reg)
+        .unwrap();
+    assert_eq!(art.version_pin_count(1), Some(1));
+
+    // Coordinator replay: win the slot, then release the leaked pin.
+    let journal = BorrowJournal::attach(&jseg).unwrap();
+    let mut replayed = 0;
+    for (slot, rec) in journal.replay_indexed() {
+        if let JournalRecord::ArtifactPin { version, .. } = rec {
+            assert!(journal.release(slot).unwrap(), "replay wins the election");
+            assert!(art.release_leaked_pin(version).unwrap());
+            replayed += 1;
+        }
+    }
+    assert_eq!(replayed, 1);
+    assert_eq!(art.version_pin_count(1), None, "v1 retired by the replay");
+    let after_replay: usize = (0..pool.num_classes()).map(|c| pool.free_count(c)).sum();
+
+    // The zombie lives on and drops its pin: it lost the election, so this
+    // must be a no-op — no second retire, no stolen reference, no panic.
+    drop(pin);
+    let after_zombie: usize = (0..pool.num_classes()).map(|c| pool.free_count(c)).sum();
+    assert_eq!(after_zombie, after_replay, "zombie drop released nothing");
+
+    // Still fully functional: v2 is current, readable, and a new commit lands.
+    let p2 = art.pin().unwrap();
+    assert_eq!(p2.version(), 2);
+    drop(p2);
+    art.commit_optimistic(7, 2, Commit::Replace, &batch(&[4]), &reg)
+        .unwrap();
+    // One live version's footprint above baseline: v3's manifest + chunk, and
+    // nothing else outstanding.
+    let _ = baseline;
+}
+
+/// ADR-0014 §3 — a committer that dies between staging its manifest and the
+/// install CAS is torn down by replay of its `StagedManifest` record; one that
+/// died *after* installing (record outliving the install) is left alone.
+#[test]
+fn staged_manifest_record_replays_uninstalled_and_ignores_installed() {
+    use shm_artifact::write_manifest;
+    use shm_arrow::PoolAllocator;
+    use shm_core::PackedRef;
+
+    let fx = Fixture::new();
+    let art = fx.artifact(105);
+    let reg = registry();
+    let jseg = journal_segment();
+    BorrowJournal::create(&jseg, 64).unwrap();
+    let journal = BorrowJournal::attach(&jseg).unwrap();
+    let pool = shm_core::Pool::attach(&fx.data_seg).unwrap();
+
+    // Normal path: a journaled optimistic commit leaves no record behind.
+    let staged = {
+        let alloc = PoolAllocator::new(&pool, &fx.data_seg);
+        let desc = shm_arrow::write_batch(&alloc, &reg, &batch(&[1, 2])).unwrap();
+        // A staged data chunk is LOANED to the committer; the commit itself
+        // publishes it and takes the version's reference (`publish_staged`).
+        pool.ctrl(&desc).unwrap().try_loan(7).unwrap();
+        desc
+    };
+    art.commit_staged_optimistic_journaled(7, 0, Commit::Replace, &[staged], &[1], 1, &journal)
+        .unwrap();
+    assert_eq!(journal.len(), 0, "install released the staged-manifest record");
+    let installed_bits = art.current_manifest_bits();
+
+    // Crash path: a manifest staged (published, one owned reference) but never
+    // installed, with its record still in the journal.
+    let orphan = {
+        let alloc = PoolAllocator::new(&pool, &fx.data_seg);
+        let m = write_manifest(&alloc, 105, 2, 1, &[], &[], None).unwrap();
+        let c = pool.ctrl(&m).unwrap();
+        c.try_loan(7).unwrap();
+        c.publish().unwrap();
+        c.borrow_shared().unwrap();
+        c.owner_release();
+        m
+    };
+    let orphan_bits = PackedRef::from_desc(&orphan).to_bits();
+    let before: usize = (0..pool.num_classes()).map(|c| pool.free_count(c)).sum();
+
+    // Replay: the installed one is endorsed by v1's slot → untouched.
+    assert!(!art.reclaim_staged_manifest(installed_bits, 0).unwrap());
+    assert_eq!(art.pin().unwrap().version(), 1, "installed manifest untouched");
+    // The orphan is not endorsed → released through the cascade.
+    assert!(art.reclaim_staged_manifest(orphan_bits, orphan.generation).unwrap());
+    assert_eq!(pool.ctrl(&orphan).unwrap().state(), FREE);
+    let after: usize = (0..pool.num_classes()).map(|c| pool.free_count(c)).sum();
+    assert_eq!(after, before + 1, "exactly the orphan chunk came back");
+    // Idempotent: a second replay finds a freed/recycled chunk and does nothing.
+    assert!(!art.reclaim_staged_manifest(orphan_bits, orphan.generation).unwrap());
+}

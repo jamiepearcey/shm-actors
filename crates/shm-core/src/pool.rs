@@ -30,7 +30,7 @@ use crate::segment::{Segment, HEADER_SIZE};
 use crate::substrate::ShmU64;
 
 /// Magic for a pool header: little-endian `b"SHMPOOL1"`.
-pub const POOL_MAGIC: u64 = u64::from_le_bytes(*b"SHMPOOL1");
+pub const POOL_MAGIC: u64 = u64::from_le_bytes(*b"SHMPOOL2");
 
 /// Free-list slot sentinel meaning "empty".
 const EMPTY: u32 = u32::MAX;

@@ -38,12 +38,12 @@ pub mod pool;
 pub mod segment;
 pub mod substrate;
 
-pub use ctrl::{ChunkCtrl, FREE, LOANED, OWNER_NONE, PUBLISHED};
+pub use ctrl::{pack_word, word_refcount, word_state, ChunkCtrl, FREE, LOANED, OWNER_NONE, PUBLISHED};
 pub use desc::{ChunkDesc, PackedRef};
 pub use error::{Error, Result};
 pub use journal::{
     BorrowJournal, JournalEntry, JournalRecord, DEFAULT_CAPACITY, ENTRY_ARTIFACT_PIN,
-    ENTRY_CHUNK_PIN, ENTRY_EMPTY, JOURNAL_MAGIC,
+    ENTRY_CHUNK_PIN, ENTRY_EMPTY, ENTRY_STAGED_MANIFEST, JOURNAL_MAGIC,
 };
 pub use platform::{
     doorbell_pair, doorbell_park, doorbell_ring, DeathDetection, DoorbellPair, Platform,

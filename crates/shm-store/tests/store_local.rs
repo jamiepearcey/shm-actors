@@ -551,8 +551,8 @@ fn retained_binding_ties_pin_to_entry_and_task_not_actor() {
     // Retain v1 for a task: pin count 1 with NO VersionPin guard held.
     let binding = entry.retain_current().expect("retain current");
     // The arm is simulated here; hand the journaled retain off as the real
-    // protocol would after a successful `submit_with_binding`.
-    entry.binding_armed(&binding).expect("handoff");
+    // protocol does before a `submit_with_binding`.
+    let binding = entry.handoff(&binding).expect("handoff");
     assert_eq!(binding.version, 1);
     assert_eq!(entry.artifact().version_pin_count(1), Some(1));
 
@@ -599,7 +599,7 @@ fn retained_binding_ties_pin_to_entry_and_task_not_actor() {
     // version, evict the entry, and the slot must stay TOMBSTONE until the
     // binding is released — then the sweep frees it and the census balances.
     let held = entry.retain_current().expect("retain v2");
-    entry.binding_armed(&held).expect("handoff");
+    let held = entry.handoff(&held).expect("handoff");
     store.evict(b"task-input").unwrap();
     let cat = Catalog::attach(&h.catalog).unwrap();
     assert_eq!(cat.slot(0).state(), SLOT_TOMBSTONE, "binding defers reclaim");

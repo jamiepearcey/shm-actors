@@ -55,7 +55,7 @@ use crate::error::{Error, Result};
 /// Bumped from `SHMSTOR1` for ADR-0008 P0.1: the header gained a free-list head
 /// and each slot gained `gen`/`next_free`, so a v0.5 catalog is rejected rather
 /// than misread.
-pub const CATALOG_MAGIC: u64 = u64::from_le_bytes(*b"SHMSTOR2");
+pub const CATALOG_MAGIC: u64 = u64::from_le_bytes(*b"SHMSTOR3");
 
 /// Slot state: unused and claimable (also the zero-initialised value).
 pub const SLOT_FREE: u32 = 0;
@@ -159,19 +159,37 @@ pub struct CatalogSlot {
     pub head_off: ShmU32,
     /// The [`RefKind`] discriminant (a `u16` value stored in a `u32` word).
     pub kind: ShmU32,
-    /// Lifecycle state; the single CAS gate publishing/retiring the slot.
-    pub state: ShmU32,
-    /// The incarnation the **next** occupant of this slot will be stamped with
-    /// (ADR-0008 P0.1). Advanced by each reclaim, so no two occupants of one
-    /// slot ever share an incarnation.
-    pub gen: ShmU32,
+    /// **`{gen:32 (hi) | state:32 (lo)}` in ONE word.** `gen` is the
+    /// incarnation the next occupant will carry (advanced by each reclaim);
+    /// `state` is the lifecycle. Packed so a tombstone is a CAS on the occupant
+    /// *and* the state together (ADR-0014): through `SHMSTOR2` an evictor
+    /// tombstoned by state alone and re-checked `gen` afterwards, and a full
+    /// recycle inside that window — plus a sweep claiming the slot before the
+    /// undo — could tear down an innocent new occupant.
+    pub word: ShmU64,
     /// Free-list link while this slot is [`SLOT_FREE`] and on the list;
     /// [`FREE_NIL`] terminates. Meaningless in any other state.
     pub next_free: ShmU32,
+    /// Pad to 32 bytes. Zero.
+    pub _pad: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<CatalogSlot>() == 28);
-const _: () = assert!(core::mem::align_of::<CatalogSlot>() == 4);
+const _: () = assert!(core::mem::size_of::<CatalogSlot>() == 32);
+const _: () = assert!(core::mem::align_of::<CatalogSlot>() == 8);
+
+/// Pack `{gen (hi) | state (lo)}`.
+#[inline]
+pub const fn pack_slot_word(gen: u32, state: u32) -> u64 {
+    ((gen as u64) << 32) | (state as u64)
+}
+#[inline]
+const fn slot_word_gen(w: u64) -> u32 {
+    (w >> 32) as u32
+}
+#[inline]
+const fn slot_word_state(w: u64) -> u32 {
+    w as u32
+}
 
 impl CatalogSlot {
     /// The interned key id this slot tracks (`0` if none).
@@ -201,7 +219,7 @@ impl CatalogSlot {
     /// The current lifecycle state ([`SLOT_FREE`]/[`SLOT_LIVE`]/[`SLOT_TOMBSTONE`]).
     #[inline]
     pub fn state(&self) -> u32 {
-        self.state.load(Acquire)
+        slot_word_state(self.word.load(Acquire))
     }
 
     /// Write the four data fields (before publishing the state). The writer owns
@@ -220,68 +238,89 @@ impl CatalogSlot {
     /// The incarnation the next occupant of this slot will carry.
     #[inline]
     pub fn gen(&self) -> u32 {
-        self.gen.load(Acquire)
+        slot_word_gen(self.word.load(Acquire))
     }
 
-    /// Publish the slot: CAS `state` `FREE → LIVE`. `true` iff this caller won.
+    /// CAS the state half from `from` to `to` **at the current gen** — a state
+    /// transition that fails if the occupant changed underneath it.
+    #[inline]
+    fn cas_state(&self, from: u32, to: u32) -> bool {
+        let mut cur = self.word.load(Acquire);
+        loop {
+            if slot_word_state(cur) != from {
+                return false;
+            }
+            match self.word.compare_exchange(
+                cur,
+                pack_slot_word(slot_word_gen(cur), to),
+                AcqRel,
+                Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// Publish the slot: `FREE → LIVE`. `true` iff this caller won.
     #[inline]
     pub fn publish(&self) -> bool {
-        self.state
-            .compare_exchange(SLOT_FREE, SLOT_LIVE, AcqRel, Acquire)
+        self.cas_state(SLOT_FREE, SLOT_LIVE)
+    }
+
+    /// Tombstone **occupant `gen`**: one CAS `{gen, LIVE} → {gen, TOMBSTONE}`.
+    /// A slot recycled since the caller observed `gen` carries a different gen
+    /// and the CAS fails — the entry the caller meant is already gone, no other
+    /// occupant was touched, and there is nothing to undo. This is the ADR-0008
+    /// residual race closed (ADR-0014).
+    #[inline]
+    pub fn tombstone_gen(&self, gen: u32) -> bool {
+        self.word
+            .compare_exchange(
+                pack_slot_word(gen, SLOT_LIVE),
+                pack_slot_word(gen, SLOT_TOMBSTONE),
+                AcqRel,
+                Acquire,
+            )
             .is_ok()
     }
 
-    /// Tombstone the slot: CAS `state` `LIVE → TOMBSTONE`. `true` iff this caller
-    /// performed the transition; `false` if it was not `LIVE` (already tombstoned
-    /// or never published) — which makes eviction idempotent.
+    /// Tombstone whichever occupant is live: `LIVE → TOMBSTONE` at the current
+    /// gen (tests and tools; `KeyedStore::evict` uses [`tombstone_gen`]).
+    ///
+    /// [`tombstone_gen`]: Self::tombstone_gen
     #[inline]
     pub fn tombstone(&self) -> bool {
-        self.state
-            .compare_exchange(SLOT_LIVE, SLOT_TOMBSTONE, AcqRel, Acquire)
-            .is_ok()
+        self.cas_state(SLOT_LIVE, SLOT_TOMBSTONE)
     }
 
-    /// Undo a tombstone that turns out to have hit the wrong occupant: CAS
-    /// `state` `TOMBSTONE → LIVE`. `true` iff this caller performed the
-    /// transition; `false` means a sweep already took the slot (`RECLAIMING`,
-    /// or beyond) and the caller must re-observe [`state`](Self::state).
-    ///
-    /// Only the evictor that *won* the tombstone CAS and then found the
-    /// occupant changed underneath it (`gen`/`key_id` no longer what it scanned
-    /// — see `KeyedStore::evict`) may call this.
-    #[inline]
-    pub(crate) fn untombstone(&self) -> bool {
-        self.state
-            .compare_exchange(SLOT_TOMBSTONE, SLOT_LIVE, AcqRel, Acquire)
-            .is_ok()
-    }
-
-    /// Take exclusive ownership for a sweep: CAS `state` `TOMBSTONE → RECLAIMING`.
-    /// `true` iff this caller won and must now either
+    /// Take exclusive ownership for a sweep: `TOMBSTONE → RECLAIMING`. `true`
+    /// iff this caller won and must now either
     /// [`finish_reclaim`](Self::finish_reclaim) or [`abort_reclaim`](Self::abort_reclaim).
     #[inline]
     fn begin_reclaim(&self) -> bool {
-        self.state
-            .compare_exchange(SLOT_TOMBSTONE, SLOT_RECLAIMING, AcqRel, Acquire)
-            .is_ok()
+        self.cas_state(SLOT_TOMBSTONE, SLOT_RECLAIMING)
     }
 
     /// Give the slot back to the tombstone pool: the entry was not quiescent, so
-    /// a later sweep must try again.
+    /// a later sweep must try again. Exclusive (we hold `RECLAIMING`); gen kept.
     #[inline]
     fn abort_reclaim(&self) {
-        self.state.store(SLOT_TOMBSTONE, Release);
+        let cur = self.word.load(Acquire);
+        self.word
+            .store(pack_slot_word(slot_word_gen(cur), SLOT_TOMBSTONE), Release);
     }
 
-    /// Clear the slot's fields and advance `gen`, returning the incarnation the
-    /// next occupant will carry — or `None` if `gen` would wrap, in which case
-    /// the slot stays `RECLAIMING` **forever** rather than risking a reused
-    /// incarnation. The caller stores `FREE` only on `Some`.
+    /// Clear the slot's key, advance `gen` and return the slot to `FREE` in
+    /// **one store** (we hold `RECLAIMING` exclusively), returning the
+    /// incarnation the next occupant will carry — or `None`, leaving the slot
+    /// parked in `RECLAIMING` forever, if `gen` would wrap.
     #[inline]
     fn finish_reclaim(&self) -> Option<u32> {
-        let next = self.gen.load(Acquire).checked_add(1)?;
+        let cur = self.word.load(Acquire);
+        let next = slot_word_gen(cur).checked_add(1)?;
         self.key_id.store(0, Release);
-        self.gen.store(next, Release);
+        self.word.store(pack_slot_word(next, SLOT_FREE), Release);
         Some(next)
     }
 }
@@ -373,9 +412,9 @@ impl<'s> Catalog<'s> {
                     artifact_id: ShmU32::new(0),
                     head_off: ShmU32::new(0),
                     kind: ShmU32::new(0),
-                    state: ShmU32::new(SLOT_FREE),
-                    gen: ShmU32::new(FIRST_GEN),
+                    word: ShmU64::new(pack_slot_word(FIRST_GEN, SLOT_FREE)),
                     next_free: ShmU32::new(FREE_NIL),
+                    _pad: 0,
                 });
             }
         }
@@ -512,7 +551,6 @@ impl<'s> Catalog<'s> {
         }
         match slot.finish_reclaim() {
             Some(_) => {
-                slot.state.store(SLOT_FREE, Release);
                 self.push_free(idx);
                 true
             }
@@ -728,7 +766,7 @@ mod tests {
         cat.publish_slot(idx, 1, RefKind::Dataset);
         assert!(cat.slot(idx).tombstone());
         // Jump `gen` to the last value it can hold.
-        cat.slot(idx).gen.store(u32::MAX, Release);
+        cat.slot(idx).word.store(pack_slot_word(u32::MAX, SLOT_TOMBSTONE), Release);
 
         assert!(
             !cat.try_reclaim(idx, |_, _| true),

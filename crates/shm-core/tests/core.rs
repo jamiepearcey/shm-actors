@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use shm_core::ctrl::ChunkCtrl;
-use shm_core::{
+use shm_core::{pack_word, ShmU64, 
     BorrowJournal, ChunkDesc, Error, JournalRecord, PackedRef, Platform, Pool, PoolConfig,
     PosixPlatform, Segment, SharedPod, FREE, LAYOUT_VERSION, LOANED, PUBLISHED, SEGMENT_MAGIC,
 };
@@ -15,7 +15,9 @@ fn chunk_offsets(jrn: &BorrowJournal) -> Vec<u32> {
         .replay()
         .filter_map(|r| match r {
             JournalRecord::ChunkPin(d) => Some(d.offset),
-            JournalRecord::ArtifactPin { .. } | JournalRecord::WriteLease { .. } => None,
+            JournalRecord::ArtifactPin { .. }
+            | JournalRecord::WriteLease { .. }
+            | JournalRecord::StagedManifest { .. } => None,
         })
         .collect();
     offs.sort_unstable();
@@ -244,8 +246,7 @@ fn pool_treiber_aba_safety() {
 fn chunkctrl_state_machine() {
     use shm_core::ShmU32;
     let ctrl = ChunkCtrl {
-        state: ShmU32::new(FREE),
-        refcount: ShmU32::new(0),
+        word: ShmU64::new(pack_word(FREE, 0)),
         owner_actor: ShmU32::new(0),
         generation: ShmU32::new(0),
     };
@@ -284,8 +285,7 @@ fn chunkctrl_state_machine() {
 fn chunkctrl_drop_loan_bumps_generation() {
     use shm_core::ShmU32;
     let ctrl = ChunkCtrl {
-        state: ShmU32::new(FREE),
-        refcount: ShmU32::new(0),
+        word: ShmU64::new(pack_word(FREE, 0)),
         owner_actor: ShmU32::new(0),
         generation: ShmU32::new(5),
     };
@@ -433,6 +433,7 @@ fn journal_tagged_entries_roundtrip_all_kinds() {
                 incarnation,
                 fence,
             } => leases.push((artifact_id, incarnation, fence)),
+            JournalRecord::StagedManifest { .. } => {}
         }
     }
     chunks.sort_unstable();
@@ -544,4 +545,29 @@ fn adopted_fd_segment_is_unnamed_and_unlink_is_a_noop() {
     drop(reattach);
     drop(adopted);
     seg.unlink().expect("creator unlink");
+}
+
+/// ADR-0014 §4: releasing a journal slot is an election — the first caller
+/// observes it occupied and wins; a second (a zombie's clean release after the
+/// coordinator's replay, or vice versa) observes it already cleared and must
+/// not perform the shared-memory release.
+fn journal_seg_for_test(capacity: usize) -> Segment {
+    let id = 90_000 + (std::process::id() & 0x3ff);
+    let _ = Segment::unlink_by_id(id);
+    Segment::create(id, 64 * 1024 + capacity * 64).expect("journal seg")
+}
+
+#[test]
+fn journal_release_is_an_election() {
+    let seg = journal_seg_for_test(64);
+    let jrn = BorrowJournal::create(&seg, 64).unwrap();
+    let slot = jrn.record_artifact_pin(5, 1, 3).unwrap();
+    assert!(jrn.release(slot).unwrap(), "first release wins the slot");
+    assert!(!jrn.release(slot).unwrap(), "second release loses: bit already clear");
+    assert_eq!(jrn.len(), 0);
+    // `replay_indexed` yields the slot so a replayer can win it before acting.
+    let s2 = jrn.record_artifact_pin(6, 1, 4).unwrap();
+    let idx: Vec<usize> = jrn.replay_indexed().into_iter().map(|(i, _)| i).collect();
+    assert_eq!(idx, vec![s2]);
+    seg.unlink().ok();
 }
