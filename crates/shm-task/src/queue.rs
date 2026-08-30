@@ -1829,6 +1829,16 @@ impl ClaimedTask<'_> {
         self.worker_id
     }
 
+    /// How many times this task was requeued by a lease [`reap`](TaskQueue::reap)
+    /// before this claim: `0` for a first delivery, `n > 0` for the `n`-th
+    /// at-least-once redelivery after a claimant died or overran its lease.
+    /// Read-only observability so a worker (or its reply) can say whether it is
+    /// serving a redelivery; the correlation id is unchanged across retries.
+    #[inline]
+    pub fn attempt(&self) -> u32 {
+        self.queue.slot(self.idx).retry.load(Ordering::Acquire)
+    }
+
     /// Whether cancellation has been requested (the cooperative poll).
     ///
     /// A cooperative worker calls this periodically and, when it returns `true`,

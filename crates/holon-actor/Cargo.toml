@@ -1,0 +1,21 @@
+[package]
+name = "holon-actor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+holon-core = { workspace = true }
+shm-core = { workspace = true }
+shm-arrow = { workspace = true }
+shm-artifact = { workspace = true }
+shm-ring = { workspace = true }
+shm-store = { workspace = true }
+shm-task = { workspace = true }
+shm-runtime = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+thiserror = { workspace = true }

@@ -1026,6 +1026,25 @@ impl TaskQueueHandle {
             .claim_blocking_with_lease(self.worker_id, lease_nanos, &parker))
     }
 
+    /// A parker over a duplicate of the **work** doorbell read-end, for a
+    /// worker that claims in a loop: [`claim_blocking`](Self::claim_blocking)
+    /// duplicates the fd on every call (a `dup` + `close` pair per claim), which
+    /// is fine for a one-shot worker but a measurable tax on a per-message hot
+    /// loop. Build one parker and pass it to
+    /// [`queue().claim_blocking_with_lease`](TaskQueue::claim_blocking_with_lease)
+    /// with [`worker_id`](Self::worker_id).
+    pub fn work_parker(&self) -> Result<DoorbellParker> {
+        Ok(DoorbellParker::new(self.work_read.try_clone()?))
+    }
+
+    /// A parker over a duplicate of the **done** doorbell read-end — the
+    /// requester-side twin of [`work_parker`](Self::work_parker), for a caller
+    /// that [`wait`](Self::wait)s per message (pass it to
+    /// [`queue().wait`](TaskQueue::wait)).
+    pub fn done_parker(&self) -> Result<DoorbellParker> {
+        Ok(DoorbellParker::new(self.done_read.try_clone()?))
+    }
+
     /// Block (parked on the done doorbell) until the task reaches a terminal
     /// [`Outcome`].
     pub fn wait(&self, handle: TaskHandle) -> Result<Outcome> {

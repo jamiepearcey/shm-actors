@@ -84,6 +84,16 @@ impl<'a> KeyedStore<'a> {
         }
     }
 
+    /// The store's shared **data** segment (one pool backing every entry's
+    /// chunks). Exposed so a layer above can place its own POD envelopes in the
+    /// same pool the G1 `TypedRef` rides in ([`write_typed_ref`](crate::write_typed_ref)):
+    /// an envelope destined for another process must live in a segment every
+    /// actor has mapped, and this is the one they all share (ADR-0015).
+    #[inline]
+    pub fn data_segment(&self) -> &Arc<Segment> {
+        &self.data_seg
+    }
+
     /// Attach a fresh [`Catalog`] handle over the mapped catalog segment.
     fn catalog(&self) -> Result<Catalog<'_>> {
         Catalog::attach(&self.catalog_seg)

@@ -1,0 +1,28 @@
+[package]
+name = "holon-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+holon-core = { workspace = true }
+holon-actor = { workspace = true }
+shm-core = { workspace = true }
+shm-arrow = { workspace = true }
+shm-store = { workspace = true }
+shm-task = { workspace = true }
+shm-runtime = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+bytemuck = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "holon-demo"
+path = "src/main.rs"

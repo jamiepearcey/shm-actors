@@ -11,6 +11,9 @@ members = [
     "crates/shm-runtime",
     "crates/shm-bench",
     "crates/shm-arrowref-spike",
+    "crates/holon-core",
+    "crates/holon-actor",
+    "crates/holon-demo",
 ]
 # The cargo-fuzz harnesses (v0.4 stage N) are a separate nightly-only crate with
 # their own detached workspace; keep them out of the pinned-stable workspace so
@@ -44,6 +47,8 @@ shm-artifact = { path = "crates/shm-artifact", version = "0.1.0", registry = "ke
 shm-stream = { path = "crates/shm-stream", version = "0.1.0", registry = "kellnr" }
 shm-store = { path = "crates/shm-store", version = "0.1.0", registry = "kellnr" }
 shm-runtime = { path = "crates/shm-runtime", version = "0.1.0", registry = "kellnr" }
+holon-core = { path = "crates/holon-core" }
+holon-actor = { path = "crates/holon-actor" }
 
 # External
 bytemuck = { version = "1", features = ["derive"] }
