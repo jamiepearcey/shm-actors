@@ -1465,12 +1465,12 @@ fn self_link_and_forward_link_are_rejected() {
     let link = head.link_from(shm_core::PackedRef(0x0000_0001_0000_1000), 0);
     // Version 1 linking to version 1: a self-link.
     assert!(matches!(
-        write_manifest(&alloc, 305, 1, head.schema_id, &[], &[], Some(&link)),
+        write_manifest(&alloc, 305, 1, head.schema_id, &[], &[], Some(&link), None),
         Err(shm_artifact::Error::Unsupported(_))
     ));
     // Version 0 linking to version 1: a forward link.
     assert!(matches!(
-        write_manifest(&alloc, 305, 0, head.schema_id, &[], &[], Some(&link)),
+        write_manifest(&alloc, 305, 0, head.schema_id, &[], &[], Some(&link), None),
         Err(shm_artifact::Error::Unsupported(_))
     ));
     assert_eq!(
@@ -1706,7 +1706,7 @@ fn staged_manifest_record_replays_uninstalled_and_ignores_installed() {
     // installed, with its record still in the journal.
     let orphan = {
         let alloc = PoolAllocator::new(&pool, &fx.data_seg);
-        let m = write_manifest(&alloc, 105, 2, 1, &[], &[], None).unwrap();
+        let m = write_manifest(&alloc, 105, 2, 1, &[], &[], None, None).unwrap();
         let c = pool.ctrl(&m).unwrap();
         c.try_loan(7).unwrap();
         c.publish().unwrap();
@@ -1727,4 +1727,432 @@ fn staged_manifest_record_replays_uninstalled_and_ignores_installed() {
     assert_eq!(after, before + 1, "exactly the orphan chunk came back");
     // Idempotent: a second replay finds a freed/recycled chunk and does nothing.
     assert!(!art.reclaim_staged_manifest(orphan_bits, orphan.generation).unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0016 — windowed append (`Commit::Window`, `WindowPolicy`) + delta read
+// ---------------------------------------------------------------------------
+
+use shm_artifact::WindowPolicy;
+
+/// A lineage pool whose 256 B class holds the data chunks and the small
+/// (Append) manifests, plus a 4096 B class for the wider `Window` manifests
+/// (`64 + 24·chunks + 4·batches` bytes: up to ~140 single-chunk batches).
+fn windowed_artifact(name_id: u32, chunks: u32) -> (Fixture, Artifact) {
+    let pool = PoolConfig {
+        classes: vec![
+            shm_core::SizeClass {
+                chunk_size: 256,
+                chunk_count: chunks,
+            },
+            shm_core::SizeClass {
+                chunk_size: 4096,
+                chunk_count: 64,
+            },
+        ],
+    };
+    let fx = Fixture::with_data_size(256 * chunks as usize + 4096 * 64 + (1 << 20));
+    let art = fx.artifact_with(name_id, &pool);
+    (fx, art)
+}
+
+/// The rows of a pinned version across every batch, in row order.
+fn rows(pin: &shm_artifact::VersionPin, reg: &SchemaRegistry) -> Vec<i64> {
+    pin.as_arrow_batches(reg)
+        .unwrap()
+        .iter()
+        .flat_map(col)
+        .collect()
+}
+
+/// (w1) A `Window` re-roots on the newest `keep_batches` batches: the table
+/// is exactly those plus the new batch, depth resets to 0, and the prior
+/// chain's tail — every batch older than the window — is back in the pool.
+/// `keep_batches == 0` is a `Replace`.
+#[test]
+fn window_commit_keeps_the_newest_batches_and_frees_the_tail() {
+    let (fx, art) = windowed_artifact(401, 256);
+    let reg = registry();
+    let baseline = free_total(&fx.data_seg);
+
+    let mut w = art.open_exclusive(7).unwrap();
+    w.commit(Commit::Replace, &batch(&[1]), &reg).unwrap();
+    for i in 2..=10i64 {
+        w.commit(Commit::Append, &batch(&[i]), &reg).unwrap();
+    }
+    assert_eq!(baseline - free_total(&fx.data_seg), 2 * 10);
+
+    let v = w
+        .commit(Commit::Window { keep_batches: 3 }, &batch(&[11]), &reg)
+        .unwrap();
+    assert_eq!(v, 11);
+    let pin = art.pin().unwrap();
+    assert_eq!(pin.manifest().depth, 0, "a Window is a root");
+    assert!(pin.manifest().prev.is_none());
+    assert_eq!(pin.manifest().chunks.len(), 4);
+    assert_eq!(pin.manifest().batch_spans, vec![1, 1, 1, 1]);
+    assert_eq!(rows(&pin, &reg), vec![8, 9, 10, 11]);
+    assert_eq!(col(&pin.as_arrow(&reg).unwrap()), vec![8, 9, 10, 11]);
+    drop(pin);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        4 + 1,
+        "3 kept + 1 new data chunks and one manifest; v1..v7 and every old manifest freed"
+    );
+
+    // Appending onto the new root chains as before.
+    w.commit(Commit::Append, &batch(&[12]), &reg).unwrap();
+    assert_eq!(rows(&art.pin().unwrap(), &reg), vec![8, 9, 10, 11, 12]);
+    assert_eq!(baseline - free_total(&fx.data_seg), 5 + 2);
+
+    // keep_batches == 0: a Replace.
+    w.commit(Commit::Window { keep_batches: 0 }, &batch(&[13]), &reg)
+        .unwrap();
+    assert_eq!(rows(&art.pin().unwrap(), &reg), vec![13]);
+    assert_eq!(baseline - free_total(&fx.data_seg), 2);
+
+    // A window wider than the table keeps the whole table.
+    w.commit(Commit::Append, &batch(&[14]), &reg).unwrap();
+    w.commit(Commit::Window { keep_batches: 99 }, &batch(&[15]), &reg)
+        .unwrap();
+    assert_eq!(rows(&art.pin().unwrap(), &reg), vec![13, 14, 15]);
+    assert_eq!(baseline - free_total(&fx.data_seg), 3 + 1);
+}
+
+/// (w2) `WindowPolicy` over 10 000 single-batch commits in a pool of 256
+/// small chunks: a plain Append lineage would need 20 000. The chain depth,
+/// the live chunk count and the table size stay inside the policy's bounds
+/// the whole way, and the table always reads back as the newest rows in
+/// order.
+#[test]
+fn window_policy_bounds_chunks_depth_and_read_over_10k_commits() {
+    let (fx, art) = windowed_artifact(402, 256);
+    let reg = registry();
+    let baseline = free_total(&fx.data_seg);
+    let policy = WindowPolicy::new(16);
+
+    let mut w = art.open_exclusive(7).unwrap();
+    let mut windows = 0usize;
+    for i in 1..=10_000i64 {
+        let kind = policy.commit_for_depth(art.current_depth());
+        if matches!(kind, Commit::Window { .. }) {
+            windows += 1;
+        }
+        assert_eq!(w.commit_windowed(&policy, &batch(&[i]), &reg).unwrap(), i as u64);
+        if i % 1000 == 0 || i < 40 {
+            let pin = art.pin().unwrap();
+            let m = pin.manifest().clone();
+            assert!(m.depth < 16, "v{i}: depth {} escaped the policy", m.depth);
+            let n = m.total_batches as i64;
+            assert!((16..=32).contains(&n) || i <= 32, "v{i}: {n} batches");
+            let expect: Vec<i64> = ((i - n + 1)..=i).collect();
+            assert_eq!(rows(&pin, &reg), expect, "v{i}: table is the newest {n} rows");
+            drop(pin);
+            let live = baseline - free_total(&fx.data_seg);
+            // chain members (manifests) + one data chunk per batch
+            assert_eq!(live, m.depth as usize + 1 + n as usize, "v{i}: census");
+            assert!(live <= 32 + 16, "v{i}: {live} live chunks");
+        }
+    }
+    assert_eq!(windows, 10_000 / 16, "the first root plus one Window per 16 commits");
+    drop(w);
+
+    // Collapse and the census returns to a single version.
+    art.open_exclusive(7)
+        .unwrap()
+        .commit(Commit::Replace, &batch(&[0]), &reg)
+        .unwrap();
+    assert_eq!(baseline - free_total(&fx.data_seg), 2);
+}
+
+/// (w3) `batches_since` walks only the manifests newer than `since`, and
+/// flags a root newer than `since` (a Window or Replace happened) as
+/// `truncated` — the delta then starts at that root.
+#[test]
+fn batches_since_returns_only_new_manifests_and_flags_truncation() {
+    let (_fx, art) = windowed_artifact(403, 256);
+    let reg = registry();
+
+    let mut w = art.open_exclusive(7).unwrap();
+    w.commit(Commit::Replace, &batch(&[1]), &reg).unwrap();
+    w.commit(Commit::Append, &batch(&[2]), &reg).unwrap();
+    w.commit(Commit::Append, &batch(&[3]), &reg).unwrap();
+    let pin = art.pin().unwrap();
+    let rows_of = |d: &shm_artifact::Delta| d.batches.iter().flat_map(col).collect::<Vec<i64>>();
+
+    let d = pin.batches_since(2, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![3], 3, false));
+    let d = pin.batches_since(1, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![2, 3], 2, false));
+    let d = pin.batches_since(3, &reg).unwrap();
+    assert!(d.batches.is_empty() && !d.truncated && d.from_version == 3);
+    let d = pin.batches_since(7, &reg).unwrap();
+    assert!(d.batches.is_empty() && !d.truncated);
+    let d = pin.batches_since(0, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![1, 2, 3], 1, false));
+    drop(pin);
+
+    // v4 = Window{2}: root [2, 3, 4] with members (2,1),(3,1) and base 1 (v2
+    // kept whole, and v2 was linked). The window is transparent to any
+    // reader at or past the base: it gets exactly the rows it lacks.
+    w.commit(Commit::Window { keep_batches: 2 }, &batch(&[4]), &reg)
+        .unwrap();
+    let pin = art.pin().unwrap();
+    let m = pin.manifest();
+    assert_eq!(m.window_base, 1);
+    assert_eq!(
+        m.kept.iter().map(|k| (k.version, k.batches)).collect::<Vec<_>>(),
+        vec![(2, 1), (3, 1)]
+    );
+    let d = pin.batches_since(3, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![4], 4, false));
+    let d = pin.batches_since(2, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![3, 4], 4, false));
+    let d = pin.batches_since(1, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![2, 3, 4], 4, false));
+    let d = pin.batches_since(4, &reg).unwrap();
+    assert!(d.batches.is_empty() && !d.truncated);
+    // from the beginning: the whole (windowed) table, not truncated
+    let d = pin.batches_since(0, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.truncated), (vec![2, 3, 4], false));
+    drop(pin);
+
+    // v5 appends onto the new root: a reader at v4 gets exactly [5]; a
+    // reader still at v3 gets [4, 5] — still exact through the window.
+    w.commit(Commit::Append, &batch(&[5]), &reg).unwrap();
+    let pin = art.pin().unwrap();
+    let d = pin.batches_since(4, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![5], 5, false));
+    let d = pin.batches_since(3, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![4, 5], 4, false));
+    drop(pin);
+
+    // v6 = Window{1} onto a windowed root: v5 kept whole (linked → base 4),
+    // so a reader at v4 still gets an exact [5, 6]; a reader at v3 is now
+    // behind the base and must resync from the root.
+    w.commit(Commit::Window { keep_batches: 1 }, &batch(&[6]), &reg)
+        .unwrap();
+    let pin = art.pin().unwrap();
+    assert_eq!(pin.manifest().window_base, 4);
+    let d = pin.batches_since(4, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![5, 6], 6, false));
+    let d = pin.batches_since(3, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![5, 6], 6, true));
+    drop(pin);
+
+    // v7 = Window{3} keeps the whole of root v6 (2 batches) plus... only 2
+    // exist: the root is kept whole, so its base (4) is inherited and its
+    // member table is flattened: (5,1),(6,1).
+    w.commit(Commit::Window { keep_batches: 3 }, &batch(&[7]), &reg)
+        .unwrap();
+    let pin = art.pin().unwrap();
+    let m = pin.manifest();
+    assert_eq!(m.window_base, 4);
+    assert_eq!(
+        m.kept.iter().map(|k| (k.version, k.batches)).collect::<Vec<_>>(),
+        vec![(5, 1), (6, 1)]
+    );
+    let d = pin.batches_since(4, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.truncated), (vec![5, 6, 7], false));
+    let d = pin.batches_since(5, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.truncated), (vec![6, 7], false));
+    let d = pin.batches_since(6, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.truncated), (vec![7], false));
+    drop(pin);
+
+    // A Replace is never transparent: a reader at v7 must resync.
+    w.commit(Commit::Replace, &batch(&[8]), &reg).unwrap();
+    let pin = art.pin().unwrap();
+    let d = pin.batches_since(7, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.from_version, d.truncated), (vec![8], 8, true));
+    // ... and a Window that keeps a whole Replace root has that root's own
+    // version as base: a reader at v7 still resyncs, a reader at v8 is exact.
+    w.commit(Commit::Window { keep_batches: 5 }, &batch(&[9]), &reg)
+        .unwrap();
+    let pin = art.pin().unwrap();
+    assert_eq!(pin.manifest().window_base, 8);
+    let d = pin.batches_since(7, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.truncated), (vec![8, 9], true));
+    let d = pin.batches_since(8, &reg).unwrap();
+    assert_eq!((rows_of(&d), d.truncated), (vec![9], false));
+}
+
+/// (w4) A reader pinned on the prior chain survives a Window: the kept
+/// chunks are shared (second reference), the old chain stays readable, and
+/// the pin drop cascades exactly the unkept tail.
+#[test]
+fn pinned_reader_survives_a_window_commit() {
+    let (fx, art) = windowed_artifact(404, 256);
+    let reg = registry();
+    let baseline = free_total(&fx.data_seg);
+
+    let mut w = art.open_exclusive(7).unwrap();
+    w.commit(Commit::Replace, &batch(&[1]), &reg).unwrap();
+    for i in 2..=5i64 {
+        w.commit(Commit::Append, &batch(&[i]), &reg).unwrap();
+    }
+    let held = art.pin().unwrap();
+    assert_eq!(held.version(), 5);
+
+    w.commit(Commit::Window { keep_batches: 2 }, &batch(&[6]), &reg)
+        .unwrap();
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        10 + 2,
+        "the pinned chain (10) plus v6's own data chunk + manifest"
+    );
+    assert_eq!(rows(&held, &reg), vec![1, 2, 3, 4, 5]);
+    assert_eq!(rows(&art.pin().unwrap(), &reg), vec![4, 5, 6]);
+    // The kept chunks carry two references: the old manifests' and the root's.
+    let pool = shm_core::Pool::attach(&fx.data_seg).unwrap();
+    let root = art.pin().unwrap();
+    for (i, c) in root.manifest().chunks.iter().enumerate() {
+        let expect = if i < 2 { 2 } else { 1 };
+        assert_eq!(pool.ctrl(c).unwrap().refcount(), expect, "kept chunk {i}");
+    }
+    drop(root);
+
+    drop(held);
+    assert_eq!(
+        baseline - free_total(&fx.data_seg),
+        3 + 1,
+        "v1..v3 and the five old manifests cascaded; [4],[5] survive on the root's reference"
+    );
+    assert_eq!(rows(&art.pin().unwrap(), &reg), vec![4, 5, 6]);
+}
+
+/// (w5) Optimistic `Window` vs `Append` racing for the same `expect`, 500
+/// rounds: exactly one wins, the loser's rollback releases every kept
+/// reference (or its link), and the census is exact after every round.
+#[test]
+fn optimistic_window_vs_append_conflict_census_exact() {
+    let (fx, art) = windowed_artifact(405, 4096);
+    let art = Arc::new(art);
+    let reg = Arc::new(registry());
+    let baseline = free_total(&fx.data_seg);
+
+    let mut current = art
+        .commit_optimistic(7, 0, Commit::Replace, &batch(&[0]), &reg)
+        .unwrap();
+    let mut windows_won = 0usize;
+    for round in 0..500u64 {
+        let barrier = Arc::new(Barrier::new(2));
+        let (a, wv) = thread::scope(|s| {
+            let a = {
+                let art = art.clone();
+                let reg = reg.clone();
+                let b = barrier.clone();
+                s.spawn(move || {
+                    b.wait();
+                    art.commit_optimistic(11, current, Commit::Append, &batch(&[round as i64]), &reg)
+                })
+            };
+            let wv = {
+                let art = art.clone();
+                let reg = reg.clone();
+                let b = barrier.clone();
+                s.spawn(move || {
+                    b.wait();
+                    art.commit_optimistic(
+                        12,
+                        current,
+                        Commit::Window { keep_batches: 4 },
+                        &batch(&[-1]),
+                        &reg,
+                    )
+                })
+            };
+            (a.join().unwrap(), wv.join().unwrap())
+        });
+        match (&a, &wv) {
+            (Ok(v), Err(shm_artifact::Error::Conflict { .. })) => current = *v,
+            (Err(shm_artifact::Error::Conflict { .. }), Ok(v)) => {
+                windows_won += 1;
+                current = *v;
+            }
+            other => panic!("round {round}: expected exactly one winner, got {other:?}"),
+        }
+        assert_eq!(current, round + 2);
+        let pin = art.pin().unwrap();
+        let m = pin.manifest().clone();
+        let live = m.depth as usize + 1 + m.total_batches as usize;
+        assert!(m.total_batches <= 5 + m.depth, "round {round}: window not honoured");
+        drop(pin);
+        assert_eq!(
+            baseline - free_total(&fx.data_seg),
+            live,
+            "round {round}: census off (depth {}, batches {})",
+            m.depth,
+            m.total_batches
+        );
+    }
+    eprintln!("window-vs-append: windows won {windows_won}/500 rounds");
+
+    art.commit_optimistic(7, current, Commit::Replace, &batch(&[1]), &reg)
+        .unwrap();
+    assert_eq!(baseline - free_total(&fx.data_seg), 2);
+}
+
+/// (w6) A Window keeps multi-chunk batches (item F) whole: the kept spans are
+/// copied with their chunk groups, every batch reads back intact, and the
+/// census counts each kept chunk once.
+#[test]
+fn window_keeps_multi_chunk_batches_whole() {
+    let fx = Fixture::new();
+    let art = fx.artifact(406);
+    let (b1, schema) = wide_batch(6, 200);
+    let reg = SchemaRegistry::with_schemas(std::slice::from_ref(&schema));
+    let baseline = free_total(&fx.data_seg);
+
+    let mut w = art.open_exclusive(7).unwrap();
+    w.commit(Commit::Replace, &b1, &reg).unwrap();
+    let n = art.pin().unwrap().manifest().chunks.len();
+    assert!(n > 1, "the batch must span several chunks for this test to mean anything");
+    w.commit(Commit::Append, &b1, &reg).unwrap();
+    w.commit(Commit::Append, &b1, &reg).unwrap();
+    assert_eq!(baseline - free_total(&fx.data_seg), 3 * n + 3);
+
+    w.commit(Commit::Window { keep_batches: 2 }, &b1, &reg).unwrap();
+    let pin = art.pin().unwrap();
+    assert_eq!(pin.manifest().chunks.len(), 3 * n);
+    assert_eq!(pin.manifest().batch_spans, vec![n as u32; 3]);
+    let batches = pin.as_arrow_batches(&reg).unwrap();
+    assert_eq!(batches.len(), 3);
+    for b in &batches {
+        assert_eq!(b, &b1);
+    }
+    drop(pin);
+    assert_eq!(baseline - free_total(&fx.data_seg), 3 * n + 1);
+}
+
+/// (w7) A Window whose new batch has a different schema is rejected before
+/// any reference is taken, and leaks nothing.
+#[test]
+fn window_with_a_different_schema_is_rejected() {
+    let fx = Fixture::new();
+    let art = fx.artifact(407);
+    let schema_b: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+        "w",
+        DataType::Int32,
+        false,
+    )]));
+    let reg = SchemaRegistry::with_schemas(&[schema(), schema_b.clone()]);
+    art.commit_optimistic(7, 0, Commit::Replace, &batch(&[1]), &reg)
+        .unwrap();
+    art.commit_optimistic(7, 1, Commit::Append, &batch(&[2]), &reg)
+        .unwrap();
+    let baseline = free_total(&fx.data_seg);
+
+    let other = RecordBatch::try_new(
+        schema_b,
+        vec![Arc::new(arrow_array::Int32Array::from(vec![3]))],
+    )
+    .unwrap();
+    assert!(matches!(
+        art.commit_optimistic(7, 2, Commit::Window { keep_batches: 1 }, &other, &reg),
+        Err(shm_artifact::Error::Unsupported(_))
+    ));
+    assert_eq!(art.current_version(), 2);
+    assert_eq!(free_total(&fx.data_seg), baseline);
+    assert_eq!(rows(&art.pin().unwrap(), &reg), vec![1, 2]);
 }

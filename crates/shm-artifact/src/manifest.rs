@@ -80,12 +80,13 @@ use crate::error::{Error, Result};
 /// `total_batches` link fields, and `chunk_count` / `batch_count` now count the
 /// version's **own** chunks only. A `SHMMFST3`-or-older manifest is rejected by
 /// the magic check.
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"SHMMFST4");
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"SHMMFST5");
 
 /// The fixed header at the start of a manifest chunk (64 bytes), followed by a
-/// flat `[ChunkDesc; chunk_count]` array and a `[u32; batch_count]` span array.
+/// flat `[ChunkDesc; chunk_count]` array, a `[u32; batch_count]` span array
+/// and, for a windowed root (ADR-0016), a `[KeptMember; kept_count]` table.
 ///
-/// # Layout (frozen ABI — 64 bytes, ADR-0013)
+/// # Layout (frozen ABI — 64 bytes, ADR-0013 + ADR-0016)
 ///
 /// | field           | type  | meaning                                          |
 /// |-----------------|-------|--------------------------------------------------|
@@ -95,12 +96,21 @@ pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"SHMMFST4");
 /// | `schema_id`     | `u32` | interned Arrow schema id of the data chunks      |
 /// | `chunk_count`   | `u32` | number of **own** `ChunkDesc`s after the header  |
 /// | `batch_count`   | `u32` | number of **own** `u32` batch spans              |
-/// | `prev_version`  | `u64` | predecessor version; `0` = root                  |
+/// | `prev_version`  | `u64` | linked: predecessor version (`≠ 0`); root: the **window base** (ADR-0016; `0` for a plain root) |
 /// | `prev_ref`      | `u64` | `PackedRef` bits of the predecessor manifest; `0` = root |
 /// | `prev_gen`      | `u32` | predecessor chunk's generation at link time      |
 /// | `depth`         | `u32` | `0` for a root, else `prev.depth + 1`            |
 /// | `total_batches` | `u32` | `batch_count + prev.total_batches` (saturating)  |
-/// | `_reserved`     | `u32` | must be `0`                                      |
+/// | `kept_count`    | `u32` | root only: number of [`KeptMember`]s after the spans; `0` when linked |
+///
+/// A **root** is `prev_ref == 0 ⇔ depth == 0` (with `prev_gen == 0`). A
+/// linked manifest has `0 < prev_version < version` and no kept members. A
+/// root produced by a [`Commit::Window`](crate::Commit::Window) re-lists the
+/// newest batches of the version it superseded: its `kept_count` members
+/// record which version each run of leading own batches came from, and
+/// `prev_version` holds the **window base** — the version after which every
+/// batch is present in this root — so a delta reader at or past the base
+/// skips exactly what it already holds.
 ///
 /// The `{artifact_id, version}` pair is monotonic and never reissued, so a
 /// manifest self-identifies; [`read_manifest_checked`] validates both against
@@ -124,7 +134,8 @@ pub struct VersionManifest {
     /// Their sum equals `chunk_count`; each span is the chunk count of one Arrow
     /// batch.
     pub batch_count: u32,
-    /// The predecessor's version, or `0` for a root manifest.
+    /// Linked: the predecessor's version. Root: the window base (ADR-0016),
+    /// `0` for a plain root.
     pub prev_version: u64,
     /// The predecessor manifest's [`PackedRef`] bits, or `0` for a root.
     pub prev_ref: u64,
@@ -136,9 +147,27 @@ pub struct VersionManifest {
     /// Batches in the whole chain: `batch_count + prev.total_batches`
     /// (saturating). Re-validated by the walk.
     pub total_batches: u32,
-    /// Reserved; must be `0`.
-    pub _reserved: u32,
+    /// Number of [`KeptMember`] entries after the span array (a windowed
+    /// root, ADR-0016); must be `0` on a linked manifest.
+    pub kept_count: u32,
 }
+
+/// One run of a windowed root's leading batches and the version that added
+/// them (ADR-0016): the root's first `Σ batches` own batches were re-listed
+/// from those versions, oldest member first.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeptMember {
+    /// The version whose batches these are.
+    pub version: u64,
+    /// How many of that version's batches this root kept (`≥ 1`; only the
+    /// oldest member may be a partial tail of its version).
+    pub batches: u32,
+    /// Reserved; must be `0`.
+    pub _pad: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<KeptMember>() == 16);
 
 const _: () = assert!(core::mem::size_of::<VersionManifest>() == 64);
 const _: () = assert!(core::mem::align_of::<VersionManifest>() == 8);
@@ -155,11 +184,18 @@ const fn spans_offset(chunk_count: usize) -> usize {
     chunks_offset() + chunk_count * core::mem::size_of::<ChunkDesc>()
 }
 
-/// The total serialized byte length of a manifest listing `chunk_count` own
-/// chunks partitioned into `batch_count` own batches.
+/// Byte offset of the [`KeptMember`] table within a manifest chunk.
 #[inline]
-pub const fn manifest_len(chunk_count: usize, batch_count: usize) -> usize {
+const fn kept_offset(chunk_count: usize, batch_count: usize) -> usize {
     spans_offset(chunk_count) + batch_count * core::mem::size_of::<u32>()
+}
+
+/// The total serialized byte length of a manifest listing `chunk_count` own
+/// chunks partitioned into `batch_count` own batches, with `kept_count`
+/// window members.
+#[inline]
+pub const fn manifest_len(chunk_count: usize, batch_count: usize, kept_count: usize) -> usize {
+    kept_offset(chunk_count, batch_count) + kept_count * core::mem::size_of::<KeptMember>()
 }
 
 /// A validated link from a manifest to its predecessor's manifest (ADR-0013).
@@ -216,9 +252,41 @@ pub struct Manifest {
     /// Batches in the whole chain: `batch_spans.len() + prev.total_batches`
     /// (saturating).
     pub total_batches: u32,
+    /// Root only (ADR-0016): the version after which every batch is present
+    /// in this root — `0` for a plain root. A reader holding version `v ≥
+    /// window_base` obtains an exact delta by skipping the leading kept
+    /// batches whose member version is `≤ v`.
+    pub window_base: u64,
+    /// Root only (ADR-0016): the versions the leading own batches were kept
+    /// from, oldest first; empty for a plain root or a linked manifest.
+    pub kept: Vec<KeptMember>,
 }
 
 impl Manifest {
+    /// `true` iff this is a root produced by a `Window` commit (it carries a
+    /// window base and/or kept members) rather than a plain `Replace` root.
+    #[inline]
+    pub fn is_window_root(&self) -> bool {
+        self.prev.is_none() && (self.window_base != 0 || !self.kept.is_empty())
+    }
+
+    /// For a windowed root and a reader holding `since ≥ window_base`: how
+    /// many leading own batches the reader already holds (the kept batches
+    /// of members at or before `since`). `None` if the reader is behind the
+    /// base — its delta cannot be made exact from this root.
+    pub fn kept_batches_before(&self, since: u64) -> Option<usize> {
+        if !self.is_window_root() || since < self.window_base {
+            return None;
+        }
+        Some(
+            self.kept
+                .iter()
+                .filter(|k| k.version <= since)
+                .map(|k| k.batches as usize)
+                .sum(),
+        )
+    }
+
     /// The link this manifest would hand to a successor that chains onto it,
     /// given where it lives (`mref`) and its chunk's current `generation`.
     pub fn link_from(&self, mref: PackedRef, generation: u32) -> ManifestLink {
@@ -243,9 +311,16 @@ impl Manifest {
 /// reference on that manifest chunk) or `None` for a root; `depth` and
 /// `total_batches` are derived from it.
 ///
+/// `window` is a windowed root's `(window_base, kept members)` (ADR-0016;
+/// `None` or `(0, &[])` for a plain root), and must be `None` when `prev` is
+/// `Some`. The members must be oldest-first with strictly increasing versions
+/// below `version`, `≥ 1` batch each, totalling at most `batch_spans.len()`,
+/// and `window_base ≤ members[0].version`.
+///
 /// The caller is responsible for the chunk's [`ChunkCtrl`](shm_core::ChunkCtrl)
 /// lifecycle (`try_loan` → `publish`) exactly as with an `shm-arrow` batch; the
 /// chunk is written **once** and then immutable.
+#[allow(clippy::too_many_arguments)]
 pub fn write_manifest<A: ChunkAllocator>(
     alloc: &A,
     artifact_id: u32,
@@ -254,6 +329,7 @@ pub fn write_manifest<A: ChunkAllocator>(
     chunks: &[ChunkDesc],
     batch_spans: &[u32],
     prev: Option<&ManifestLink>,
+    window: Option<(u64, &[KeptMember])>,
 ) -> Result<ChunkDesc> {
     let chunk_count = u32::try_from(chunks.len())
         .map_err(|_| Error::Unsupported("too many chunks in manifest"))?;
@@ -264,10 +340,16 @@ pub fn write_manifest<A: ChunkAllocator>(
         chunks.len(),
         "batch spans must partition the chunk list"
     );
+    let (window_base, kept): (u64, &[KeptMember]) = window.unwrap_or((0, &[]));
+    let kept_count = u32::try_from(kept.len())
+        .map_err(|_| Error::Unsupported("too many kept members in manifest"))?;
     let (prev_version, prev_ref, prev_gen, depth, total_batches) = match prev {
         Some(link) => {
             if link.version >= version || link.version == 0 || link.mref.to_bits() == 0 {
                 return Err(Error::Unsupported("manifest link must name an older version"));
+            }
+            if window.is_some() {
+                return Err(Error::Unsupported("a linked manifest carries no window"));
             }
             let depth = link
                 .depth
@@ -281,9 +363,14 @@ pub fn write_manifest<A: ChunkAllocator>(
                 batch_count.saturating_add(link.total_batches),
             )
         }
-        None => (0, 0, 0, 0, batch_count),
+        None => {
+            if !window_ok(version, window_base, kept, batch_count) {
+                return Err(Error::Unsupported("malformed window members"));
+            }
+            (window_base, 0, 0, 0, batch_count)
+        }
     };
-    let total = manifest_len(chunks.len(), batch_spans.len());
+    let total = manifest_len(chunks.len(), batch_spans.len(), kept.len());
 
     let desc = alloc.alloc(total)?;
     if (desc.len as usize) < total {
@@ -307,7 +394,7 @@ pub fn write_manifest<A: ChunkAllocator>(
         prev_gen,
         depth,
         total_batches,
-        _reserved: 0,
+        kept_count,
     };
     // SAFETY: `base` points at a loaned chunk of `desc.len >= total` bytes,
     // exclusively owned by the caller. The header, each `ChunkDesc`, and each
@@ -323,8 +410,40 @@ pub fn write_manifest<A: ChunkAllocator>(
         for (i, s) in batch_spans.iter().enumerate() {
             spans.add(i).write_unaligned(*s);
         }
+        let members = base
+            .add(kept_offset(chunks.len(), batch_spans.len()))
+            .cast::<KeptMember>();
+        for (i, k) in kept.iter().enumerate() {
+            members.add(i).write_unaligned(KeptMember { _pad: 0, ..*k });
+        }
     }
     Ok(desc)
+}
+
+/// The structural rules of a root's window (ADR-0016), shared by the writer
+/// and the parser: `window_base < version`; members oldest-first with
+/// strictly increasing versions `< version`, each `≥ 1` batch with a zero
+/// pad, totalling at most `batch_count`; and `window_base ≤ members[0].version`.
+fn window_ok(version: u64, window_base: u64, kept: &[KeptMember], batch_count: u32) -> bool {
+    if window_base >= version {
+        return false;
+    }
+    let mut prev: Option<u64> = None;
+    let mut total: u64 = 0;
+    for k in kept {
+        if k.batches == 0 || k._pad != 0 || k.version >= version {
+            return false;
+        }
+        if prev.is_some_and(|p| k.version <= p) {
+            return false;
+        }
+        prev = Some(k.version);
+        total += k.batches as u64;
+    }
+    if total > batch_count as u64 {
+        return false;
+    }
+    kept.first().is_none_or(|k| window_base <= k.version)
 }
 
 /// Parse and validate the manifest chunk `mref` points at within `segment`.
@@ -349,7 +468,8 @@ pub fn read_manifest(segment: &Segment, mref: PackedRef) -> Result<Manifest> {
 
     let chunk_count = header.chunk_count as usize;
     let batch_count = header.batch_count as usize;
-    let total = manifest_len(chunk_count, batch_count);
+    let kept_count = header.kept_count as usize;
+    let total = manifest_len(chunk_count, batch_count, kept_count);
     let total = u32::try_from(total).map_err(|_| Error::VersionGone)?;
     // Bounds-check the whole record (header + descriptor array + span array),
     // then parse it out of the now-validated byte region. Sharing
@@ -396,20 +516,20 @@ pub fn parse_manifest_bytes(bytes: &[u8]) -> Result<Manifest> {
         return Err(Error::BadMagic);
     }
 
-    // Root-strictness (ADR-0013).
+    // Root-strictness (ADR-0013 + ADR-0016).
     let is_root = header.prev_ref == 0;
-    if is_root != (header.prev_version == 0)
-        || is_root != (header.depth == 0)
+    if is_root != (header.depth == 0)
         || (is_root && header.prev_gen != 0)
-        || (!is_root && header.prev_version >= header.version)
+        || (!is_root && (header.prev_version == 0 || header.kept_count != 0))
+        || header.prev_version >= header.version
         || header.total_batches < header.batch_count
-        || header._reserved != 0
     {
         return Err(Error::VersionGone);
     }
 
     let chunk_count = header.chunk_count as usize;
     let batch_count = header.batch_count as usize;
+    let kept_count = header.kept_count as usize;
 
     // Whole-record extent with checked math (attacker counts are ~4e9 each).
     let chunk_bytes = chunk_count
@@ -421,10 +541,16 @@ pub fn parse_manifest_bytes(bytes: &[u8]) -> Result<Manifest> {
     let span_bytes = batch_count
         .checked_mul(size_of::<u32>())
         .ok_or(Error::VersionGone)?;
-    let total = spans_off
+    let kept_off = spans_off
         .checked_add(span_bytes)
         .ok_or(Error::VersionGone)?;
-    debug_assert_eq!(total, manifest_len(chunk_count, batch_count));
+    let kept_bytes = kept_count
+        .checked_mul(size_of::<KeptMember>())
+        .ok_or(Error::VersionGone)?;
+    let total = kept_off
+        .checked_add(kept_bytes)
+        .ok_or(Error::VersionGone)?;
+    debug_assert_eq!(total, manifest_len(chunk_count, batch_count, kept_count));
     if total > bytes.len() {
         return Err(Error::VersionGone);
     }
@@ -440,6 +566,15 @@ pub fn parse_manifest_bytes(bytes: &[u8]) -> Result<Manifest> {
     for i in 0..batch_count {
         // SAFETY: as above; the span array sits at `spans_off < total`.
         batch_spans.push(unsafe { read_pod::<u32>(bytes, spans_off + i * size_of::<u32>()) });
+    }
+    let mut kept = Vec::with_capacity(kept_count);
+    for i in 0..kept_count {
+        // SAFETY: as above; the member table ends exactly at `total`.
+        kept.push(unsafe { read_pod::<KeptMember>(bytes, kept_off + i * size_of::<KeptMember>()) });
+    }
+    let window_base = if is_root { header.prev_version } else { 0 };
+    if is_root && !window_ok(header.version, window_base, &kept, header.batch_count) {
+        return Err(Error::VersionGone);
     }
 
     let prev = if is_root {
@@ -465,6 +600,8 @@ pub fn parse_manifest_bytes(bytes: &[u8]) -> Result<Manifest> {
         prev,
         depth: header.depth,
         total_batches: header.total_batches,
+        window_base,
+        kept,
     })
 }
 
@@ -533,11 +670,39 @@ pub fn read_manifest_checked(
 ///   cur.batch_count`) and the root's equals its own `batch_count`.
 ///
 /// Any violation is [`Error::VersionGone`] (or whatever `read_prev` returned).
-pub fn walk_chain_with<F>(head: &Manifest, mut read_prev: F) -> Result<Vec<Manifest>>
+pub fn walk_chain_with<F>(head: &Manifest, read_prev: F) -> Result<Vec<Manifest>>
 where
     F: FnMut(&ManifestLink) -> Result<Manifest>,
 {
-    let mut chain: Vec<Manifest> = Vec::with_capacity(head.depth as usize + 1);
+    let mut chain = walk_chain_newest_first(head, read_prev, |_| false)?;
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Walk a manifest chain from `head` towards its root, **newest-first**
+/// (`head` at index `0`), stopping early once `stop(&manifest)` returns `true`
+/// for a manifest just appended — the primitive under both
+/// [`walk_chain_with`] (never stops: the full chain, reversed) and the
+/// bounded walks a windowed commit ([`Commit::Window`](crate::Commit::Window))
+/// and a delta read (`VersionPin::batches_since`) make, which only need the
+/// newest few members and must not pay for the whole history.
+///
+/// Every hop carries the same structural checks as the full walk (bounded by
+/// `head.depth`, strictly decreasing versions, depth continuity, constant
+/// `artifact_id` / `schema_id`, telescoping `total_batches`); a root reached
+/// before `stop` fires is checked as a root. An early stop simply omits the
+/// root check, which is sound: each hop was validated against the link that
+/// named it. Any violation is [`Error::VersionGone`] (or `read_prev`'s error).
+pub fn walk_chain_newest_first<F, S>(
+    head: &Manifest,
+    mut read_prev: F,
+    mut stop: S,
+) -> Result<Vec<Manifest>>
+where
+    F: FnMut(&ManifestLink) -> Result<Manifest>,
+    S: FnMut(&Manifest) -> bool,
+{
+    let mut chain: Vec<Manifest> = Vec::new();
     let mut cur = head.clone();
     let mut hops = 0u32;
     loop {
@@ -568,6 +733,10 @@ where
                 {
                     return Err(Error::VersionGone);
                 }
+                chain.push(cur);
+                if stop(chain.last().expect("just pushed")) {
+                    break;
+                }
                 let prev = read_prev(&link)?;
                 if prev.version != link.version
                     || prev.depth != link.depth
@@ -575,13 +744,11 @@ where
                 {
                     return Err(Error::VersionGone);
                 }
-                chain.push(cur);
                 cur = prev;
                 hops += 1;
             }
         }
     }
-    chain.reverse();
     Ok(chain)
 }
 
@@ -670,7 +837,7 @@ mod tests {
     #[test]
     fn manifest_parser_round_trips_a_root_image() {
         // 2 chunks in 2 single-chunk batches: total = 64 + 2*24 + 2*4 = 120.
-        let total = manifest_len(2, 2);
+        let total = manifest_len(2, 2, 0);
         assert_eq!(total, 120);
         let mut b = valid_manifest(2, 2, total);
         // Fill the two ChunkDesc entries + spans with recognizable values.
@@ -695,7 +862,7 @@ mod tests {
 
     #[test]
     fn manifest_parser_round_trips_a_linked_image() {
-        let total = manifest_len(1, 1);
+        let total = manifest_len(1, 1, 0);
         let mut b = valid_manifest(1, 1, total);
         let sp = 64 + 24;
         b[sp..sp + 4].copy_from_slice(&1u32.to_le_bytes());
@@ -721,7 +888,7 @@ mod tests {
 
     #[test]
     fn manifest_parser_enforces_root_strictness() {
-        let total = manifest_len(0, 0);
+        let total = manifest_len(0, 0, 0);
         let ok = valid_manifest(0, 0, total);
         assert!(parse_manifest_bytes(&ok).is_ok());
 
@@ -729,9 +896,14 @@ mod tests {
         let mut b = ok.clone();
         b[40..48].copy_from_slice(&1u64.to_le_bytes());
         assert!(matches!(parse_manifest_bytes(&b), Err(Error::VersionGone)));
-        // prev_version without prev_ref.
+        // prev_version without prev_ref is a root's window base (ADR-0016):
+        // legal below the version, rejected at or above it.
         let mut b = ok.clone();
         b[32..40].copy_from_slice(&1u64.to_le_bytes());
+        let m = parse_manifest_bytes(&b).unwrap();
+        assert!(m.prev.is_none() && m.window_base == 1 && m.is_window_root());
+        let mut b = ok.clone();
+        b[32..40].copy_from_slice(&5u64.to_le_bytes());
         assert!(matches!(parse_manifest_bytes(&b), Err(Error::VersionGone)));
         // depth without a link.
         let mut b = ok.clone();
@@ -753,17 +925,79 @@ mod tests {
         link(&mut b, 4, 1, 0, 0, 0);
         assert!(matches!(parse_manifest_bytes(&b), Err(Error::VersionGone)));
         // total_batches < batch_count.
-        let mut b = valid_manifest(1, 1, manifest_len(1, 1));
+        let mut b = valid_manifest(1, 1, manifest_len(1, 1, 0));
         b[56..60].copy_from_slice(&0u32.to_le_bytes());
         assert!(matches!(parse_manifest_bytes(&b), Err(Error::VersionGone)));
-        // Reserved word set.
+        // kept_count without the bytes to back it.
         let mut b = ok.clone();
         b[60..64].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(parse_manifest_bytes(&b), Err(Error::VersionGone)));
+        // kept_count on a linked manifest.
+        let mut b = vec![0u8; manifest_len(0, 0, 1)];
+        b[..64].copy_from_slice(&ok);
+        link(&mut b, 4, 1, 0, 1, 0);
+        b[60..64].copy_from_slice(&1u32.to_le_bytes());
+        b[64..72].copy_from_slice(&3u64.to_le_bytes());
+        b[72..76].copy_from_slice(&1u32.to_le_bytes());
         assert!(matches!(parse_manifest_bytes(&b), Err(Error::VersionGone)));
         // A well-formed link still parses.
         let mut b = ok.clone();
         link(&mut b, 4, 1, 0, 1, 0);
         assert!(parse_manifest_bytes(&b).is_ok());
+    }
+
+    /// A windowed root (ADR-0016) round-trips its member table, and the
+    /// member rules reject: a member at/after the version, non-increasing
+    /// versions, zero batches, a set pad, more kept batches than own batches,
+    /// and a base above the oldest member.
+    #[test]
+    fn manifest_parser_round_trips_and_validates_window_members() {
+        let total = manifest_len(3, 3, 2);
+        let mut b = valid_manifest(3, 3, total);
+        // spans 1,1,1 at 64 + 72
+        for i in 0..3 {
+            b[136 + 4 * i..140 + 4 * i].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let members = |b: &mut [u8], m: &[(u64, u32, u32)]| {
+            for (i, (v, n, pad)) in m.iter().enumerate() {
+                let o = 148 + 16 * i;
+                b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+                b[o + 8..o + 12].copy_from_slice(&n.to_le_bytes());
+                b[o + 12..o + 16].copy_from_slice(&pad.to_le_bytes());
+            }
+        };
+        b[32..40].copy_from_slice(&2u64.to_le_bytes()); // window_base = 2
+        b[60..64].copy_from_slice(&2u32.to_le_bytes()); // kept_count = 2
+        members(&mut b, &[(3, 1, 0), (4, 1, 0)]);
+        let m = parse_manifest_bytes(&b).unwrap();
+        assert_eq!(m.window_base, 2);
+        assert_eq!(m.kept.len(), 2);
+        assert_eq!((m.kept[0].version, m.kept[0].batches), (3, 1));
+        assert!(m.is_window_root());
+        assert_eq!(m.kept_batches_before(1), None, "behind the base");
+        assert_eq!(m.kept_batches_before(2), Some(0));
+        assert_eq!(m.kept_batches_before(3), Some(1));
+        assert_eq!(m.kept_batches_before(4), Some(2));
+        assert_eq!(m.kept_batches_before(9), Some(2));
+
+        for bad in [
+            vec![(5u64, 1u32, 0u32), (6, 1, 0)], // at/after the version
+            vec![(4, 1, 0), (3, 1, 0)],          // not increasing
+            vec![(3, 0, 0), (4, 1, 0)],          // zero batches
+            vec![(3, 1, 7), (4, 1, 0)],          // pad set
+            vec![(3, 2, 0), (4, 2, 0)],          // 4 kept > 3 own batches
+            vec![(1, 1, 0), (4, 1, 0)],          // base 2 > oldest member 1
+        ] {
+            let mut x = b.clone();
+            members(&mut x, &bad);
+            assert!(
+                matches!(parse_manifest_bytes(&x), Err(Error::VersionGone)),
+                "accepted {bad:?}"
+            );
+        }
+        // A plain root keeps `window_base == 0` and no members.
+        let plain = parse_manifest_bytes(&valid_manifest(0, 0, 64)).unwrap();
+        assert!(!plain.is_window_root() && plain.kept_batches_before(1).is_none());
     }
 
     /// Property-fuzz: many deterministic iterations of random + mutated-valid
@@ -813,6 +1047,8 @@ mod tests {
             prev: None,
             depth: 0,
             total_batches: batches,
+            window_base: 0,
+            kept: Vec::new(),
         }
     }
 
@@ -826,6 +1062,8 @@ mod tests {
             prev: Some(prev.link_from(mref(prev.version), 0)),
             depth: prev.depth + 1,
             total_batches: prev.total_batches + batches,
+            window_base: 0,
+            kept: Vec::new(),
         }
     }
 

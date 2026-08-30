@@ -40,8 +40,11 @@
 //!   two-word head update is never observed torn.
 //! - **Commit kinds**: [`Commit::Replace`] (supersede wholesale — a chain
 //!   root), [`Commit::Append`] (link to the predecessor's manifest + new data —
-//!   O(new data) commit and pin, ADR-0013), [`Commit::Patch`] (deferred to
-//!   v0.2 — [`Error::Unsupported`]).
+//!   O(new data) commit and pin, ADR-0013), [`Commit::Window`] (a fresh root
+//!   re-listing the newest `keep_batches` batches by reference + new data —
+//!   the bounded, zero-copy shape of a high-churn stream, amortised by
+//!   [`WindowPolicy`], ADR-0016), [`Commit::Patch`] (deferred to v0.2 —
+//!   [`Error::Unsupported`]).
 //! - **Multi-writer**: exclusive mode takes a lease (second writer →
 //!   [`Error::WriteLocked`]); optimistic mode races on the install CAS (loser →
 //!   [`Error::Conflict`]).
@@ -54,7 +57,8 @@
 //! - **Read**: [`VersionPin::as_arrow_batches`] is zero-copy, one
 //!   [`RecordBatch`](arrow_array::RecordBatch) per batch across the chain;
 //!   [`VersionPin::as_arrow`] concatenates (copies) when a version holds more
-//!   than one batch.
+//!   than one batch; [`VersionPin::batches_since`] is the stream consumer's
+//!   O(new batches) delta, exact across a `Window` (ADR-0016).
 //!
 //! # Scope (v0.1)
 //!
@@ -74,13 +78,14 @@ pub mod event;
 pub mod head;
 pub mod manifest;
 
-pub use artifact::{Artifact, Commit, Committer, VersionPin};
+pub use artifact::{Artifact, Commit, Committer, Delta, VersionPin, WindowPolicy};
 pub use error::{Error, Result};
 pub use event::{CommitKind, VersionEvent, ARTIFACTS_TOPIC, EVENT_MAGIC};
 pub use head::{
     ArtifactHead, PinSlot, FIRST_INCARNATION, MAX_LIVE_VERSIONS, NO_INCARNATION,
 };
 pub use manifest::{
-    manifest_len, parse_manifest_bytes, read_manifest, read_manifest_checked, walk_chain_with,
-    write_manifest, Manifest, ManifestLink, VersionManifest, MANIFEST_MAGIC,
+    manifest_len, parse_manifest_bytes, read_manifest, read_manifest_checked,
+    walk_chain_newest_first, walk_chain_with, write_manifest, KeptMember, Manifest,
+    ManifestLink, VersionManifest, MANIFEST_MAGIC,
 };

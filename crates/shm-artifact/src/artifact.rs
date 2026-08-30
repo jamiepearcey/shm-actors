@@ -68,8 +68,8 @@ use crate::head::{
 /// real actor id (actor ids are coordinator-issued small integers).
 pub const EVICTOR_OWNER: u32 = u32::MAX;
 use crate::manifest::{
-    read_manifest, read_manifest_checked, walk_chain_with, write_manifest, Manifest,
-    ManifestLink,
+    read_manifest, read_manifest_checked, walk_chain_newest_first, walk_chain_with,
+    write_manifest, KeptMember, Manifest, ManifestLink,
 };
 
 /// How a commit relates the new version to its predecessor.
@@ -85,10 +85,70 @@ pub enum Commit {
     /// manifests and nothing prior is copied or re-listed. Commit and pin cost
     /// O(new data) regardless of the lineage's length; a read is O(batches).
     Append,
+    /// **Windowed append (ADR-0016).** The new version is a fresh chain
+    /// **root** whose manifest lists the newest `keep_batches` batches of the
+    /// predecessor's table — *re-listed by reference* (one `borrow_shared`
+    /// each, no byte copied) — followed by the newly staged chunk(s). The
+    /// predecessor's chain is not linked, so once it retires its tail (every
+    /// batch older than the window) cascades back to the pool.
+    ///
+    /// Cost: O(`keep_batches` + new data) reference RMWs plus a walk over the
+    /// newest chain members that hold those batches; the manifest is
+    /// `64 + 24·chunks + 4·batches` bytes and must fit a pool class. Zero
+    /// copy. With no predecessor (or `keep_batches == 0`) this is exactly
+    /// [`Replace`](Commit::Replace). See [`WindowPolicy`] for the amortised
+    /// Append-then-Window pattern a high-churn stream wants.
+    Window {
+        /// How many of the predecessor's newest batches the new root keeps.
+        keep_batches: u32,
+    },
     /// A ranged in-place-style update. **Deferred to v0.2**: currently returns
     /// [`Error::Unsupported`]. The range names the row span a full
     /// implementation would rewrite.
     Patch(core::ops::Range<u64>),
+}
+
+/// The amortised policy a long-lived, high-churn cell uses to stay bounded
+/// (ADR-0016): [`Commit::Append`] while the chain is shallower than
+/// `max_depth`, then one [`Commit::Window`] that re-roots on the newest
+/// `keep_batches` batches. The table then always holds between `keep_batches`
+/// and `keep_batches + max_depth` batches; the live chunk count, the read cost
+/// and the manifest size are all bounded by that, independent of how many
+/// versions were ever committed; and the amortised per-commit cost is
+/// O(1 + keep_batches / max_depth) reference RMWs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowPolicy {
+    /// Batches the periodic `Window` commit keeps from the prior table.
+    pub keep_batches: u32,
+    /// Chain depth at which the next commit re-roots instead of appending
+    /// (`1` = every commit is a `Window`; `0` is treated as `1`).
+    pub max_depth: u32,
+}
+
+impl WindowPolicy {
+    /// `keep_batches` kept, re-rooting every `keep_batches` commits — O(2)
+    /// amortised reference RMWs per commit, table size in
+    /// `[keep, 2·keep]` batches.
+    pub const fn new(keep_batches: u32) -> WindowPolicy {
+        WindowPolicy {
+            keep_batches,
+            max_depth: keep_batches,
+        }
+    }
+
+    /// The commit kind for the next version given the current head's chain
+    /// depth (`None` = nothing committed yet, or the head could not be read —
+    /// a `Window` then, which re-validates everything itself and degenerates
+    /// to a root when there is no prior).
+    pub fn commit_for_depth(&self, depth: Option<u32>) -> Commit {
+        let max_depth = self.max_depth.max(1);
+        match depth {
+            Some(d) if d.saturating_add(1) < max_depth => Commit::Append,
+            _ => Commit::Window {
+                keep_batches: self.keep_batches,
+            },
+        }
+    }
 }
 
 impl Commit {
@@ -97,6 +157,7 @@ impl Commit {
         match self {
             Commit::Replace => CommitKind::Replace,
             Commit::Append => CommitKind::Append,
+            Commit::Window { .. } => CommitKind::Window,
             Commit::Patch(_) => CommitKind::Patch,
         }
     }
@@ -893,7 +954,7 @@ impl Artifact {
                 Ok(prior) => prior,
                 _ => {
                     // Prior version moved or is unreadable: treat as a conflict.
-                    self.rollback_staged(&pool, &published, None, None, None);
+                    self.rollback_staged(&pool, &published, None, &[], None, None);
                     return Err(Error::Conflict {
                         expected: expect,
                         actual: head.current.load(SeqCst),
@@ -901,7 +962,7 @@ impl Artifact {
                 }
             };
             if prior.schema_id != schema_id {
-                self.rollback_staged(&pool, &published, None, None, None);
+                self.rollback_staged(&pool, &published, None, &[], None, None);
                 return Err(Error::Unsupported("Append schema differs from the prior version"));
             }
 
@@ -917,7 +978,7 @@ impl Artifact {
             let ctrl = match pool.ctrl(&mdesc) {
                 Ok(c) => c,
                 Err(e) => {
-                    self.rollback_staged(&pool, &published, None, None, None);
+                    self.rollback_staged(&pool, &published, None, &[], None, None);
                     return Err(Error::from(e));
                 }
             };
@@ -926,7 +987,7 @@ impl Artifact {
             // across our bump, i.e. the reference we hold is genuine.
             let generation = ctrl.generation();
             if ctrl.borrow_shared().is_err() {
-                self.rollback_staged(&pool, &published, None, None, None);
+                self.rollback_staged(&pool, &published, None, &[], None, None);
                 return Err(Error::Conflict {
                     expected: expect,
                     actual: head.current.load(SeqCst),
@@ -948,7 +1009,7 @@ impl Artifact {
                 if generation_ok {
                     release_manifest_ref(&pool, &self.data_seg, mref, Some(generation));
                 }
-                self.rollback_staged(&pool, &published, None, None, None);
+                self.rollback_staged(&pool, &published, None, &[], None, None);
                 return Err(Error::Conflict {
                     expected: expect,
                     actual: head.current.load(SeqCst),
@@ -956,6 +1017,59 @@ impl Artifact {
             }
             link = Some(prior.link_from(mref, generation));
         }
+
+        // 2w. For a Window with a prior version (ADR-0016): re-list the
+        //     newest `keep_batches` batches of the prior table by reference.
+        //     Walk the prior chain newest-first only as far as those batches
+        //     reach, then take ONE `borrow_shared` per kept data chunk. The
+        //     new manifest is a root: nothing links the prior chain, so its
+        //     tail cascades away once the prior version retires, and the kept
+        //     chunks survive on their second reference.
+        let mut kept: Vec<ChunkDesc> = Vec::new();
+        let mut kept_spans: Vec<u32> = Vec::new();
+        let mut window: Option<(u64, Vec<KeptMember>)> = None;
+        if let Commit::Window { keep_batches } = commit {
+            if expect != NO_VERSION {
+                let mref = PackedRef(head.manifest_desc.load(Acquire));
+                let conflict = |head: &ArtifactHead| Error::Conflict {
+                    expected: expect,
+                    actual: head.current.load(SeqCst),
+                };
+                let prior =
+                    match read_manifest_checked(&self.data_seg, mref, self.name_id, expect) {
+                        Ok(prior) => prior,
+                        _ => {
+                            self.rollback_staged(&pool, &published, None, &[], None, None);
+                            return Err(conflict(head));
+                        }
+                    };
+                if prior.schema_id != schema_id {
+                    self.rollback_staged(&pool, &published, None, &[], None, None);
+                    return Err(Error::Unsupported("Window schema differs from the prior version"));
+                }
+                match collect_window(&pool, &self.data_seg, &prior, keep_batches) {
+                    Ok(w) => {
+                        kept = w.chunks;
+                        kept_spans = w.spans;
+                        window = Some((w.base, w.members));
+                    }
+                    Err(_) => {
+                        self.rollback_staged(&pool, &published, None, &[], None, None);
+                        return Err(conflict(head));
+                    }
+                }
+            }
+        }
+        // The new manifest's own chunk list: kept (row order) then staged.
+        let (own_chunks, own_spans): (Vec<ChunkDesc>, Vec<u32>) = if kept.is_empty() {
+            (published.clone(), staged_spans.to_vec())
+        } else {
+            let mut c = kept.clone();
+            c.extend_from_slice(&published);
+            let mut sp = kept_spans.clone();
+            sp.extend_from_slice(staged_spans);
+            (c, sp)
+        };
 
         let target = expect + 1;
 
@@ -970,9 +1084,10 @@ impl Artifact {
                     self.name_id,
                     target,
                     schema_id,
-                    &published,
-                    staged_spans,
+                    &own_chunks,
+                    &own_spans,
                     link.as_ref(),
+                    window.as_ref().map(|(base, m)| (*base, m.as_slice())),
                 )
             },
             &alloc,
@@ -980,7 +1095,7 @@ impl Artifact {
         ) {
             Ok(d) => d,
             Err(e) => {
-                self.rollback_staged(&pool, &published, link.as_ref(), None, None);
+                self.rollback_staged(&pool, &published, link.as_ref(), &kept, None, None);
                 return Err(e);
             }
         };
@@ -1011,6 +1126,7 @@ impl Artifact {
                     &pool,
                     &published,
                     link.as_ref(),
+                    &kept,
                     Some(&manifest_desc),
                     None,
                 );
@@ -1033,6 +1149,7 @@ impl Artifact {
                 &pool,
                 &published,
                 link.as_ref(),
+                &kept,
                 Some(&manifest_desc),
                 None,
             );
@@ -1080,6 +1197,7 @@ impl Artifact {
                     &pool,
                     &published,
                     link.as_ref(),
+                    &kept,
                     Some(&manifest_desc),
                     Some((slot_idx, target)),
                 );
@@ -1103,11 +1221,18 @@ impl Artifact {
     /// was recycled across the `ChunkCtrl` split-word window (state and
     /// refcount are separate words), its next occupant's `try_loan` reset the
     /// refcount, and a release here would take a reference that is not ours.
+    ///
+    /// `kept` are the prior-table chunks a `Window` commit re-listed (one
+    /// held reference each, ADR-0016); each is released generation-checked —
+    /// while we hold the reference the chunk cannot reach `FREE`, so its
+    /// generation cannot have moved, and the check only guards a reference
+    /// that was never ours.
     fn rollback_staged(
         &self,
         pool: &Pool<'_>,
         published: &[ChunkDesc],
         link: Option<&ManifestLink>,
+        kept: &[ChunkDesc],
         manifest_desc: Option<&ChunkDesc>,
         slot_idx: Option<(usize, u64)>,
     ) {
@@ -1138,12 +1263,39 @@ impl Artifact {
                 release_manifest_ref(pool, &self.data_seg, l.mref, Some(l.generation));
             }
         }
+        for c in kept {
+            release_chunk(pool, c);
+        }
         for c in published {
             release_chunk(pool, c);
         }
     }
 
     // ---- Read path ----
+
+    /// The data segment this artifact's chunk pool lives in (the one every
+    /// version's manifest and data chunks are allocated from).
+    #[inline]
+    pub fn data_segment(&self) -> &Arc<Segment> {
+        &self.data_seg
+    }
+
+    /// The chain depth of the current version's head manifest (`0` for a root),
+    /// or `None` when nothing is committed or the head could not be read
+    /// consistently (an unpinned, identity-checked read racing a commit). A
+    /// policy hint only — see [`WindowPolicy::commit_for_depth`]; every commit
+    /// re-validates the prior under its own rules.
+    pub fn current_depth(&self) -> Option<u32> {
+        let head = self.head();
+        let version = head.current.load(SeqCst);
+        if version == NO_VERSION {
+            return None;
+        }
+        let mref = PackedRef(head.manifest_desc.load(Acquire));
+        read_manifest_checked(&self.data_seg, mref, self.name_id, version)
+            .ok()
+            .map(|m| m.depth)
+    }
 
     /// Pin the current version, freezing it so its chunks cannot be reclaimed
     /// while the returned [`VersionPin`] (or any Arrow batch built from it) is
@@ -1532,6 +1684,189 @@ fn free_loaned(pool: &Pool<'_>, desc: &ChunkDesc) {
 /// is recycled to `FREE` and returned to the pool's free list. Returns `true`
 /// iff **this** release freed it — `try_reclaim`'s `PUBLISHED → FREE` CAS
 /// elects exactly one releaser (modeled in `tests/loom_ctrl.rs`).
+/// What a [`Commit::Window`] re-lists from its predecessor (ADR-0016): the
+/// kept data chunks and their batch spans in row order, the [`KeptMember`]
+/// table naming the version each run of kept batches came from, and the
+/// window base — the version after which every batch is in the new root.
+struct WindowSet {
+    chunks: Vec<ChunkDesc>,
+    spans: Vec<u32>,
+    members: Vec<KeptMember>,
+    base: u64,
+}
+
+/// Gather the newest `keep_batches` batches of the table headed by `prior`
+/// for a [`Commit::Window`] (ADR-0016), taking **one `borrow_shared` per kept
+/// data chunk**.
+///
+/// The walk is newest-first and stops as soon as enough batches are held, so
+/// it costs O(members holding the window), never O(depth). Each chunk is
+/// validated against its descriptor's generation before *and* after the
+/// borrow: a chunk freed and re-published between the manifest read and the
+/// borrow (the prior version retired under a concurrent commit) would carry a
+/// new generation, and the bump then landed on a stranger's live occupant —
+/// a genuine reference of ours, released back directly. Any failure releases
+/// every reference taken so far and reports it; the caller maps it to a
+/// conflict.
+///
+/// The member table makes a later delta read exact: a kept chain member
+/// contributes `(version, batches)`; a kept root that was itself a window
+/// contributes its own member table (so a reader that predates that window
+/// still skips exactly what it holds) followed by its new batches. Only the
+/// oldest kept member may be a partial tail. The base is the oldest kept
+/// member's version when partial, one less when whole — except a whole
+/// plain (`Replace`) root, whose base is its own version: a reader that
+/// missed the `Replace` must resynchronise, not append.
+fn collect_window(
+    pool: &Pool<'_>,
+    data_seg: &Segment,
+    prior: &Manifest,
+    keep_batches: u32,
+) -> Result<WindowSet> {
+    let mut remaining = keep_batches as usize;
+    let members = if remaining == 0 {
+        Vec::new()
+    } else {
+        walk_chain_newest_first(
+            prior,
+            |link| {
+                let ctrl = pool.ctrl(&manifest_chunk_desc(link.mref, 0))?;
+                if ctrl.generation() != link.generation {
+                    return Err(Error::VersionGone);
+                }
+                read_manifest_checked(data_seg, link.mref, prior.artifact_id, link.version)
+            },
+            |m| {
+                remaining = remaining.saturating_sub(m.batch_spans.len());
+                remaining == 0
+            },
+        )?
+    };
+
+    // Newest-first: the tail batches of each member until the window is full.
+    let mut remaining = keep_batches as usize;
+    let mut parts: Vec<(&Manifest, usize)> = Vec::with_capacity(members.len());
+    for m in &members {
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(m.batch_spans.len());
+        parts.push((m, take));
+        remaining -= take;
+    }
+    parts.reverse();
+
+    // Nothing kept: every batch after the prior version is in the new root.
+    let mut base = prior.version;
+    let mut kept_members: Vec<KeptMember> = Vec::new();
+    let mut chunks: Vec<ChunkDesc> = Vec::new();
+    let mut spans: Vec<u32> = Vec::new();
+    for (i, &(m, take)) in parts.iter().enumerate() {
+        let tail_spans = &m.batch_spans[m.batch_spans.len() - take..];
+        let chunk_take: usize = tail_spans.iter().map(|&s| s as usize).sum();
+        if chunk_take > m.chunks.len() {
+            return Err(Error::VersionGone);
+        }
+        let tail_chunks = &m.chunks[m.chunks.len() - chunk_take..];
+        for desc in tail_chunks {
+            let held = pool.ctrl(desc).map_err(Error::from).and_then(|ctrl| {
+                ctrl.validate(desc)?;
+                ctrl.borrow_shared()?;
+                if ctrl.validate(desc).is_err() {
+                    // Our +1 sits on whatever now occupies the chunk: give it
+                    // back to that occupant, freeing it if we were its last.
+                    release_chunk_owned(pool, desc);
+                    return Err(Error::VersionGone);
+                }
+                Ok(())
+            });
+            if let Err(e) = held {
+                for c in &chunks {
+                    release_chunk(pool, c);
+                }
+                return Err(e);
+            }
+            chunks.push(*desc);
+        }
+        spans.extend_from_slice(tail_spans);
+
+        // Member accounting. `m`'s batches are its inherited kept run (only
+        // a root has one) followed by the batches it added itself.
+        let inherited: usize = m.kept.iter().map(|k| k.batches as usize).sum();
+        let own_new = m.batch_spans.len().saturating_sub(inherited);
+        let oldest = i == 0;
+        if take <= own_new {
+            if take > 0 {
+                kept_members.push(KeptMember {
+                    version: m.version,
+                    batches: take as u32,
+                    _pad: 0,
+                });
+            }
+            if oldest {
+                // Partial: the reader must hold `m`. Whole, none of the
+                // inherited run: a reader at `m - 1` holds every inherited
+                // row already — unless `m` is a plain `Replace` root, which
+                // that reader must have seen (its base is its own version).
+                base = if take < own_new || (m.prev.is_none() && !m.is_window_root()) {
+                    m.version
+                } else {
+                    m.version - 1
+                };
+            }
+        } else {
+            // Into the inherited run: the newest `take - own_new` kept batches.
+            let mut need = take - own_new;
+            let mut run: Vec<KeptMember> = Vec::new();
+            let mut all_inherited = true;
+            let mut run_base = m.window_base;
+            for (ki, k) in m.kept.iter().enumerate().rev() {
+                if need == 0 {
+                    all_inherited = false;
+                    break;
+                }
+                let t = need.min(k.batches as usize);
+                run.push(KeptMember {
+                    version: k.version,
+                    batches: t as u32,
+                    _pad: 0,
+                });
+                need -= t;
+                // `m`'s oldest member may itself be a partial tail of its
+                // version (then `m.window_base == k.version`): keeping all
+                // of what `m` kept is still not all of `k`.
+                let partial_in_m = ki == 0 && m.window_base == k.version;
+                run_base = if t < k.batches as usize {
+                    all_inherited = false;
+                    k.version
+                } else if partial_in_m {
+                    k.version
+                } else {
+                    k.version - 1
+                };
+            }
+            run.reverse();
+            if oldest {
+                base = if all_inherited { m.window_base } else { run_base };
+            }
+            kept_members.extend(run);
+            if own_new > 0 {
+                kept_members.push(KeptMember {
+                    version: m.version,
+                    batches: own_new as u32,
+                    _pad: 0,
+                });
+            }
+        }
+    }
+    Ok(WindowSet {
+        chunks,
+        spans,
+        members: kept_members,
+        base,
+    })
+}
+
 fn release_chunk(pool: &Pool<'_>, desc: &ChunkDesc) -> bool {
     if let Ok(ctrl) = pool.ctrl(desc) {
         // Generation-checked: a descriptor whose chunk was freed and
@@ -1819,6 +2154,20 @@ impl Committer<'_> {
         )
     }
 
+    /// Commit `batch` under `policy` (ADR-0016): [`Commit::Append`] while
+    /// the current chain is shallower than the policy's `max_depth`, else a
+    /// [`Commit::Window`] re-rooting on its newest `keep_batches` batches —
+    /// the bounded, amortised-O(1) shape a high-churn stream commits with.
+    pub fn commit_windowed(
+        &mut self,
+        policy: &WindowPolicy,
+        batch: &RecordBatch,
+        registry: &SchemaRegistry,
+    ) -> Result<u64> {
+        let commit = policy.commit_for_depth(self.artifact.current_depth());
+        self.commit(commit, batch, registry)
+    }
+
     /// **ADDITIVE (v0.2 stage C — for `shm-stream`).** Install a batch of
     /// **pre-staged** chunks (each already written + loaned via
     /// [`shm_arrow::write_batch`] + [`ChunkCtrl::try_loan`](shm_core::ChunkCtrl::try_loan))
@@ -1927,6 +2276,23 @@ impl Drop for Committer<'_> {
 #[derive(Clone)]
 pub struct VersionPin {
     inner: Arc<PinState>,
+}
+
+/// The result of a [`VersionPin::batches_since`] delta read (ADR-0016).
+#[derive(Clone, Debug)]
+pub struct Delta {
+    /// The batches added after the requested version, oldest-first; each is
+    /// zero-copy and kept alive by the pin it was read under.
+    pub batches: Vec<RecordBatch>,
+    /// The oldest manifest walked (the pinned version itself when `batches`
+    /// is empty). For an exact delta across a `Window` this is the new root,
+    /// of which only the batches the reader lacked are returned.
+    pub from_version: u64,
+    /// `true` iff the walk hit a chain root the reader cannot be caught up
+    /// from exactly — a `Replace`, or a `Window` whose base is newer than
+    /// the reader's version — so `batches` is the whole table from that
+    /// root, to resynchronise from rather than append.
+    pub truncated: bool,
 }
 
 /// The shared inner state of a [`VersionPin`]; also the Arrow buffer keep-alive.
@@ -2053,14 +2419,91 @@ impl VersionPin {
     /// O(batches) — independent of row count — and no byte is copied. An empty
     /// version (evicted-current) yields an empty `Vec`.
     pub fn as_arrow_batches(&self, registry: &SchemaRegistry) -> Result<Vec<RecordBatch>> {
-        let pool = Pool::attach(&self.inner.data_seg)?;
         let chain = self.chain()?;
+        self.batches_of(&chain, 0, registry)
+    }
+
+    /// **Delta read (ADR-0016).** The batches this version added **after**
+    /// version `since`, oldest-first, zero-copy — the walk starts at the head
+    /// and stops at the first manifest whose predecessor is `since` or older,
+    /// so a consumer that keeps up pays O(new batches), never O(table).
+    ///
+    /// `since == 0` ([`NO_VERSION`]) reads the whole table (`truncated ==
+    /// false`). A [`Commit::Window`] root newer than `since` is transparent
+    /// to a reader at or past its window base: the root's member table says
+    /// how many of its leading (kept) batches that reader already holds, and
+    /// exactly the rest are returned — so a consumer that keeps up never
+    /// resynchronises. A [`Commit::Replace`] root, or a `Window` whose base
+    /// the reader has not reached, makes the history between unreachable: the
+    /// delta is then the whole table from that root and `truncated` is
+    /// `true`, telling the caller to resynchronise rather than append. A
+    /// `since` at or past this version yields an empty, non-truncated delta.
+    pub fn batches_since(&self, since: u64, registry: &SchemaRegistry) -> Result<Delta> {
+        let head = &self.inner.manifest;
+        if head.version <= since {
+            return Ok(Delta {
+                batches: Vec::new(),
+                from_version: head.version,
+                truncated: false,
+            });
+        }
+        let seg = &self.inner.data_seg;
+        let pool = Pool::attach(seg)?;
+        let artifact_id = head.artifact_id;
+        let mut chain = walk_chain_newest_first(
+            head,
+            |link| {
+                let ctrl = pool.ctrl(&manifest_chunk_desc(link.mref, 0))?;
+                if ctrl.generation() != link.generation {
+                    return Err(Error::VersionGone);
+                }
+                read_manifest_checked(seg, link.mref, artifact_id, link.version)
+            },
+            |m| m.prev.is_none_or(|l| l.version <= since),
+        )?;
+        chain.reverse();
+        let oldest = chain.first().expect("head is always walked");
+        let from_version = oldest.version;
+        // At a root newer than `since`: a windowed root whose base the reader
+        // has reached tells us exactly how many of its leading batches the
+        // reader already holds; any other root means the history between is
+        // gone and the reader must resynchronise from it.
+        let (skip, truncated) = if since == NO_VERSION || oldest.prev.is_some() {
+            (0, false)
+        } else {
+            match oldest.kept_batches_before(since) {
+                Some(skip) => (skip, false),
+                None => (0, true),
+            }
+        };
+        let batches = self.batches_of(&chain, skip, registry)?;
+        Ok(Delta {
+            batches,
+            from_version,
+            truncated,
+        })
+    }
+
+    /// Reconstruct every batch of `chain` (oldest-first manifests of this
+    /// pinned version) except the first `skip_first` batches of the oldest
+    /// member, one zero-copy [`RecordBatch`] per batch.
+    fn batches_of(
+        &self,
+        chain: &[Manifest],
+        skip_first: usize,
+        registry: &SchemaRegistry,
+    ) -> Result<Vec<RecordBatch>> {
+        let pool = Pool::attach(&self.inner.data_seg)?;
         let mut batches: Vec<RecordBatch> =
-            Vec::with_capacity(self.inner.manifest.total_batches as usize);
-        for manifest in &chain {
+            Vec::with_capacity(chain.iter().map(|m| m.batch_spans.len()).sum());
+        for (mi, manifest) in chain.iter().enumerate() {
             let mut idx = 0usize;
-            for &span in &manifest.batch_spans {
+            for (bi, &span) in manifest.batch_spans.iter().enumerate() {
                 let span = span as usize;
+                if mi == 0 && bi < skip_first {
+                    idx += span;
+                    continue;
+                }
                 let group = manifest
                     .chunks
                     .get(idx..idx + span)

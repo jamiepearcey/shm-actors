@@ -30,6 +30,9 @@ pub enum CommitKind {
     /// A [`Commit::Patch`](crate::Commit::Patch): a ranged in-place update
     /// (deferred to v0.2).
     Patch = 2,
+    /// A [`Commit::Window`](crate::Commit::Window): a fresh root re-listing
+    /// the newest batches of its predecessor plus new data (ADR-0016).
+    Window = 3,
 }
 
 impl CommitKind {
@@ -47,6 +50,7 @@ impl CommitKind {
             0 => Some(CommitKind::Replace),
             1 => Some(CommitKind::Append),
             2 => Some(CommitKind::Patch),
+            3 => Some(CommitKind::Window),
             _ => None,
         }
     }

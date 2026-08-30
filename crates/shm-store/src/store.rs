@@ -13,7 +13,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 
 use shm_arrow::SchemaRegistry;
-use shm_artifact::{Artifact, Commit, VersionPin};
+use shm_artifact::{Artifact, Commit, Delta, VersionPin, WindowPolicy};
 use shm_core::{BorrowJournal, Segment};
 
 use crate::catalog::{Catalog, RefKind};
@@ -393,6 +393,22 @@ impl Entry {
         self.commit(Commit::Replace, batch)
     }
 
+    /// **ADR-0016 — the high-churn stream commit.** Append `batch` under
+    /// `policy`: a chained [`Commit::Append`] while the cell's history is
+    /// shallower than `policy.max_depth`, then one [`Commit::Window`] that
+    /// re-roots on the newest `policy.keep_batches` batches by reference. The
+    /// cell's live chunks, manifest size and read cost stay bounded by the
+    /// policy no matter how many versions are ever committed; amortised cost
+    /// is O(1) reference RMWs per commit and no byte is ever copied. Same
+    /// journaled exclusive lease as [`commit`](Self::commit).
+    pub fn append_windowed(&self, policy: &WindowPolicy, batch: &RecordBatch) -> Result<u64> {
+        let journal = BorrowJournal::attach(&self.journal_seg)?;
+        let mut committer = self
+            .artifact
+            .open_exclusive_journaled(self.owner, &journal)?;
+        Ok(committer.commit_windowed(policy, batch, &self.registry)?)
+    }
+
     /// **P0.3 (ADR-0010, G4) — evict the entry's *current* version without
     /// evicting the entry.** Commits an **empty** `Replace` version under the
     /// entry's journaled exclusive write lease; the evicted version retires
@@ -426,6 +442,18 @@ impl Entry {
         let pin = self.pin()?;
         let batch = pin.as_arrow(&self.registry)?;
         Ok((pin, batch))
+    }
+
+    /// **ADR-0016 — the stream consumer's read.** Pin the current version and
+    /// return only the batches added after version `since`
+    /// ([`VersionPin::batches_since`]): O(new batches), zero-copy, with
+    /// [`Delta::truncated`] telling the consumer a `Window`/`Replace`
+    /// intervened and the delta is a table prefix to resynchronise from. Pass
+    /// the pin's [`version`](VersionPin::version) back as the next `since`.
+    pub fn read_since(&self, since: u64) -> Result<(VersionPin, Delta)> {
+        let pin = self.pin()?;
+        let delta = pin.batches_since(since, &self.registry)?;
+        Ok((pin, delta))
     }
 
     /// **P0.3 (ADR-0010, G12) — retain the current version for a task's

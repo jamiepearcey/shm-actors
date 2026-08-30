@@ -37,6 +37,12 @@
 //!   O(new data)) plus the staged chunks.
 //! - [`Commit::Replace`](shm_artifact::Commit::Replace) — the new version
 //!   supersedes wholesale: its manifest is the staged chunks alone.
+//! - [`Commit::Window`](shm_artifact::Commit::Window) — a fresh root that
+//!   re-lists the newest `keep_batches` batches of the prior table by
+//!   reference plus the staged chunks (ADR-0016): the bounded shape a
+//!   high-churn stream commits with. Pick the kind per transaction with
+//!   [`WindowPolicy::commit_for_depth`](shm_artifact::WindowPolicy::commit_for_depth)
+//!   over [`Artifact::current_depth`](shm_artifact::Artifact::current_depth).
 //! - [`Commit::Patch`](shm_artifact::Commit::Patch) — deferred to v0.3; rejected
 //!   at [`open`](StreamWriter::open) with [`Error::Unsupported`].
 //!

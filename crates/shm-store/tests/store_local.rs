@@ -11,7 +11,7 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use shm_arrow::SchemaRegistry;
-use shm_artifact::{ArtifactHead, Commit};
+use shm_artifact::{ArtifactHead, Commit, WindowPolicy};
 use shm_core::{segment::HEADER_SIZE, BorrowJournal, Pool, PoolConfig, Segment};
 use shm_store::{
     Catalog, Error, KeyResolver, KeyedStore, RefKind, SLOT_FREE, SLOT_LIVE, SLOT_TOMBSTONE,
@@ -616,5 +616,59 @@ fn retained_binding_ties_pin_to_entry_and_task_not_actor() {
     assert_eq!(store.reclaim_tombstones().unwrap(), 1);
     assert_eq!(cat.slot(0).state(), SLOT_FREE);
     assert_eq!(h.free_total(), baseline, "zero leak");
+    h.unlink();
+}
+
+/// ADR-0016: a keyed entry driven as a high-churn stream — `append_windowed`
+/// keeps the cell bounded across 5000 commits in a pool of a few hundred
+/// chunks, and a consumer following it with `read_since` sees every row
+/// exactly once, resynchronising from the window when told to.
+#[test]
+fn entry_append_windowed_stays_bounded_and_read_since_follows_it() {
+    let sch = schema();
+    let h = Harness::new(80_400 + (std::process::id() & 0x3ff), &sch);
+    let store = h.store();
+    let baseline = h.free_total();
+    let entry = store
+        .create(b"stream/ticks", RefKind::Dataset, &sch)
+        .expect("create");
+    let policy = WindowPolicy::new(8);
+
+    // A consumer that keeps up: after every commit it reads the delta since
+    // the version it last saw. It must never be told to resync (a Window
+    // keeps `keep_batches` newest batches, and it is at most one behind), and
+    // the rows it accumulates must be exactly the committed sequence.
+    let mut seen: Vec<i64> = Vec::new();
+    let mut last = 0u64;
+    let mut max_live = 0usize;
+    for i in 1..=5000i64 {
+        assert_eq!(entry.append_windowed(&policy, &batch(&sch, &[i])).unwrap(), i as u64);
+        let (pin, delta) = entry.read_since(last).unwrap();
+        assert!(!delta.truncated || last == 0, "v{i}: a following reader was told to resync");
+        for b in &delta.batches {
+            let v = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            seen.extend_from_slice(v.values());
+        }
+        last = pin.version();
+        drop(pin);
+        max_live = max_live.max(baseline - h.free_total());
+    }
+    assert_eq!(seen, (1..=5000).collect::<Vec<i64>>());
+    assert!(max_live <= 2 * 8 + 8 + 2, "live chunks peaked at {max_live}");
+
+    // A consumer that fell far behind is told the history is gone and gets
+    // the whole window to resync from.
+    let (pin, delta) = entry.read_since(100).unwrap();
+    assert!(delta.truncated);
+    assert_eq!(delta.from_version, pin.manifest().version - pin.manifest().depth as u64);
+    let n: usize = delta.batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(n, pin.manifest().total_batches as usize);
+    // The delta's batches are zero-copy views that keep the pin alive.
+    drop(delta);
+    drop(pin);
+
+    store.evict(b"stream/ticks").unwrap();
+    store.reclaim_tombstones().unwrap();
+    assert_eq!(h.free_total(), baseline, "zero leak after evict");
     h.unlink();
 }

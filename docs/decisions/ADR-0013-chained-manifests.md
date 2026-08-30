@@ -133,6 +133,12 @@ The honest contract: **commit and pin are O(new data); read is O(batches);
 zero-copy per batch.** Controlling batch count is a policy of the layer above
 (compact by `Replace` of a concatenated batch past a depth threshold).
 
+> **Superseded in part by ADR-0016.** The "layer above" policy is now in the
+> substrate: `Commit::Window` re-roots on the newest batches by reference
+> (no copy), `WindowPolicy` amortises it, and `VersionPin::batches_since`
+> gives a consumer an O(new batches) delta that stays exact across a window.
+> The manifest ABI moved `SHMMFST4 → SHMMFST5` for the kept-member table.
+
 ## ABI
 
 `VersionManifest` 32 → 64 B, `SHMMFST3 → SHMMFST4`. `ArtifactHead`, `PinSlot`,

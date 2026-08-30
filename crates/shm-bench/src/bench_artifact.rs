@@ -8,7 +8,7 @@ use std::time::Instant;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use shm_arrow::SchemaRegistry;
-use shm_artifact::{Artifact, Commit};
+use shm_artifact::{Artifact, Commit, WindowPolicy};
 use shm_core::{PoolConfig, Segment, SizeClass};
 
 use crate::stats::{measure, Stats};
@@ -138,6 +138,190 @@ pub fn run() {
     println!("commit latency vs prior version index (Replace should be flat; Append flat => O(new data)):");
     commit_series(Commit::Replace, "Replace", &reg);
     commit_series(Commit::Append, "Append", &reg);
+
+    // ---- ADR-0016: windowed append stream ----
+    println!(
+        "windowed append stream (ADR-0016) — N=100000 commits of a 4-row batch under WindowPolicy::new(keep):\n\
+         \x20 Append commits should be flat, a Window commit costs O(keep) reference RMWs, live chunks and reads stay bounded:"
+    );
+    for &keep in &[16u32, 256, 4096] {
+        stream_series(keep, keep, 100_000, &reg);
+    }
+    println!("losing shapes (the rows that punish the design):");
+    // (a) Window on EVERY commit: O(keep) RMWs per commit, no amortisation.
+    stream_series(256, 1, 20_000, &reg);
+    // (b) Unbounded Append at the same N as a windowed run: memory and read
+    //     cost grow with history; the point of the policy.
+    unbounded_series(20_000, &reg);
+    // (c) A slow reader pinned before a Window keeps the whole old chain
+    //     alive until it drops: the bound is per *reachable* version.
+    slow_reader_series(256, 4096, &reg);
+}
+
+/// Commit `n` small batches under `WindowPolicy { keep_batches: keep, max_depth }`,
+/// timing every commit and splitting the samples by kind. Then a consumer's
+/// delta read (one batch behind) and the full window read.
+fn stream_series(keep: u32, max_depth: u32, n: usize, reg: &SchemaRegistry) {
+    let policy = WindowPolicy {
+        keep_batches: keep,
+        max_depth,
+    };
+    // A windowed root lists up to keep + max_depth single-chunk batches:
+    // 24 B descriptor + 4 B span + 16 B kept member each (ADR-0016).
+    let window_bytes = (64 + 44 * (keep as usize + max_depth as usize + 1)).next_power_of_two() as u32;
+    let small_chunks = 4 * keep + 4 * max_depth + 256;
+    let pool = PoolConfig {
+        classes: vec![
+            SizeClass {
+                chunk_size: 256,
+                chunk_count: small_chunks,
+            },
+            SizeClass {
+                chunk_size: window_bytes.max(512),
+                chunk_count: 8,
+            },
+        ],
+    };
+    let bytes = 256 * small_chunks as usize + 8 * window_bytes.max(512) as usize + (1 << 20);
+    let (art, h, d) = make_artifact(bytes, &pool);
+    let baseline = free_total(&art);
+    let small = batch(4);
+    let mut appends: Vec<f64> = Vec::with_capacity(n);
+    let mut windows: Vec<f64> = Vec::with_capacity(n / max_depth.max(1) as usize + 1);
+    let mut max_live = 0usize;
+    {
+        let mut w = art.open_exclusive(7).unwrap();
+        for i in 0..n {
+            let kind = policy.commit_for_depth(art.current_depth());
+            let t0 = Instant::now();
+            w.commit(kind.clone(), &small, reg).unwrap();
+            let ns = t0.elapsed().as_nanos() as f64;
+            if matches!(kind, Commit::Window { .. }) {
+                windows.push(ns);
+            } else {
+                appends.push(ns);
+            }
+            if i % 4096 == 0 {
+                max_live = max_live.max(baseline - free_total(&art));
+            }
+        }
+    }
+    max_live = max_live.max(baseline - free_total(&art));
+    let line = |label: &str, v: Vec<f64>| -> String {
+        if v.is_empty() {
+            return format!("{label} (none)");
+        }
+        let s = Stats::from_ns(v);
+        format!("{label} p50={:>8.0} p99={:>8.0} max={:>8.0}ns (n={})", s.p50, s.p99, s.max, s.n)
+    };
+    let a = line("Append", appends);
+    let wst = line("Window", windows);
+    let pin = art.pin().unwrap();
+    let batches = pin.manifest().total_batches;
+    let depth = pin.manifest().depth;
+    // A consumer one version behind: the delta is one batch.
+    let since = pin.version() - 1;
+    let delta = measure(2_000, 20_000, || pin.batches_since(since, reg).unwrap());
+    let full_iters = (4_000_000 / batches as usize).clamp(200, 20_000);
+    let full = measure(full_iters / 10, full_iters, || pin.as_arrow_batches(reg).unwrap());
+    println!("  keep={keep:>5} max_depth={max_depth:>5}: {a}  {wst}");
+    println!(
+        "                              live chunks max={max_live:>6} (bound {})  final table {batches} batches depth {depth}",
+        2 * keep as usize + 2 * max_depth as usize + 2
+    );
+    println!(
+        "                              delta read (1 batch behind) {}\n                              full read ({batches} batches)       {}",
+        delta.line_ns(),
+        full.line_ns()
+    );
+    drop(pin);
+    cleanup(h, d);
+}
+
+/// Plain `Append` for `n` commits in a pool sized to hold them all: the
+/// unbounded baseline the policy replaces.
+fn unbounded_series(n: usize, reg: &SchemaRegistry) {
+    let pool = PoolConfig {
+        classes: vec![SizeClass {
+            chunk_size: 256,
+            chunk_count: 2 * n as u32 + 64,
+        }],
+    };
+    let (art, h, d) = make_artifact(256 * (2 * n + 64) + (1 << 20), &pool);
+    let baseline = free_total(&art);
+    let small = batch(4);
+    let mut samples: Vec<f64> = Vec::with_capacity(n);
+    {
+        let mut w = art.open_exclusive(7).unwrap();
+        for _ in 0..n {
+            let t0 = Instant::now();
+            w.commit(Commit::Append, &small, reg).unwrap();
+            samples.push(t0.elapsed().as_nanos() as f64);
+        }
+    }
+    let s = Stats::from_ns(samples);
+    let live = baseline - free_total(&art);
+    let pin = art.pin().unwrap();
+    let since = pin.version() - 1;
+    let delta = measure(2_000, 20_000, || pin.batches_since(since, reg).unwrap());
+    let full = measure(20, 200, || pin.as_arrow_batches(reg).unwrap());
+    println!(
+        "  unbounded Append N={n}: commit p50={:>6.0} p99={:>6.0}ns  live chunks {live} (grows 2/commit)\n                              delta read {}\n                              full read ({n} batches) {}",
+        s.p50,
+        s.p99,
+        delta.line_ns(),
+        full.line_ns()
+    );
+    drop(pin);
+    cleanup(h, d);
+}
+
+/// A reader pins a version, then `extra` more commits land under the policy:
+/// the pinned chain cannot be freed, so live chunks grow past the bound until
+/// the pin drops — then the census falls back to the window.
+fn slow_reader_series(keep: u32, extra: usize, reg: &SchemaRegistry) {
+    let policy = WindowPolicy::new(keep);
+    let small_chunks = 4 * keep + 2 * extra as u32 + 256;
+    let window_bytes = (64 + 44 * (2 * keep as usize + 1)).next_power_of_two() as u32;
+    let pool = PoolConfig {
+        classes: vec![
+            SizeClass {
+                chunk_size: 256,
+                chunk_count: small_chunks,
+            },
+            SizeClass {
+                chunk_size: window_bytes,
+                chunk_count: 64,
+            },
+        ],
+    };
+    let bytes = 256 * small_chunks as usize + 64 * window_bytes as usize + (1 << 20);
+    let (art, h, d) = make_artifact(bytes, &pool);
+    let baseline = free_total(&art);
+    let small = batch(4);
+    let mut w = art.open_exclusive(7).unwrap();
+    for _ in 0..(2 * keep) {
+        w.commit_windowed(&policy, &small, reg).unwrap();
+    }
+    let steady = baseline - free_total(&art);
+    let held = art.pin().unwrap();
+    for _ in 0..extra {
+        w.commit_windowed(&policy, &small, reg).unwrap();
+    }
+    let with_pin = baseline - free_total(&art);
+    drop(held);
+    let after = baseline - free_total(&art);
+    drop(w);
+    println!(
+        "  slow reader keep={keep} pinned across {extra} commits: live chunks steady {steady} -> pinned {with_pin} -> dropped {after}"
+    );
+    cleanup(h, d);
+}
+
+/// Total free chunks across every size class of the artifact's data pool.
+fn free_total(art: &Artifact) -> usize {
+    let pool = shm_core::Pool::attach(art.data_segment()).unwrap();
+    (0..pool.num_classes()).map(|c| pool.free_count(c)).sum()
 }
 
 /// Commit a small batch `count` times, recording each commit's latency, then
