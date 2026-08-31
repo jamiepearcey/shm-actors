@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Guide — shm-actors</title>
+<title>Guide — Holon / shm-actors</title>
 <meta name="description" content="The shm-actors guide: memory model, zero-copy Arrow payloads, versioned cells, tasks, streams, the keyed store, the runtime, and the Holon actor layer.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏹</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -13,13 +13,13 @@
 <body>
 
 <div class="topbar"><div class="in">
-  <a class="brand" href="./" style="text-decoration:none">shm-<em>actors</em></a>
+  <a class="brand" href="./" style="text-decoration:none">holon<em>//</em>shm-actors</a>
   <nav>
     <a href="./">Overview</a>
     <a href="guide.html" class="on">Guide</a>
     <a href="benchmarks.html">Benchmarks</a>
     <a href="adrs.html">ADRs</a>
-    <a href="api/shm_artifact/index.html">API</a>
+    <a href="api/holon_actor/index.html">API</a>
     <a class="gh" href="https://github.com/jamiepearcey/shm-actors">GitHub</a>
     <button id="themeToggle" aria-label="Toggle theme">◒</button>
   </nav>
@@ -27,9 +27,9 @@
 
 <main class="wrap">
 <h1 class="page">The guide</h1>
-<p class="lede" style="max-width:66ch">Bottom-up: the memory model first, then each primitive built
-on it, then the actor layer on top. Every section names the crate that implements it and the ADR
-that decided it.</p>
+<p class="lede" style="max-width:66ch">Bottom-up: the shm-actors substrate first — the memory
+model, then each primitive built on it — and the Holon actor framework on top. Every section names
+the crate that implements it and the ADR that decided it.</p>
 
 <div class="docgrid">
 <div>
@@ -182,7 +182,7 @@ tx.<span class="a">commit</span>()?;            <span class="c">// one CAS: read
 
 <section id="holon">
   <div class="eyebrow">holon-core / holon-actor · ADR-0015</div>
-  <h2>The Holon actor layer</h2>
+  <h2>The Holon actor framework</h2>
   <p><strong>Actors own no state; memory nodes own no code.</strong> An actor is a message loop:
   envelopes ride the task queue, payloads live in versioned cells, and the handler pins the exact
   cell version its message named. Dispatch is a sorted table of function pointers — no
@@ -234,8 +234,8 @@ sys.<span class="a">run</span>()?;
 </main>
 
 <footer class="site"><div class="in">
-  <div>shm-actors · Apache-2.0</div>
-  <div class="mono"><a href="adrs.html">decision record</a> · <a href="benchmarks.html">benchmarks</a> · <a href="api/shm_artifact/index.html">API</a></div>
+  <div>Holon · an actor framework on the shm-actors substrate · Apache-2.0</div>
+  <div class="mono"><a href="adrs.html">decision record</a> · <a href="benchmarks.html">benchmarks</a> · <a href="api/holon_actor/index.html">API</a></div>
 </div></footer>
 <script src="site.js"></script>
 </body>

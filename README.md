@@ -1,17 +1,21 @@
-# shm-actors
+# Holon / shm-actors
 
-**One copy in. Zero copies after.**
+**Actors own no state. Memory owns no code.**
+
+**Holon** is a zero-copy actor framework for Rust: 64-byte envelopes over a
+lock-free mailbox, payloads in versioned Apache Arrow cells, crash recovery by
+lease + journal replay. It stands on **shm-actors**, the shared-memory
+substrate this repo also contains — one copy in, zero copies after.
 
 [![ci](https://github.com/jamiepearcey/shm-actors/actions/workflows/ci.yml/badge.svg)](https://github.com/jamiepearcey/shm-actors/actions/workflows/ci.yml)
 [![site](https://github.com/jamiepearcey/shm-actors/actions/workflows/site.yml/badge.svg)](https://jamiepearcey.github.io/shm-actors/)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A zero-copy, cross-process actor substrate in Rust, with **Apache Arrow** as the
-first-class payload format. A payload is written once into shared memory;
-everything downstream — pub/sub, tasks, streams, versioned tables — moves a
-**24-byte descriptor**. Safety is Rust's borrowing extended across process
-boundaries: exclusive loans for writers, pinned shared views for readers, and
-crash reclamation by journal replay that provably leaks nothing.
+The substrate writes a payload once into shared memory; everything downstream —
+pub/sub, tasks, streams, versioned tables — moves a **24-byte descriptor**.
+Safety is Rust's borrowing extended across process boundaries: exclusive loans
+for writers, pinned shared views for readers, and crash reclamation by journal
+replay that provably leaks nothing.
 
 **Website & docs: <https://jamiepearcey.github.io/shm-actors/>** — the guide,
 every benchmark, and all sixteen ADRs.

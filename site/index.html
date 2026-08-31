@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>shm-actors — zero-copy cross-process actors for Rust + Apache Arrow</title>
-<meta name="description" content="A Rust actor substrate over shared memory: payloads are written once, everything downstream moves a 24-byte descriptor. Versioned Arrow tables, crash-safe by replay, every number measured.">
+<title>Holon — a zero-copy actor framework for Rust, on the shm-actors substrate</title>
+<meta name="description" content="Holon is a Rust actor framework over shared memory: 64-byte envelopes, payloads in versioned Arrow cells, crash recovery by lease and journal replay. Built on the shm-actors substrate — one copy in, zero copies after.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏹</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=Archivo:wght@400;500;600&family=Spline+Sans+Mono:wght@400;500;600&display=swap">
@@ -13,13 +13,13 @@
 <body>
 
 <div class="topbar"><div class="in">
-  <a class="brand" href="./" style="text-decoration:none">shm-<em>actors</em></a>
+  <a class="brand" href="./" style="text-decoration:none">holon<em>//</em>shm-actors</a>
   <nav>
     <a href="./" class="on">Overview</a>
     <a href="guide.html">Guide</a>
     <a href="benchmarks.html">Benchmarks</a>
     <a href="adrs.html">ADRs</a>
-    <a href="api/shm_artifact/index.html">API</a>
+    <a href="api/holon_actor/index.html">API</a>
     <a class="gh" href="https://github.com/jamiepearcey/shm-actors">GitHub</a>
     <button id="themeToggle" aria-label="Toggle theme">◒</button>
   </nav>
@@ -27,14 +27,15 @@
 
 <main class="wrap">
 <header class="hero">
-  <div class="kicker">rust · shared memory · apache arrow · <b>16 ADRs, every number measured</b></div>
-  <h1>One copy in.<br><span class="z">Zero copies</span> after.</h1>
+  <div class="kicker">rust · actor framework · shared memory · apache arrow · <b>16 ADRs, every number measured</b></div>
+  <h1>Actors own no state.<br><span class="z">Memory owns no code.</span></h1>
   <p class="thesis lede">
-    <strong>shm-actors</strong> is a cross-process actor substrate where a payload is written once
-    into shared memory and everything downstream — pub/sub, tasks, streams, versioned tables —
-    moves a <strong>24-byte descriptor</strong>. Rust's borrowing, extended across process
-    boundaries: exclusive loans for writers, pinned shared views for readers, and crash
-    reclamation that provably leaks nothing.
+    <strong>Holon</strong> is an actor framework where the message is a 64-byte envelope, the
+    payload lives in a <strong>versioned Arrow cell</strong> in shared memory, and a handler pins
+    the exact version its message names. Actors are ordinary Rust processes; a
+    <code>kill&nbsp;-9</code> mid-message recovers by lease and journal replay with zero losses.
+    It stands on <strong>shm-actors</strong>, the zero-copy substrate: one copy in, everything
+    downstream moves a 24-byte descriptor.
   </p>
   <div class="cta">
     <a class="btn primary" href="guide.html">Read the guide</a>
@@ -43,10 +44,10 @@
   </div>
 
   <div class="statrow" role="list">
-    <div class="stat" role="listitem"><div class="v">83.5 <small>ns</small></div><div class="k">ring hop, cross-process p50</div></div>
-    <div class="stat" role="listitem"><div class="v">≤ 1 <small>tick</small></div><div class="k">version pin, 1 → 10 k versions</div></div>
-    <div class="stat" role="listitem"><div class="v">1.4 <small>µs</small></div><div class="k">append commit, flat to v100 000</div></div>
-    <div class="stat" role="listitem"><div class="v">0 <small>lost</small></div><div class="k">messages across a kill&nbsp;-9</div></div>
+    <div class="stat" role="listitem"><div class="v">1.2 <small>µs</small></div><div class="k">ask round trip, cross-process, spinning</div></div>
+    <div class="stat" role="listitem"><div class="v">9.5 <small>µs</small></div><div class="k">ask round trip, parked (7:1 is the wake, not us)</div></div>
+    <div class="stat" role="listitem"><div class="v">0 <small>lost</small></div><div class="k">messages across a kill&nbsp;-9 mid-handler</div></div>
+    <div class="stat" role="listitem"><div class="v">83.5 <small>ns</small></div><div class="k">substrate ring hop, cross-process p50</div></div>
     <div class="stat" role="listitem"><div class="v">239</div><div class="k">tests · 4 loom models · 5 fuzz targets</div></div>
   </div>
   <p class="footnote">All numbers: Apple M4 Max, macOS dev profile, release builds, ≥ 2 runs — the portable
@@ -65,27 +66,80 @@
   </div>
 </header>
 
-<section id="model" class="first" style="padding-top:60px">
-  <div class="eyebrow">The model</div>
-  <h2>A control plane that never touches the data path</h2>
-  <div class="flow" aria-label="Coordinator and actors">
-    <div class="fnode">coordinator<small>registry · leases · fd passing · reclamation</small></div>
-    <div class="farr">──SCM_RIGHTS──▶<small>segment fds, once</small></div>
-    <div class="fnode hot">actor A<small>maps segments, then: no hot-path syscalls</small></div>
-    <div class="farr">◀─shared memory─▶<small>descriptors only</small></div>
-    <div class="fnode hot">actor B<small>ordinary Rust process</small></div>
+<section id="framework" class="first" style="padding-top:60px">
+  <div class="eyebrow">The framework</div>
+  <h2>Message loops over shared state, without sharing mutable state</h2>
+  <p>An actor is a handler behind a mailbox. Envelopes ride a lock-free task queue; dispatch is a
+  sorted table of function pointers — no <code>dyn</code>, no allocation on the message path. One
+  process hosts any number of actors over one mailbox, routed by the envelope's <code>to</code>;
+  N processes of the same name form a pool with lease-based failover.</p>
+
+  <pre><code><span class="c">// host side: any number of actors, one mailbox, routed by `to`</span>
+<span class="k">let</span> <span class="k">mut</span> sys = ActorSystem::<span class="a">attach</span>(&node)?;
+sys.<span class="a">spawn</span>(<span class="g">"pricer"</span>, Pricer::<span class="a">new</span>(curve_ref))?;
+sys.<span class="a">spawn</span>(<span class="g">"risk"</span>,   Risk::<span class="a">new</span>(curve_ref))?;
+sys.<span class="a">run</span>()?;
+
+<span class="c">// a handler pins the exact cell version its message names</span>
+<span class="k">impl</span> Actor <span class="k">for</span> Pricer {
+    <span class="k">fn</span> <span class="a">handle</span>(&mut <span class="k">self</span>, cx: &Cx, env: &Envelope, req: PriceRequest) -> Reply {
+        <span class="k">let</span> curve = cx.<span class="a">pin</span>(&<span class="k">self</span>.curve)?;   <span class="c">// journaled: kill -9 safe</span>
+        <span class="g">price</span>(curve.<span class="a">as_arrow</span>(), req.tenor)     <span class="c">// zero-copy view</span>
+    }
+}
+
+<span class="c">// client side</span>
+<span class="k">let</span> pricer = client.<span class="a">actor_ref</span>::&lt;PriceRequest&gt;(<span class="g">"pricer"</span>)?;
+<span class="k">let</span> reply  = pricer.<span class="a">ask</span>(&req, timeout)?;        <span class="c">// or .tell(&evt)</span></code></pre>
+
+  <ul>
+    <li><strong>State lives in cells, not actors.</strong> A curve, a book, a table of ticks — each is a versioned Arrow cell any actor can pin. Restarting an actor loses nothing, because it owned nothing.</li>
+    <li><strong>The asker owns the reply memory.</strong> Learned from the demo, not the whiteboard: under crash-retry the reply must live in a chunk the asker allocated, named in the request — provably terminal, and handlers time-fence their writes at half the lease.</li>
+    <li><strong>Failover is observable, not magical.</strong> Replies carry the incarnation and the exact redelivery count; the client that cares sees the crash; the one that doesn’t, never notices.</li>
+  </ul>
+</section>
+
+<section id="crash">
+  <div class="eyebrow">Fault tolerance</div>
+  <h2>The crash story, measured — not promised</h2>
+  <p>The demo's supervisor injects <code>_exit(137)</code> into a pricer <em>while it holds a claimed
+  task and a journaled pin</em>. What follows is mechanical:</p>
+  <div class="flow" aria-label="Crash timeline">
+    <div class="fnode">t = 0<small>pricer killed mid-message</small></div>
+    <div class="farr">▶<small>lease runs out</small></div>
+    <div class="fnode">t = 500 ms<small>coordinator fences the corpse, replays its journal</small></div>
+    <div class="farr">▶<small>task redelivered</small></div>
+    <div class="fnode hot">t ≈ 530 ms<small>successor's first reply</small></div>
+    <div class="farr">▶<small>census</small></div>
+    <div class="fnode">0 leaked<small>pool returns to baseline, to the chunk</small></div>
   </div>
-  <p>The <strong>coordinator</strong> owns names — topics, artifacts, actors, leases — hands segment
-  file descriptors over a Unix socket, and drives crash reclamation. It is never on the data path:
-  if it dies, existing channels keep flowing. <strong>Actors</strong> are plain Rust processes that
-  map the granted segments and then communicate entirely through shared memory.</p>
+  <ul>
+    <li><strong>1 restart, 1 redelivery, 0 lost, 0 errors</strong> — clients see replies from both incarnations.</li>
+    <li>The dead process's journaled pin and staged chunks are <strong>replayed</strong>, its lease fenced — a zombie waking later can never write into freed memory.</li>
+    <li>The recovery constant is the <strong>lease, not luck</strong>: 500 ms lease → 522–543 ms to first successor reply, run after run.</li>
+  </ul>
+</section>
+
+<section id="substrate">
+  <div class="eyebrow">The substrate: shm-actors</div>
+  <h2>One copy in. Zero copies after.</h2>
+  <p>Holon does not carry its own runtime tricks — it stands on <strong>shm-actors</strong>, a
+  substrate where a payload is serialized once into size-class pooled chunks and everything
+  downstream moves a 24-byte, generation-checked descriptor. A <strong>coordinator</strong> owns
+  names and leases, passes segment fds over a Unix socket, and is never on the data path;
+  <strong>actors</strong> map their segments and stop making syscalls.</p>
 
   <div class="grid2">
     <div class="card"><h4><span class="m">shm-ring</span> Pub/sub</h4><p>SPMC broadcast ring with per-subscriber cursors. One-way hop: 83.5 ns p50, cross-process — the same as cross-core.</p><a class="more" href="guide.html#ring">How it works →</a></div>
-    <div class="card"><h4><span class="m">shm-task</span> Tasks</h4><p>MPMC queue with O(1) claim at capacity 256 <em>and</em> 65 536, leases, redelivery counts, and a journaled crash story.</p><a class="more" href="guide.html#task">How it works →</a></div>
+    <div class="card"><h4><span class="m">shm-task</span> Tasks</h4><p>MPMC queue with O(1) claim at capacity 256 <em>and</em> 65 536, leases, redelivery counts, and a journaled crash story. Holon's mailbox.</p><a class="more" href="guide.html#task">How it works →</a></div>
+    <div class="card"><h4><span class="m">shm-artifact</span> Versioned cells</h4><p>RCU-versioned Arrow tables: pin in ≤ 1 tick at any history depth, append in O(new data), windowed retention, exact delta reads. Holon's memory.</p><a class="more" href="guide.html#cells">How it works →</a></div>
     <div class="card"><h4><span class="m">shm-stream</span> Streams</h4><p>Transactional writers: stage many Arrow batches invisibly, install them as one atomic version. Abort or die — nothing partial is ever visible.</p><a class="more" href="guide.html#stream">How it works →</a></div>
-    <div class="card"><h4><span class="m">shm-artifact</span> Artifacts</h4><p>Versioned Arrow tables with RCU heads: readers pin a version in ≤ 1 tick and hold it while writers publish the next.</p><a class="more" href="guide.html#cells">How it works →</a></div>
   </div>
+
+  <p>Safety is Rust's ownership story made multi-process: exclusive <strong>loans</strong> for
+  writers, pinned shared views for readers, reclamation driven by <strong>leases + a per-actor
+  borrow journal + generation counters</strong>. A process that dies mid-anything is unwound by
+  replay, not by hope.</p>
 </section>
 
 <section id="numbers">
@@ -113,27 +167,6 @@
 
   <p>The full suite — including the shapes that <em>punish</em> the design — is on the
   <a href="benchmarks.html">benchmarks page</a>.</p>
-</section>
-
-<section id="crash">
-  <div class="eyebrow">Fault tolerance</div>
-  <h2>The crash story, measured — not promised</h2>
-  <p>The demo's supervisor injects <code>_exit(137)</code> into a pricer <em>while it holds a claimed
-  task and a journaled pin</em>. What follows is mechanical:</p>
-  <div class="flow" aria-label="Crash timeline">
-    <div class="fnode">t = 0<small>pricer killed mid-message</small></div>
-    <div class="farr">▶<small>lease runs out</small></div>
-    <div class="fnode">t = 500 ms<small>coordinator fences the corpse, replays its journal</small></div>
-    <div class="farr">▶<small>task redelivered</small></div>
-    <div class="fnode hot">t ≈ 530 ms<small>successor's first reply</small></div>
-    <div class="farr">▶<small>census</small></div>
-    <div class="fnode">0 leaked<small>pool returns to baseline, to the chunk</small></div>
-  </div>
-  <ul>
-    <li><strong>1 restart, 1 redelivery, 0 lost, 0 errors</strong> — clients see replies from both incarnations; the reply carries the exact attempt count.</li>
-    <li>The dead process's journaled pin and staged chunks are <strong>replayed</strong>, its lease fenced — a zombie waking later can never write into freed memory.</li>
-    <li>The recovery constant is the <strong>lease, not luck</strong>: 500 ms lease → 522–543 ms to first successor reply, run after run.</li>
-  </ul>
 </section>
 
 <section id="discipline">
@@ -169,13 +202,13 @@ cargo run -p holon-demo --release -- bench</code></pre>
   <div class="cta">
     <a class="btn primary" href="guide.html">Read the guide</a>
     <a class="btn" href="adrs.html">Browse the 16 ADRs</a>
-    <a class="btn" href="api/shm_artifact/index.html">API reference</a>
+    <a class="btn" href="api/holon_actor/index.html">API reference</a>
   </div>
 </section>
 </main>
 
 <footer class="site"><div class="in">
-  <div>shm-actors · Apache-2.0 · the substrate beneath a retained-execution data fabric</div>
+  <div>Holon · an actor framework on the shm-actors substrate · Apache-2.0</div>
   <div class="mono">every number on this site: measured, ≥ 2 runs, release builds</div>
 </div></footer>
 
