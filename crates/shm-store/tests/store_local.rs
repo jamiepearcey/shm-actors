@@ -453,7 +453,11 @@ fn a_tombstoned_entry_with_a_held_write_lease_converges() {
 
     store.evict(b"leased").unwrap();
     let cat = Catalog::attach(&h.catalog).unwrap();
-    assert_eq!(cat.slot(0).state(), SLOT_TOMBSTONE, "pin defers the reclaim");
+    assert_eq!(
+        cat.slot(0).state(),
+        SLOT_TOMBSTONE,
+        "pin defers the reclaim"
+    );
 
     // The evict force-released the lease with a fence bump (entry-lifecycle-
     // tied lease): the idle holder's token is stale, so its late commit is
@@ -602,7 +606,11 @@ fn retained_binding_ties_pin_to_entry_and_task_not_actor() {
     let held = entry.handoff(&held).expect("handoff");
     store.evict(b"task-input").unwrap();
     let cat = Catalog::attach(&h.catalog).unwrap();
-    assert_eq!(cat.slot(0).state(), SLOT_TOMBSTONE, "binding defers reclaim");
+    assert_eq!(
+        cat.slot(0).state(),
+        SLOT_TOMBSTONE,
+        "binding defers reclaim"
+    );
     assert_eq!(store.reclaim_tombstones().unwrap(), 0);
 
     assert!(shm_store::release_task_binding(
@@ -642,9 +650,15 @@ fn entry_append_windowed_stays_bounded_and_read_since_follows_it() {
     let mut last = 0u64;
     let mut max_live = 0usize;
     for i in 1..=5000i64 {
-        assert_eq!(entry.append_windowed(&policy, &batch(&sch, &[i])).unwrap(), i as u64);
+        assert_eq!(
+            entry.append_windowed(&policy, &batch(&sch, &[i])).unwrap(),
+            i as u64
+        );
         let (pin, delta) = entry.read_since(last).unwrap();
-        assert!(!delta.truncated || last == 0, "v{i}: a following reader was told to resync");
+        assert!(
+            !delta.truncated || last == 0,
+            "v{i}: a following reader was told to resync"
+        );
         for b in &delta.batches {
             let v = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             seen.extend_from_slice(v.values());
@@ -654,13 +668,19 @@ fn entry_append_windowed_stays_bounded_and_read_since_follows_it() {
         max_live = max_live.max(baseline - h.free_total());
     }
     assert_eq!(seen, (1..=5000).collect::<Vec<i64>>());
-    assert!(max_live <= 2 * 8 + 8 + 2, "live chunks peaked at {max_live}");
+    assert!(
+        max_live <= 2 * 8 + 8 + 2,
+        "live chunks peaked at {max_live}"
+    );
 
     // A consumer that fell far behind is told the history is gone and gets
     // the whole window to resync from.
     let (pin, delta) = entry.read_since(100).unwrap();
     assert!(delta.truncated);
-    assert_eq!(delta.from_version, pin.manifest().version - pin.manifest().depth as u64);
+    assert_eq!(
+        delta.from_version,
+        pin.manifest().version - pin.manifest().depth as u64
+    );
     let n: usize = delta.batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(n, pin.manifest().total_batches as usize);
     // The delta's batches are zero-copy views that keep the pin alive.

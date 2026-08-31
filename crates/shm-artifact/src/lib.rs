@@ -81,11 +81,9 @@ pub mod manifest;
 pub use artifact::{Artifact, Commit, Committer, Delta, VersionPin, WindowPolicy};
 pub use error::{Error, Result};
 pub use event::{CommitKind, VersionEvent, ARTIFACTS_TOPIC, EVENT_MAGIC};
-pub use head::{
-    ArtifactHead, PinSlot, FIRST_INCARNATION, MAX_LIVE_VERSIONS, NO_INCARNATION,
-};
+pub use head::{ArtifactHead, PinSlot, FIRST_INCARNATION, MAX_LIVE_VERSIONS, NO_INCARNATION};
 pub use manifest::{
     manifest_len, parse_manifest_bytes, read_manifest, read_manifest_checked,
-    walk_chain_newest_first, walk_chain_with, write_manifest, KeptMember, Manifest,
-    ManifestLink, VersionManifest, MANIFEST_MAGIC,
+    walk_chain_newest_first, walk_chain_with, write_manifest, KeptMember, Manifest, ManifestLink,
+    VersionManifest, MANIFEST_MAGIC,
 };

@@ -75,10 +75,7 @@ pub fn run() {
     println!("throughput, 1 producer -> N workers (producer-bound by construction):");
     for workers in [1usize, 2, 4] {
         let rate = throughput(200_000, workers);
-        println!(
-            "  {workers} worker(s): {} tasks/sec",
-            fmt_rate(rate)
-        );
+        println!("  {workers} worker(s): {} tasks/sec", fmt_rate(rate));
     }
     // N producers feeding N workers is the shape that can scale. At capacity
     // 256 producers spin on QueueFull; 4096 removes that backpressure so the
@@ -98,11 +95,17 @@ pub fn run() {
     println!("drain, pre-filled 60000, N workers, no producers, per-worker counters:");
     for workers in [1usize, 2, 4, 8] {
         let rate = drain(60_000, workers, true);
-        println!("  {workers} worker(s), claim+complete: {} tasks/sec", fmt_rate(rate));
+        println!(
+            "  {workers} worker(s), claim+complete: {} tasks/sec",
+            fmt_rate(rate)
+        );
     }
     for workers in [1usize, 2, 4, 8] {
         let rate = drain(60_000, workers, false);
-        println!("  {workers} worker(s), claim only:     {} tasks/sec", fmt_rate(rate));
+        println!(
+            "  {workers} worker(s), claim only:     {} tasks/sec",
+            fmt_rate(rate)
+        );
     }
 
     // ---- capacity scaling (ADR-0009: claim must be O(1), flat in capacity) ----

@@ -338,10 +338,12 @@ fn client_thread(
         return Ok(r);
     }
 
-    let mut actor = ActorRef::new(&mut node, ActorId::named(PRICER_NAME)).map_err(|e| e.to_string())?;
+    let mut actor =
+        ActorRef::new(&mut node, ActorId::named(PRICER_NAME)).map_err(|e| e.to_string())?;
     actor.set_spin(spin);
     // A second ref over the same node + mailbox, addressed to the other actor.
-    let mut risk = ActorRef::new(&mut node, ActorId::named(RISK_NAME)).map_err(|e| e.to_string())?;
+    let mut risk =
+        ActorRef::new(&mut node, ActorId::named(RISK_NAME)).map_err(|e| e.to_string())?;
     risk.set_spin(spin);
     let mut last_version: Option<u64> = None;
     barrier.wait();
@@ -352,18 +354,29 @@ fn client_thread(
         let t0 = Instant::now();
         // Both arms fold to (curve_version, incarnation, attempt) once verified.
         let res: Result<(u64, u32, u32), String> = if to_risk {
-            let req = RiskRequest { tenor, notional, seq };
+            let req = RiskRequest {
+                tenor,
+                notional,
+                seq,
+            };
             risk.ask::<RiskRequest, RiskReply>(&req)
                 .map_err(|e| e.to_string())
                 .and_then(|rep| {
                     let want = expected_dv01(rep.px, tenor);
                     if (rep.dv01 - want).abs() > 1e-9 * rep.px.abs().max(1.0) {
-                        return Err(format!("dv01 {} != expected {want} (px {})", rep.dv01, rep.px));
+                        return Err(format!(
+                            "dv01 {} != expected {want} (px {})",
+                            rep.dv01, rep.px
+                        ));
                     }
                     Ok((rep.curve_version, rep.incarnation, rep.attempt))
                 })
         } else {
-            let req = PriceRequest { tenor, notional, seq };
+            let req = PriceRequest {
+                tenor,
+                notional,
+                seq,
+            };
             actor
                 .ask::<PriceRequest, PriceReply>(&req)
                 .map(|rep| (rep.curve_version, rep.incarnation, rep.attempt))
@@ -392,7 +405,10 @@ fn client_thread(
             }
             Err(e) => {
                 r.errors += 1;
-                eprintln!("client-{idx} ask {seq} ({}) failed: {e}", if to_risk { "risk" } else { "price" });
+                eprintln!(
+                    "client-{idx} ask {seq} ({}) failed: {e}",
+                    if to_risk { "risk" } else { "price" }
+                );
             }
         }
     }
@@ -409,7 +425,12 @@ fn run_client_role(opts: &Opts) -> i32 {
     let barrier = Arc::new(Barrier::new(clients as usize + 1));
     let mut handles = Vec::new();
     for i in 0..clients {
-        let per = n / clients as u64 + if i == clients - 1 { n % clients as u64 } else { 0 };
+        let per = n / clients as u64
+            + if i == clients - 1 {
+                n % clients as u64
+            } else {
+                0
+            };
         let uds = uds.clone();
         let barrier = barrier.clone();
         handles.push(std::thread::spawn(move || {
@@ -430,7 +451,10 @@ fn run_client_role(opts: &Opts) -> i32 {
     }
     let elapsed = t0.elapsed();
 
-    let mut samples: Vec<u64> = reports.iter().flat_map(|r| r.samples.iter().copied()).collect();
+    let mut samples: Vec<u64> = reports
+        .iter()
+        .flat_map(|r| r.samples.iter().copied())
+        .collect();
     samples.sort_unstable();
     let mut incarnations: HashMap<u32, (u64, u64)> = HashMap::new();
     for r in &reports {
@@ -500,7 +524,10 @@ fn run_supervisor(opts: &Opts) -> i32 {
     let exe = std::env::current_exe().expect("current exe");
     // SAFETY: installing a signal handler that only stores to an atomic.
     unsafe {
-        libc::signal(libc::SIGTERM, on_term as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            on_term as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
     }
     let logline = |s: &str| {
         if let Some(p) = &log {
@@ -623,8 +650,26 @@ fn run_bench(opts: &Opts) -> i32 {
 
         // 2. busy-poll floor: pricer spins on claim, client spins on poll.
         let spin = {
-            let _p = spawn_pricer(&exe, &uds_s, &dir, "spin", &PricerOpts { spin: true, ..Default::default() });
-            run_client(&exe, &uds_s, &dir, "spin", &ClientOpts { spin: true, ..ClientOpts::parked(n) })
+            let _p = spawn_pricer(
+                &exe,
+                &uds_s,
+                &dir,
+                "spin",
+                &PricerOpts {
+                    spin: true,
+                    ..Default::default()
+                },
+            );
+            run_client(
+                &exe,
+                &uds_s,
+                &dir,
+                "spin",
+                &ClientOpts {
+                    spin: true,
+                    ..ClientOpts::parked(n)
+                },
+            )
         };
         println!(
             "2. ask round trip, pricer + client BUSY-POLLING (the floor): p50={} p99={} max={}  errors={}",
@@ -634,13 +679,39 @@ fn run_bench(opts: &Opts) -> i32 {
         // 3. throughput.
         let t41 = {
             let _p = spawn_pricer(&exe, &uds_s, &dir, "t41", &PricerOpts::default());
-            run_client(&exe, &uds_s, &dir, "t41", &ClientOpts { clients: 4, ..ClientOpts::parked(n) })
+            run_client(
+                &exe,
+                &uds_s,
+                &dir,
+                "t41",
+                &ClientOpts {
+                    clients: 4,
+                    ..ClientOpts::parked(n)
+                },
+            )
         };
         let t44 = {
             let _ps: Vec<Reaper> = (0..4)
-                .map(|i| spawn_pricer(&exe, &uds_s, &dir, &format!("t44-{i}"), &PricerOpts::default()))
+                .map(|i| {
+                    spawn_pricer(
+                        &exe,
+                        &uds_s,
+                        &dir,
+                        &format!("t44-{i}"),
+                        &PricerOpts::default(),
+                    )
+                })
                 .collect();
-            run_client(&exe, &uds_s, &dir, "t44", &ClientOpts { clients: 4, ..ClientOpts::parked(n) })
+            run_client(
+                &exe,
+                &uds_s,
+                &dir,
+                "t44",
+                &ClientOpts {
+                    clients: 4,
+                    ..ClientOpts::parked(n)
+                },
+            )
         };
         println!(
             "3. throughput (parked): 1 client/1 pricer = {:.0} asks/s; 4 clients/1 pricer = {:.0} asks/s (p50 {}); 4/4 = {:.0} asks/s (p50 {})  errors={}/{}/{}",
@@ -651,7 +722,17 @@ fn run_bench(opts: &Opts) -> i32 {
         // 3b. two actors per process, routed by `to` over the one mailbox.
         let mix = {
             let _p = spawn_pricer(&exe, &uds_s, &dir, "mix", &PricerOpts::default());
-            run_client(&exe, &uds_s, &dir, "mix", &ClientOpts { clients: 4, mix: true, ..ClientOpts::parked(n) })
+            run_client(
+                &exe,
+                &uds_s,
+                &dir,
+                "mix",
+                &ClientOpts {
+                    clients: 4,
+                    mix: true,
+                    ..ClientOpts::parked(n)
+                },
+            )
         };
         println!(
             "3b. two actors in ONE process (pricer + risk), 4 clients alternating by `to`: {:.0} asks/s (p50 {}, p99 {}) vs single-actor 4/1 {:.0} asks/s (p50 {}); risk replies={} (each verified) errors={}",
@@ -660,12 +741,50 @@ fn run_bench(opts: &Opts) -> i32 {
 
         // Detour: the same round trip with no envelope, no pin, no handler.
         let bare = {
-            let _p = spawn_pricer(&exe, &uds_s, &dir, "bare", &PricerOpts { bare: true, ..Default::default() });
-            run_client(&exe, &uds_s, &dir, "bare", &ClientOpts { bare: true, ..ClientOpts::parked(n) })
+            let _p = spawn_pricer(
+                &exe,
+                &uds_s,
+                &dir,
+                "bare",
+                &PricerOpts {
+                    bare: true,
+                    ..Default::default()
+                },
+            );
+            run_client(
+                &exe,
+                &uds_s,
+                &dir,
+                "bare",
+                &ClientOpts {
+                    bare: true,
+                    ..ClientOpts::parked(n)
+                },
+            )
         };
         let bare_spin = {
-            let _p = spawn_pricer(&exe, &uds_s, &dir, "bare-spin", &PricerOpts { bare: true, spin: true, ..Default::default() });
-            run_client(&exe, &uds_s, &dir, "bare-spin", &ClientOpts { bare: true, spin: true, ..ClientOpts::parked(n) })
+            let _p = spawn_pricer(
+                &exe,
+                &uds_s,
+                &dir,
+                "bare-spin",
+                &PricerOpts {
+                    bare: true,
+                    spin: true,
+                    ..Default::default()
+                },
+            );
+            run_client(
+                &exe,
+                &uds_s,
+                &dir,
+                "bare-spin",
+                &ClientOpts {
+                    bare: true,
+                    spin: true,
+                    ..ClientOpts::parked(n)
+                },
+            )
         };
         println!(
             "   bare submit→claim→complete→wait (no envelope/pin/handler): parked p50={} p99={}; spin p50={} p99={}",
@@ -679,7 +798,15 @@ fn run_bench(opts: &Opts) -> i32 {
 
         // 4. the crash.
         let before_crash = coord.store_data_free_total().expect("census");
-        let crash = crash_scenario(&exe, &uds_s, &dir, &format!("r{run}"), crash_n, kill_after, lease_ms);
+        let crash = crash_scenario(
+            &exe,
+            &uds_s,
+            &dir,
+            &format!("r{run}"),
+            crash_n,
+            kill_after,
+            lease_ms,
+        );
         let lost = crash.client.lost();
         println!(
             "4. crash: SIGKILL(_exit 137) → first reply from successor = {}; restarts={} redelivered={} lost={} errors={} incarnations={:?}",
@@ -718,7 +845,11 @@ fn run_bench(opts: &Opts) -> i32 {
     let final_free = coord.store_data_free_total().unwrap_or(0);
     println!(
         "\nfinal census after evicting curve: {final_free} free vs empty baseline {baseline} — {}",
-        if final_free == baseline { "ZERO LEAK" } else { "LEAK" }
+        if final_free == baseline {
+            "ZERO LEAK"
+        } else {
+            "LEAK"
+        }
     );
     let _ = std::fs::remove_dir_all(&dir);
     0

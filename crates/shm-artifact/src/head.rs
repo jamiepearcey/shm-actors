@@ -344,7 +344,8 @@ pub struct ArtifactHead {
 // `head_stride`) is unchanged. Gated on `not(loom)` like the `PinSlot` asserts.
 #[cfg(not(loom))]
 const _: () = assert!(
-    core::mem::size_of::<ArtifactHead>() == 40 + MAX_LIVE_VERSIONS * core::mem::size_of::<PinSlot>()
+    core::mem::size_of::<ArtifactHead>()
+        == 40 + MAX_LIVE_VERSIONS * core::mem::size_of::<PinSlot>()
 );
 
 impl ArtifactHead {

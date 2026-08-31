@@ -137,9 +137,11 @@ impl ClientReport {
             for part in s.split(';').filter(|p| !p.is_empty()) {
                 let f: Vec<&str> = part.split(':').collect();
                 if f.len() == 3 {
-                    if let (Ok(a), Ok(b), Ok(c)) =
-                        (f[0].parse::<u32>(), f[1].parse::<u64>(), f[2].parse::<u64>())
-                    {
+                    if let (Ok(a), Ok(b), Ok(c)) = (
+                        f[0].parse::<u32>(),
+                        f[1].parse::<u64>(),
+                        f[2].parse::<u64>(),
+                    ) {
                         incarnations.push((a, b, c));
                     }
                 }
@@ -410,7 +412,13 @@ pub fn crash_scenario(
         "supervised pricer never became READY"
     );
 
-    let client = run_client(exe, uds, dir, &format!("crash-{tag}"), &ClientOpts::parked(n));
+    let client = run_client(
+        exe,
+        uds,
+        dir,
+        &format!("crash-{tag}"),
+        &ClientOpts::parked(n),
+    );
 
     // The restart is logged when the supervisor respawns; it happened before
     // the client's later asks were answered, but give the log a moment.
@@ -424,13 +432,11 @@ pub fn crash_scenario(
         .lines()
         .filter(|l| l.starts_with("RESTART"))
         .count() as u32;
-    let kill_ns = std::fs::read_to_string(&pricer_log)
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("KILL "))
-                .and_then(|l| l[5..].trim().parse::<u64>().ok())
-        });
+    let kill_ns = std::fs::read_to_string(&pricer_log).ok().and_then(|s| {
+        s.lines()
+            .find(|l| l.starts_with("KILL "))
+            .and_then(|l| l[5..].trim().parse::<u64>().ok())
+    });
     // Incarnations are sorted by first reply; the second is the successor.
     let first_successor_reply_ns = client.incarnations.get(1).map(|i| i.2);
 

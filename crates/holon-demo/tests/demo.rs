@@ -31,7 +31,7 @@ use holon_demo::orchestrate::{
 };
 use holon_demo::roles::publish_curve_with;
 use holon_demo::{
-    curve_batch, expected_dv01, interpolate, price, Pricer, PriceReply, PriceRequest, Risk,
+    curve_batch, expected_dv01, interpolate, price, PriceReply, PriceRequest, Pricer, Risk,
     RiskReply, RiskRequest, CURVE_KEY, PRICER_NAME, RISK_NAME,
 };
 use shm_arrow::SchemaRegistry;
@@ -64,12 +64,17 @@ fn ask_reply_single_process() {
         let stop = stop.clone();
         std::thread::spawn(move || {
             let mut sys = ActorSystem::connect(&uds, PRICER_NAME).expect("system");
-            sys.intern_schema(&holon_demo::curve_schema()).expect("intern");
+            sys.intern_schema(&holon_demo::curve_schema())
+                .expect("intern");
             sys.set_stop(stop);
-            sys.spawn(PRICER_NAME, Pricer::new(None, None)).expect("spawn pricer");
+            sys.spawn(PRICER_NAME, Pricer::new(None, None))
+                .expect("spawn pricer");
             sys.spawn(RISK_NAME, Risk::new()).expect("spawn risk");
             assert!(
-                matches!(sys.spawn(RISK_NAME, Risk::new()), Err(holon_actor::Error::DuplicateActor(_))),
+                matches!(
+                    sys.spawn(RISK_NAME, Risk::new()),
+                    Err(holon_actor::Error::DuplicateActor(_))
+                ),
                 "a second spawn under the same name is refused"
             );
             assert_eq!(sys.actor_ids().count(), 2);
@@ -123,7 +128,11 @@ fn ask_reply_single_process() {
     for seq in 0..10u64 {
         let tenor = 1.0 + seq as f64 * 2.5;
         let rep: RiskReply = risk
-            .ask(&RiskRequest { tenor, notional: 1_000_000.0, seq })
+            .ask(&RiskRequest {
+                tenor,
+                notional: 1_000_000.0,
+                seq,
+            })
             .expect("risk ask");
         let px = price(interpolate(&v2, tenor).unwrap(), tenor, 1_000_000.0);
         assert!((rep.px - px).abs() < 1e-6, "risk px {} != {px}", rep.px);
@@ -138,11 +147,15 @@ fn ask_reply_single_process() {
     }
     // Routing is by `to`, not by schema: the pricer's schema sent to `risk`
     // is refused by `risk`'s own table …
-    let err = risk.ask_raw(PriceRequest::SCHEMA_ID, &[0u8; 24]).unwrap_err();
+    let err = risk
+        .ask_raw(PriceRequest::SCHEMA_ID, &[0u8; 24])
+        .unwrap_err();
     assert!(matches!(err, holon_actor::Error::Failed), "got {err:?}");
     // … and an actor nobody hosts fails the ask rather than hanging it.
     let nobody = ActorRef::new(&mut client, ActorId::named("nobody")).expect("ref");
-    let err = nobody.ask_raw(PriceRequest::SCHEMA_ID, &[0u8; 24]).unwrap_err();
+    let err = nobody
+        .ask_raw(PriceRequest::SCHEMA_ID, &[0u8; 24])
+        .unwrap_err();
     assert!(matches!(err, holon_actor::Error::Failed), "got {err:?}");
 
     // Stop the system: set the flag, nudge it with one more message.
@@ -216,7 +229,10 @@ fn crash_multiprocess() {
         n - (kill_after - 1),
         "the successor answered the redelivered ask and every one after it"
     );
-    assert_eq!(c.redelivered, 1, "exactly the in-flight ask was redelivered");
+    assert_eq!(
+        c.redelivered, 1,
+        "exactly the in-flight ask was redelivered"
+    );
     let k2f = out
         .kill_to_first_reply()
         .expect("kill and first successor reply both observed");
@@ -274,7 +290,15 @@ fn four_clients_two_pricers() {
     let n = 4_000;
     let report = {
         let _pricers: Vec<_> = (0..2)
-            .map(|i| spawn_pricer(exe, &uds_s, dir.path(), &format!("p{i}"), &PricerOpts::default()))
+            .map(|i| {
+                spawn_pricer(
+                    exe,
+                    &uds_s,
+                    dir.path(),
+                    &format!("p{i}"),
+                    &PricerOpts::default(),
+                )
+            })
             .collect();
         run_client(
             exe,
@@ -317,7 +341,15 @@ fn two_actors_one_mailbox_multiprocess() {
     let n = 4_000;
     let report = {
         let _pricers: Vec<_> = (0..2)
-            .map(|i| spawn_pricer(exe, &uds_s, dir.path(), &format!("mix{i}"), &PricerOpts::default()))
+            .map(|i| {
+                spawn_pricer(
+                    exe,
+                    &uds_s,
+                    dir.path(),
+                    &format!("mix{i}"),
+                    &PricerOpts::default(),
+                )
+            })
             .collect();
         run_client(
             exe,
@@ -332,9 +364,16 @@ fn two_actors_one_mailbox_multiprocess() {
         )
     };
     assert_eq!(report.asks, n);
-    assert_eq!(report.errors, 0, "no ask may error or misroute (each risk reply is verified)");
+    assert_eq!(
+        report.errors, 0,
+        "no ask may error or misroute (each risk reply is verified)"
+    );
     assert_eq!(report.replies, n, "every ask answered");
-    assert_eq!(report.risk_replies, n / 2, "exactly the odd seqs went to `risk`");
+    assert_eq!(
+        report.risk_replies,
+        n / 2,
+        "exactly the odd seqs went to `risk`"
+    );
     assert_eq!(report.lost(), 0);
     assert_eq!(report.redelivered, 0);
     assert_eq!(

@@ -145,7 +145,8 @@ pub trait Actor: Sized + 'static {
     /// Handle one message. `body` is the inline POD payload
     /// ([`Payload::from_bytes`]); return a [`Reply`] or an error (which fails the
     /// task — the asker sees [`Error::Failed`]).
-    fn handle(&mut self, msg: &Envelope, body: &[u8], cx: &mut Cx<'_>) -> holon_core::Result<Reply>;
+    fn handle(&mut self, msg: &Envelope, body: &[u8], cx: &mut Cx<'_>)
+        -> holon_core::Result<Reply>;
 
     /// Build the dispatch table. The default routes every id in
     /// [`accepts`](Self::accepts) to [`handle`](Self::handle); an actor with
@@ -169,7 +170,8 @@ trait Spawnable {
 /// zero-`dyn` dispatch table. Routing costs one vtable call per message at
 /// the `to → host` boundary; the schema lookup inside is the fn-pointer table.
 trait Hosted<'s> {
-    fn handle(&mut self, env: &Envelope, body: &[u8], cx: &mut Cx<'s>) -> holon_core::Result<Reply>;
+    fn handle(&mut self, env: &Envelope, body: &[u8], cx: &mut Cx<'s>)
+        -> holon_core::Result<Reply>;
 }
 
 struct Host<'s, A: Actor> {
@@ -187,7 +189,12 @@ impl<A: Actor> Spawnable for A {
 }
 
 impl<'s, A: Actor> Hosted<'s> for Host<'s, A> {
-    fn handle(&mut self, env: &Envelope, body: &[u8], cx: &mut Cx<'s>) -> holon_core::Result<Reply> {
+    fn handle(
+        &mut self,
+        env: &Envelope,
+        body: &[u8],
+        cx: &mut Cx<'s>,
+    ) -> holon_core::Result<Reply> {
         let handler = self
             .dispatch
             .lookup(env.schema_id)
@@ -383,7 +390,9 @@ impl ActorSystem {
                     &Envelope::reply_to(&env, b.schema_id(), b.len()),
                     b.bytes(),
                 ),
-                Ok(Reply::None) => msgs.write_message_into(&rdesc, &Envelope::reply_to(&env, 0, 0), &[]),
+                Ok(Reply::None) => {
+                    msgs.write_message_into(&rdesc, &Envelope::reply_to(&env, 0, 0), &[])
+                }
                 Err(_) => msgs.write_message_into(&rdesc, &Envelope::err_to(&env), &[]),
             };
             let done = if outcome.is_ok() && wrote.is_ok() {
@@ -496,8 +505,9 @@ impl ActorRef {
             _ => self.corr.fetch_add(1, Ordering::Relaxed),
         };
         let deadline = now_nanos().wrapping_add(SUBMIT_HORIZON.as_nanos() as u64);
-        let mut env = Envelope::inline(kind, self.to, self.from, corr, schema_id, body.len() as u16)
-            .with_deadline_nanos(deadline);
+        let mut env =
+            Envelope::inline(kind, self.to, self.from, corr, schema_id, body.len() as u16)
+                .with_deadline_nanos(deadline);
         if let Some(r) = reply {
             env = env.with_reply_ref(r);
         }

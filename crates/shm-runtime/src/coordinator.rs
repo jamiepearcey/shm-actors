@@ -1346,7 +1346,10 @@ fn reclaim_dead(
                 generation,
             } => {
                 if let Some(art) = attach_artifact_by_id(shared, artifact_id, incarnation) {
-                    if art.reclaim_staged_manifest(manifest, generation).unwrap_or(false) {
+                    if art
+                        .reclaim_staged_manifest(manifest, generation)
+                        .unwrap_or(false)
+                    {
                         artifact_pins += 1;
                     }
                 }

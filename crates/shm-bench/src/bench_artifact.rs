@@ -168,7 +168,8 @@ fn stream_series(keep: u32, max_depth: u32, n: usize, reg: &SchemaRegistry) {
     };
     // A windowed root lists up to keep + max_depth single-chunk batches:
     // 24 B descriptor + 4 B span + 16 B kept member each (ADR-0016).
-    let window_bytes = (64 + 44 * (keep as usize + max_depth as usize + 1)).next_power_of_two() as u32;
+    let window_bytes =
+        (64 + 44 * (keep as usize + max_depth as usize + 1)).next_power_of_two() as u32;
     let small_chunks = 4 * keep + 4 * max_depth + 256;
     let pool = PoolConfig {
         classes: vec![
@@ -212,7 +213,10 @@ fn stream_series(keep: u32, max_depth: u32, n: usize, reg: &SchemaRegistry) {
             return format!("{label} (none)");
         }
         let s = Stats::from_ns(v);
-        format!("{label} p50={:>8.0} p99={:>8.0} max={:>8.0}ns (n={})", s.p50, s.p99, s.max, s.n)
+        format!(
+            "{label} p50={:>8.0} p99={:>8.0} max={:>8.0}ns (n={})",
+            s.p50, s.p99, s.max, s.n
+        )
     };
     let a = line("Append", appends);
     let wst = line("Window", windows);
@@ -223,7 +227,9 @@ fn stream_series(keep: u32, max_depth: u32, n: usize, reg: &SchemaRegistry) {
     let since = pin.version() - 1;
     let delta = measure(2_000, 20_000, || pin.batches_since(since, reg).unwrap());
     let full_iters = (4_000_000 / batches as usize).clamp(200, 20_000);
-    let full = measure(full_iters / 10, full_iters, || pin.as_arrow_batches(reg).unwrap());
+    let full = measure(full_iters / 10, full_iters, || {
+        pin.as_arrow_batches(reg).unwrap()
+    });
     println!("  keep={keep:>5} max_depth={max_depth:>5}: {a}  {wst}");
     println!(
         "                              live chunks max={max_live:>6} (bound {})  final table {batches} batches depth {depth}",

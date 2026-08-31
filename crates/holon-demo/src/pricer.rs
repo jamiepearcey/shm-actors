@@ -51,7 +51,12 @@ impl Actor for Pricer {
         &[PRICE_REQUEST_SCHEMA]
     }
 
-    fn handle(&mut self, _msg: &Envelope, body: &[u8], cx: &mut Cx<'_>) -> holon_core::Result<Reply> {
+    fn handle(
+        &mut self,
+        _msg: &Envelope,
+        body: &[u8],
+        cx: &mut Cx<'_>,
+    ) -> holon_core::Result<Reply> {
         let req = PriceRequest::from_bytes(body)?;
         let curve = cx.pin(&self.curve)?;
         let rate = interpolate(&curve, req.tenor).map_err(holon_core::Error::Handler)?;

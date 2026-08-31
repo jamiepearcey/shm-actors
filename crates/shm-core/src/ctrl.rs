@@ -229,7 +229,11 @@ impl ChunkCtrl {
     pub fn release_shared(&self) -> bool {
         let mut cur = self.word.load(Ordering::SeqCst);
         loop {
-            debug_assert_eq!(word_state(cur), PUBLISHED, "release_shared on non-PUBLISHED");
+            debug_assert_eq!(
+                word_state(cur),
+                PUBLISHED,
+                "release_shared on non-PUBLISHED"
+            );
             let n = word_refcount(cur);
             debug_assert!(n > 0, "release_shared underflow");
             let owner_gone = self.owner_actor.load(Ordering::SeqCst) == OWNER_NONE;

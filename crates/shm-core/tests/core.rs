@@ -3,9 +3,10 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use shm_core::ctrl::ChunkCtrl;
-use shm_core::{pack_word, ShmU64, 
-    BorrowJournal, ChunkDesc, Error, JournalRecord, PackedRef, Platform, Pool, PoolConfig,
-    PosixPlatform, Segment, SharedPod, FREE, LAYOUT_VERSION, LOANED, PUBLISHED, SEGMENT_MAGIC,
+use shm_core::{
+    pack_word, BorrowJournal, ChunkDesc, Error, JournalRecord, PackedRef, Platform, Pool,
+    PoolConfig, PosixPlatform, Segment, SharedPod, ShmU64, FREE, LAYOUT_VERSION, LOANED, PUBLISHED,
+    SEGMENT_MAGIC,
 };
 
 /// The chunk offsets of the `ChunkPin` records a replay yields (ignores any
@@ -399,12 +400,18 @@ fn journal_tagged_entries_roundtrip_all_kinds() {
     // WriteLease — item K adds the third).
     let c0 = jrn.record(mk_desc(64)).unwrap();
     let a0 = jrn
-        .record_artifact_pin(/*artifact_id*/ 7, /*incarnation*/ 1, /*version*/ 0x1_0000_0002)
+        .record_artifact_pin(
+            /*artifact_id*/ 7,
+            /*incarnation*/ 1,
+            /*version*/ 0x1_0000_0002,
+        )
         .unwrap();
     let c1 = jrn.record(mk_desc(128)).unwrap();
     let a1 = jrn.record_artifact_pin(42, 1, 5).unwrap();
     let w0 = jrn
-        .record_write_lease(/*artifact_id*/ 9, /*incarnation*/ 1, /*fence*/ 3)
+        .record_write_lease(
+            /*artifact_id*/ 9, /*incarnation*/ 1, /*fence*/ 3,
+        )
         .unwrap();
     assert_eq!(jrn.len(), 5);
     assert!(
@@ -538,7 +545,9 @@ fn adopted_fd_segment_is_unnamed_and_unlink_is_a_noop() {
     assert_eq!(adopted.id(), id);
 
     // The adopted handle's unlink is a no-op...
-    adopted.unlink().expect("unnamed unlink must succeed as a no-op");
+    adopted
+        .unlink()
+        .expect("unnamed unlink must succeed as a no-op");
     // ...so the creator's name must STILL resolve afterwards.
     let reattach = Segment::attach(id)
         .expect("the creator's shm name must survive an adopted handle's unlink");
@@ -563,7 +572,10 @@ fn journal_release_is_an_election() {
     let jrn = BorrowJournal::create(&seg, 64).unwrap();
     let slot = jrn.record_artifact_pin(5, 1, 3).unwrap();
     assert!(jrn.release(slot).unwrap(), "first release wins the slot");
-    assert!(!jrn.release(slot).unwrap(), "second release loses: bit already clear");
+    assert!(
+        !jrn.release(slot).unwrap(),
+        "second release loses: bit already clear"
+    );
     assert_eq!(jrn.len(), 0);
     // `replay_indexed` yields the slot so a replayer can win it before acting.
     let s2 = jrn.record_artifact_pin(6, 1, 4).unwrap();

@@ -540,9 +540,15 @@ fn task_binding_lifecycle_arms_at_submit_and_releases_exactly_once_at_ack() {
         .expect("submit with input binding");
 
     // A live task's bindings cannot be acked out from under it.
-    assert!(matches!(queue.ack(h), Err(Error::NotTerminal)), "queued = live");
+    assert!(
+        matches!(queue.ack(h), Err(Error::NotTerminal)),
+        "queued = live"
+    );
     let task = queue.claim(11).expect("claim");
-    assert!(matches!(queue.ack(h), Err(Error::NotTerminal)), "claimed = live");
+    assert!(
+        matches!(queue.ack(h), Err(Error::NotTerminal)),
+        "claimed = live"
+    );
 
     // The worker ties its retained output to the task, then completes.
     task.bind_output(output).expect("bind output");
@@ -643,10 +649,7 @@ fn task_binding_survives_slot_reuse_and_table_full_backpressures() {
     // With capacity 1 the lease table holds 2 records, both now armed:
     // arming a third binding backpressures.
     let t_new = queue.claim(5).expect("claim new");
-    assert!(matches!(
-        t_new.bind_output(new),
-        Err(Error::LeaseTableFull)
-    ));
+    assert!(matches!(t_new.bind_output(new), Err(Error::LeaseTableFull)));
 
     // The old handle's ack releases ONLY the old binding (seq-matched), even
     // though its slot now hosts a live task (StaleHandle from poll's view).

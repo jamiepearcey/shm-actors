@@ -130,7 +130,10 @@ fn pidfd_reclaims_killed_worker_long_before_the_lease_deadline() {
         use shm_stream::{Commit, Coordination};
         let stream = committer.stream(CACHE_ARTIFACT).expect("stream");
         let mut w = stream
-            .writer(Commit::Replace, Coordination::Optimistic { expect_version: 1 })
+            .writer(
+                Commit::Replace,
+                Coordination::Optimistic { expect_version: 1 },
+            )
             .expect("writer");
         w.append_batch(&demo_batch()).expect("append");
         assert_eq!(w.commit().expect("commit v2"), 2);

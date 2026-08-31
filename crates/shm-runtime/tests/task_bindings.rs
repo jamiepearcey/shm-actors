@@ -122,7 +122,11 @@ fn task_bindings_survive_submitter_death_and_release_by_reap_not_replay() {
     })
     .expect("bind output");
     task.complete(shm_core::ChunkDesc::ZERO).expect("complete");
-    assert_eq!(coord.store_entry_pins(OUT_KEY, 1), Some(1), "output retained");
+    assert_eq!(
+        coord.store_entry_pins(OUT_KEY, 1),
+        Some(1),
+        "output retained"
+    );
 
     // --- The submitter "dies" holding its journaled pin (kill -9 analogue). ---
     std::mem::forget(own_pin);

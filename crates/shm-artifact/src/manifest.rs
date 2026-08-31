@@ -346,7 +346,9 @@ pub fn write_manifest<A: ChunkAllocator>(
     let (prev_version, prev_ref, prev_gen, depth, total_batches) = match prev {
         Some(link) => {
             if link.version >= version || link.version == 0 || link.mref.to_bits() == 0 {
-                return Err(Error::Unsupported("manifest link must name an older version"));
+                return Err(Error::Unsupported(
+                    "manifest link must name an older version",
+                ));
             }
             if window.is_some() {
                 return Err(Error::Unsupported("a linked manifest carries no window"));
@@ -547,9 +549,7 @@ pub fn parse_manifest_bytes(bytes: &[u8]) -> Result<Manifest> {
     let kept_bytes = kept_count
         .checked_mul(size_of::<KeptMember>())
         .ok_or(Error::VersionGone)?;
-    let total = kept_off
-        .checked_add(kept_bytes)
-        .ok_or(Error::VersionGone)?;
+    let total = kept_off.checked_add(kept_bytes).ok_or(Error::VersionGone)?;
     debug_assert_eq!(total, manifest_len(chunk_count, batch_count, kept_count));
     if total > bytes.len() {
         return Err(Error::VersionGone);
@@ -1017,7 +1017,14 @@ mod tests {
                 let len = 64 + rng.below(160);
                 let mut b = valid_manifest(cc, bc, len);
                 if rng.below(2) == 0 {
-                    link(&mut b, 1 + rng.below(4) as u64, 1 + rng.next_u64() % 1000, rng.byte() as u32, 1 + rng.below(3) as u32, bc + rng.below(4) as u32);
+                    link(
+                        &mut b,
+                        1 + rng.below(4) as u64,
+                        1 + rng.next_u64() % 1000,
+                        rng.byte() as u32,
+                        1 + rng.below(3) as u32,
+                        bc + rng.below(4) as u32,
+                    );
                 }
                 for _ in 0..rng.below(8) {
                     if !b.is_empty() {
@@ -1107,7 +1114,10 @@ mod tests {
 
         // Depth overrun: head claims depth 1 but the chain is 2 deep.
         c.depth = 1;
-        c.prev = Some(ManifestLink { depth: 0, ..c.prev.unwrap() });
+        c.prev = Some(ManifestLink {
+            depth: 0,
+            ..c.prev.unwrap()
+        });
         assert!(matches!(
             walk_chain_with(&c, store(&all)),
             Err(Error::VersionGone)
@@ -1115,7 +1125,10 @@ mod tests {
 
         // Non-decreasing version on the link itself.
         let mut d = linked(4, 1, &b);
-        d.prev = Some(ManifestLink { version: 4, ..d.prev.unwrap() });
+        d.prev = Some(ManifestLink {
+            version: 4,
+            ..d.prev.unwrap()
+        });
         assert!(matches!(
             walk_chain_with(&d, store(&all)),
             Err(Error::VersionGone)
@@ -1123,7 +1136,10 @@ mod tests {
 
         // The resolved predecessor does not self-identify as the linked version.
         let mut e = linked(5, 1, &b);
-        e.prev = Some(ManifestLink { mref: mref(1), ..e.prev.unwrap() });
+        e.prev = Some(ManifestLink {
+            mref: mref(1),
+            ..e.prev.unwrap()
+        });
         assert!(matches!(
             walk_chain_with(&e, store(&all)),
             Err(Error::VersionGone)
@@ -1151,7 +1167,10 @@ mod tests {
         // total_batches does not telescope: b claims 5 total over a's 2.
         let mut b_bad = b.clone();
         b_bad.total_batches = 5;
-        b_bad.prev = Some(ManifestLink { total_batches: 4, ..b_bad.prev.unwrap() });
+        b_bad.prev = Some(ManifestLink {
+            total_batches: 4,
+            ..b_bad.prev.unwrap()
+        });
         assert!(matches!(
             walk_chain_with(&b_bad, store(&[a.clone(), b_bad.clone()])),
             Err(Error::VersionGone)

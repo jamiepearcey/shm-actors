@@ -575,8 +575,7 @@ impl<'s> Catalog<'s> {
         let n = self.next_slot().min(self.capacity as u32);
         (0..n)
             .filter(|&idx| {
-                self.slot(idx).state() == SLOT_TOMBSTONE
-                    && self.try_reclaim(idx, &mut quiescent)
+                self.slot(idx).state() == SLOT_TOMBSTONE && self.try_reclaim(idx, &mut quiescent)
             })
             .count()
     }
@@ -740,17 +739,28 @@ mod tests {
         // A busy entry is refused and left exactly as it was found.
         assert!(!cat.try_reclaim(i0, |_, _| false));
         assert_eq!(cat.slot(i0).state(), SLOT_TOMBSTONE);
-        assert_eq!(cat.slot(i0).gen(), gen0, "an aborted sweep advances nothing");
+        assert_eq!(
+            cat.slot(i0).gen(),
+            gen0,
+            "an aborted sweep advances nothing"
+        );
 
         // A finished one comes back with the next incarnation staged.
         assert!(cat.try_reclaim(i0, |_, _| true));
         assert_eq!(cat.slot(i0).state(), SLOT_FREE);
         assert_eq!(cat.slot(i0).gen(), gen0 + 1);
-        assert_eq!(cat.slot(i0).key_id(), 0, "the recycled slot forgets its key");
+        assert_eq!(
+            cat.slot(i0).key_id(),
+            0,
+            "the recycled slot forgets its key"
+        );
 
         // The next allocation reuses the index instead of growing the table.
         let i1 = cat.alloc_slot().unwrap();
-        assert_eq!(i1, i0, "the free list is preferred over the high-water bump");
+        assert_eq!(
+            i1, i0,
+            "the free list is preferred over the high-water bump"
+        );
         assert_eq!(cat.next_slot(), 1, "and the high-water mark did not move");
 
         seg.unlink().ok();
@@ -766,7 +776,9 @@ mod tests {
         cat.publish_slot(idx, 1, RefKind::Dataset);
         assert!(cat.slot(idx).tombstone());
         // Jump `gen` to the last value it can hold.
-        cat.slot(idx).word.store(pack_slot_word(u32::MAX, SLOT_TOMBSTONE), Release);
+        cat.slot(idx)
+            .word
+            .store(pack_slot_word(u32::MAX, SLOT_TOMBSTONE), Release);
 
         assert!(
             !cat.try_reclaim(idx, |_, _| true),

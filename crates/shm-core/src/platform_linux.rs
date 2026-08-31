@@ -152,13 +152,8 @@ pub fn eventfd_ring(fd: RawFd) -> Result<()> {
     let one: u64 = 1;
     loop {
         // SAFETY: writing 8 bytes from a valid local to a live owned fd.
-        let n = unsafe {
-            libc::write(
-                fd,
-                (&one as *const u64).cast(),
-                core::mem::size_of::<u64>(),
-            )
-        };
+        let n =
+            unsafe { libc::write(fd, (&one as *const u64).cast(), core::mem::size_of::<u64>()) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             match err.kind() {
@@ -189,9 +184,8 @@ pub fn memfd_sealed_fd(debug_id: u32, size: usize) -> Result<OwnedFd> {
     let name = std::ffi::CString::new(format!("shmactr.{debug_id}"))
         .map_err(|_| Error::LayoutOverflow("memfd name contained NUL"))?;
     // SAFETY: `name` is a valid NUL-terminated string for the syscall's duration.
-    let raw = unsafe {
-        libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
-    };
+    let raw =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if raw < 0 {
         return Err(Error::Io(std::io::Error::last_os_error()));
     }

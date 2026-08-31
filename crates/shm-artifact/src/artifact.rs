@@ -68,8 +68,8 @@ use crate::head::{
 /// real actor id (actor ids are coordinator-issued small integers).
 pub const EVICTOR_OWNER: u32 = u32::MAX;
 use crate::manifest::{
-    read_manifest, read_manifest_checked, walk_chain_newest_first, walk_chain_with,
-    write_manifest, KeptMember, Manifest, ManifestLink,
+    read_manifest, read_manifest_checked, walk_chain_newest_first, walk_chain_with, write_manifest,
+    KeptMember, Manifest, ManifestLink,
 };
 
 /// How a commit relates the new version to its predecessor.
@@ -320,7 +320,9 @@ impl Artifact {
         // SAFETY: as above; the region is exclusively owned for this init.
         unsafe { ArtifactHead::init_at(ptr) };
         let fresh = head_ref_at(&head_seg, head_off);
-        fresh.write_lease.store(pack_lease(OWNER_NONE, carry), Release);
+        fresh
+            .write_lease
+            .store(pack_lease(OWNER_NONE, carry), Release);
         // Commission last: the release store publishes the initialised head to
         // any handle that resolves this slot from now on.
         fresh.commission(incarnation);
@@ -963,7 +965,9 @@ impl Artifact {
             };
             if prior.schema_id != schema_id {
                 self.rollback_staged(&pool, &published, None, &[], None, None);
-                return Err(Error::Unsupported("Append schema differs from the prior version"));
+                return Err(Error::Unsupported(
+                    "Append schema differs from the prior version",
+                ));
             }
 
             // 3. ONE `borrow_shared` on the prior *manifest* chunk: the new
@@ -1035,17 +1039,19 @@ impl Artifact {
                     expected: expect,
                     actual: head.current.load(SeqCst),
                 };
-                let prior =
-                    match read_manifest_checked(&self.data_seg, mref, self.name_id, expect) {
-                        Ok(prior) => prior,
-                        _ => {
-                            self.rollback_staged(&pool, &published, None, &[], None, None);
-                            return Err(conflict(head));
-                        }
-                    };
+                let prior = match read_manifest_checked(&self.data_seg, mref, self.name_id, expect)
+                {
+                    Ok(prior) => prior,
+                    _ => {
+                        self.rollback_staged(&pool, &published, None, &[], None, None);
+                        return Err(conflict(head));
+                    }
+                };
                 if prior.schema_id != schema_id {
                     self.rollback_staged(&pool, &published, None, &[], None, None);
-                    return Err(Error::Unsupported("Window schema differs from the prior version"));
+                    return Err(Error::Unsupported(
+                        "Window schema differs from the prior version",
+                    ));
                 }
                 match collect_window(&pool, &self.data_seg, &prior, keep_batches) {
                     Ok(w) => {
@@ -1178,8 +1184,7 @@ impl Artifact {
                 // The predecessor is now non-current; reclaim it if unpinned —
                 // the endorsed slot only (ADR-0013 review F3).
                 if expect != NO_VERSION {
-                    let _ =
-                        try_retire_version_at(head, &self.data_seg, expect, Some(prior_bits));
+                    let _ = try_retire_version_at(head, &self.data_seg, expect, Some(prior_bits));
                 }
 
                 if let Some(sink) = &self.watch {
@@ -1847,7 +1852,11 @@ fn collect_window(
             }
             run.reverse();
             if oldest {
-                base = if all_inherited { m.window_base } else { run_base };
+                base = if all_inherited {
+                    m.window_base
+                } else {
+                    run_base
+                };
             }
             kept_members.extend(run);
             if own_new > 0 {
@@ -2512,7 +2521,8 @@ impl VersionPin {
                 let ctrls: Vec<&ChunkCtrl> = group
                     .iter()
                     .map(|d| pool.ctrl(d))
-                    .collect::<core::result::Result<Vec<_>, shm_core::Error>>()?;
+                    .collect::<core::result::Result<Vec<_>, shm_core::Error>>(
+                )?;
                 let batch = read_batch_chunks(self.inner.clone(), group, &ctrls, registry)?;
                 batches.push(batch);
             }

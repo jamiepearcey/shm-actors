@@ -453,9 +453,8 @@ pub fn claim_pop<'s>(
     slot_at: impl Fn(u32) -> &'s TaskSlot,
 ) -> Option<u32> {
     loop {
-        let idx = shm_core::pool::treiber_pop(ready_head, |i| {
-            slot_at(i).next.load(Ordering::Acquire)
-        })?;
+        let idx =
+            shm_core::pool::treiber_pop(ready_head, |i| slot_at(i).next.load(Ordering::Acquire))?;
         let slot = slot_at(idx);
         if slot.try_claim() {
             return Some(idx);
@@ -614,8 +613,10 @@ impl LeaseSlot {
         self.version.store(binding.version, Ordering::Relaxed);
         self.seq.store(seq, Ordering::Relaxed);
         self.deadline.store(deadline, Ordering::Relaxed);
-        self.artifact_id.store(binding.artifact_id, Ordering::Relaxed);
-        self.incarnation.store(binding.incarnation, Ordering::Relaxed);
+        self.artifact_id
+            .store(binding.artifact_id, Ordering::Relaxed);
+        self.incarnation
+            .store(binding.incarnation, Ordering::Relaxed);
         self.slot_idx.store(slot_idx, Ordering::Relaxed);
         let gen = lease_word_gen(self.word.load(Ordering::Relaxed));
         self.word.store(
@@ -672,8 +673,10 @@ impl LeaseSlot {
     pub fn retire(&self) {
         let w = self.word.load(Ordering::Relaxed);
         debug_assert_eq!(lease_word_state(w), LEASE_RELEASED);
-        self.word
-            .store(pack_lease_word(lease_word_gen(w), LEASE_NONE), Ordering::Release);
+        self.word.store(
+            pack_lease_word(lease_word_gen(w), LEASE_NONE),
+            Ordering::Release,
+        );
     }
 }
 
@@ -1198,7 +1201,11 @@ impl TaskQueue {
         // Publish (`QUEUED`, Release — pairs with the claimer's Acquire), then
         // push onto READY. Strictly in that order: see [`publish_queued`].
         let s = next_shard();
-        publish_queued(&self.header().ready_heads[s].head, |i| self.slot(i as usize), idx);
+        publish_queued(
+            &self.header().ready_heads[s].head,
+            |i| self.slot(i as usize),
+            idx,
+        );
 
         // Dekker against `claim_blocking`'s register-then-sweep: the house rule
         // (`substrate::fence` docs, and the pin handshake) is an explicit
@@ -1322,7 +1329,9 @@ impl TaskQueue {
             // that spurious `QueueFull` into a submit. The pop grants
             // exclusivity, exactly as in the primary FREE path.
             found = self.pop_free().inspect(|&idx| {
-                self.slot(idx as usize).state.store(RESERVED, Ordering::Release);
+                self.slot(idx as usize)
+                    .state
+                    .store(RESERVED, Ordering::Release);
             });
         }
         // Re-ring the doorbell for any worker that raced the drain, saw READY
@@ -1681,7 +1690,12 @@ impl TaskQueue {
                 LEASE_ARMED => {}
                 _ => continue,
             }
-            if now_nanos <= rec.deadline.load(Ordering::Acquire).saturating_add(grace_nanos) {
+            if now_nanos
+                <= rec
+                    .deadline
+                    .load(Ordering::Acquire)
+                    .saturating_add(grace_nanos)
+            {
                 continue; // still inside the requester's ack window
             }
             let sidx = rec.slot_idx.load(Ordering::Acquire) as usize;

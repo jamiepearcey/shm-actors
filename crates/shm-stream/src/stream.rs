@@ -309,17 +309,15 @@ impl<'a> StreamWriter<'a> {
 
         let result = match &mut self.coord {
             Coord::Exclusive(committer) => committer.commit_staged(kind, &descs, &spans, schema_id),
-            Coord::Optimistic { expect } => {
-                artifact.commit_staged_optimistic_journaled(
-                    owner,
-                    *expect,
-                    kind,
-                    &descs,
-                    &spans,
-                    schema_id,
-                    self.journal,
-                )
-            }
+            Coord::Optimistic { expect } => artifact.commit_staged_optimistic_journaled(
+                owner,
+                *expect,
+                kind,
+                &descs,
+                &spans,
+                schema_id,
+                self.journal,
+            ),
         };
 
         // Whether the install succeeded (chunks now owned by the version) or

@@ -38,7 +38,9 @@ pub mod pool;
 pub mod segment;
 pub mod substrate;
 
-pub use ctrl::{pack_word, word_refcount, word_state, ChunkCtrl, FREE, LOANED, OWNER_NONE, PUBLISHED};
+pub use ctrl::{
+    pack_word, word_refcount, word_state, ChunkCtrl, FREE, LOANED, OWNER_NONE, PUBLISHED,
+};
 pub use desc::{ChunkDesc, PackedRef};
 pub use error::{Error, Result};
 pub use journal::{

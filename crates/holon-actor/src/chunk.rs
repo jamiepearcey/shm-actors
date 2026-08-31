@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use holon_core::{decode_message, encode_message, Envelope, LocalRef, ENVELOPE_SIZE, SCHEMA_ENVELOPE};
+use holon_core::{
+    decode_message, encode_message, Envelope, LocalRef, ENVELOPE_SIZE, SCHEMA_ENVELOPE,
+};
 use shm_core::{ChunkDesc, Pool, Segment};
 
 /// The size of the **reply chunk** an asker allocates and a handler writes
@@ -191,7 +193,10 @@ mod tests {
         ));
         let r = LocalRef(shm_core::PackedRef::from_desc(&reply));
         let rd = msgs.reply_desc(r);
-        assert_eq!((rd.segment_id, rd.offset, rd.len), (reply.segment_id, reply.offset, 256));
+        assert_eq!(
+            (rd.segment_id, rd.offset, rd.len),
+            (reply.segment_id, reply.offset, 256)
+        );
         let renv = Envelope::reply_to(&env, 1002, 4);
         msgs.write_message_into(&rd, &renv, &[1, 2, 3, 4]).unwrap();
         let (got, got_body) = msgs.read_message(&reply).unwrap();

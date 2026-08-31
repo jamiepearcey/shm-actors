@@ -39,9 +39,8 @@ fn futex_doorbell_wakes_idle_subscriber() {
     let size = (required_bytes(64) + 4096).next_power_of_two();
     let segment = Arc::new(Segment::create(id, size).expect("create segment"));
     // SAFETY: the payload stays mapped for the whole test; sole initializer.
-    let ring = unsafe {
-        Ring::init(segment.payload_ptr(), segment.payload_len(), 64).expect("init ring")
-    };
+    let ring =
+        unsafe { Ring::init(segment.payload_ptr(), segment.payload_len(), 64).expect("init ring") };
 
     // SAFETY (both hooks): the word borrows the ring header inside `segment`,
     // whose Arc clones keep the mapping alive for both threads' lifetimes.
@@ -95,9 +94,8 @@ fn futex_park_bounded_timeout_recovers_a_silent_publish() {
     let size = (required_bytes(64) + 4096).next_power_of_two();
     let segment = Arc::new(Segment::create(id, size).expect("create segment"));
     // SAFETY: the payload stays mapped for the whole test; sole initializer.
-    let ring = unsafe {
-        Ring::init(segment.payload_ptr(), segment.payload_len(), 64).expect("init ring")
-    };
+    let ring =
+        unsafe { Ring::init(segment.payload_ptr(), segment.payload_len(), 64).expect("init ring") };
 
     // Short bounded park so the test is quick; the contract is the same.
     // SAFETY: the word borrows the header in `segment`, kept alive via Arc.

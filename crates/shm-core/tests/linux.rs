@@ -179,7 +179,9 @@ fn monotonic_clock_and_native_platform() {
     assert!(c >= b);
 
     // The sealed creation goes through the seam too.
-    let seg = plat.segment_create_sealed(90_003, 8192).expect("sealed via seam");
+    let seg = plat
+        .segment_create_sealed(90_003, 8192)
+        .expect("sealed via seam");
     // SAFETY: ftruncate on a live owned fd (expected to be refused).
     let rc = unsafe { libc::ftruncate(seg.as_raw_fd(), 4096) };
     assert_eq!(rc, -1);

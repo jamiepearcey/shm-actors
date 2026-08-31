@@ -290,7 +290,10 @@ fn loom_claim_index_publish_vs_pop() {
         ITERS_E.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Submitter holds slot 0 exclusively (RESERVED, off both stacks),
         // fields written — about to publish.
-        let q = Arc::new(MiniQueue::one_slot(6 /* RESERVED (internal transient) */, false));
+        let q = Arc::new(MiniQueue::one_slot(
+            6, /* RESERVED (internal transient) */
+            false,
+        ));
 
         let s = q.clone();
         let submitter = loom::thread::spawn(move || {
@@ -407,7 +410,10 @@ fn loom_lease_release_exactly_once_and_gen_aba_safe() {
             !rec.try_release(armed_word),
             "a stale-generation release must never touch the new task's binding"
         );
-        assert_eq!(lease_word_gen(rec.word.load(core::sync::atomic::Ordering::Acquire)), 2);
+        assert_eq!(
+            lease_word_gen(rec.word.load(core::sync::atomic::Ordering::Acquire)),
+            2
+        );
         assert_eq!(
             lease_word_state(rec.word.load(core::sync::atomic::Ordering::Acquire)),
             LEASE_ARMED
