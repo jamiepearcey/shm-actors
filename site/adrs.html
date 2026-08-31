@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Decision record — shm-actors</title>
+<meta name="description" content="All sixteen shm-actors architecture decision records, rendered in the build sequence they were made.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏹</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=Archivo:wght@400;500;600&family=Spline+Sans+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="topbar"><div class="in">
+  <a class="brand" href="./" style="text-decoration:none">shm-<em>actors</em></a>
+  <nav>
+    <a href="./">Overview</a>
+    <a href="guide.html">Guide</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="adrs.html" class="on">ADRs</a>
+    <a href="api/shm_artifact/index.html">API</a>
+    <a class="gh" href="https://github.com/jamiepearcey/shm-actors">GitHub</a>
+    <button id="themeToggle" aria-label="Toggle theme">◒</button>
+  </nav>
+</div></div>
+
+<main class="wrap">
+<h1 class="page">The decision record</h1>
+<p class="lede" style="max-width:66ch">Every capability landed through an ADR with measured
+evidence, in this exact sequence. These are the source files from
+<code>docs/decisions/</code>, rendered as-is.</p>
+
+<div class="adrshell">
+  <nav class="adrlist" id="adrlist" aria-label="ADRs"></nav>
+  <article class="md" id="adrbody"><p class="kbd-note">Loading…</p></article>
+</div>
+</main>
+
+<footer class="site"><div class="in">
+  <div>shm-actors · Apache-2.0</div>
+  <div class="mono">decisions are commits, not slideware</div>
+</div></footer>
+
+<script src="site.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script>
+const ADRS = [
+  ["0001","ADR-0001-foundation-and-scope.md","Foundation, build-vs-adopt, v0.1 scope"],
+  ["0002","ADR-0002-v0.2-scope.md","v0.2 scope, sequence, walking skeleton"],
+  ["0003","ADR-0003-v0.3-scope.md","v0.3 scope + the hostile cache loop"],
+  ["0003a","ADR-0003a-packedref-repack-and-pin-hazard.md","PackedRef repack + pin hazard handshake"],
+  ["0004","ADR-0004-v0.4-adversarial-release.md","v0.4: the Adversarial Release"],
+  ["0005","ADR-0005-arrowref-task-fabric-spike.md","ArrowRef task-fabric integration spike"],
+  ["0007","ADR-0007-typed-ref-envelope-and-keyed-store.md","Typed ref envelope + keyed store"],
+  ["0008","ADR-0008-holon-phase-0-substrate-prerequisites.md","Holon Phase 0: substrate prerequisites"],
+  ["0009","ADR-0009-p0-2-o1-task-claim.md","O(1) task claim via index stacks"],
+  ["0010","ADR-0010-p0-3-lifecycle-leases-and-evict-current.md","Lifecycle leases + evict-current"],
+  ["0011","ADR-0011-p0-4-linux-fast-paths.md","The Linux fast paths"],
+  ["0012","ADR-0012-task-queue-contention.md","Task-queue contention: the four fixes"],
+  ["0013","ADR-0013-chained-manifests.md","Chained manifests: Append in O(new data)"],
+  ["0014","ADR-0014-correctness-contracts-closed.md","Closing the residual correctness contracts"],
+  ["0015","ADR-0015-holon-demo.md","The Holon demo"],
+  ["0016","ADR-0016-windowed-append-and-delta-read.md","Windowed append + delta read"]
+];
+const list = document.getElementById("adrlist"), body = document.getElementById("adrbody");
+ADRS.forEach(([n, file, title]) => {
+  const a = document.createElement("a");
+  a.href = "#" + n; a.innerHTML = '<span class="n">' + n + "</span>" + title;
+  a.dataset.n = n; list.appendChild(a);
+});
+async function load(n) {
+  const row = ADRS.find(r => r[0] === n) || ADRS[ADRS.length - 1];
+  [...list.children].forEach(a => a.classList.toggle("on", a.dataset.n === row[0]));
+  body.innerHTML = '<p class="kbd-note">Loading ADR-' + row[0] + "…</p>";
+  try {
+    const res = await fetch("adrs/" + row[1]);
+    if (!res.ok) throw new Error(res.status);
+    const md = await res.text();
+    body.innerHTML = marked.parse(md, { mangle: false, headerIds: false });
+    window.scrollTo({ top: 0 });
+  } catch (e) {
+    body.innerHTML = '<p>Could not load this ADR here (' + e.message +
+      '). Read it in the repo: <a href="https://github.com/jamiepearcey/shm-actors/blob/main/docs/decisions/' +
+      row[1] + '">docs/decisions/' + row[1] + "</a>.</p>";
+  }
+}
+addEventListener("hashchange", () => load(location.hash.slice(1)));
+load(location.hash.slice(1) || "0001");
+</script>
+</body>
+</html>

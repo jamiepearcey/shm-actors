@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Guide — shm-actors</title>
+<meta name="description" content="The shm-actors guide: memory model, zero-copy Arrow payloads, versioned cells, tasks, streams, the keyed store, the runtime, and the Holon actor layer.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏹</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=Archivo:wght@400;500;600&family=Spline+Sans+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="topbar"><div class="in">
+  <a class="brand" href="./" style="text-decoration:none">shm-<em>actors</em></a>
+  <nav>
+    <a href="./">Overview</a>
+    <a href="guide.html" class="on">Guide</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="adrs.html">ADRs</a>
+    <a href="api/shm_artifact/index.html">API</a>
+    <a class="gh" href="https://github.com/jamiepearcey/shm-actors">GitHub</a>
+    <button id="themeToggle" aria-label="Toggle theme">◒</button>
+  </nav>
+</div></div>
+
+<main class="wrap">
+<h1 class="page">The guide</h1>
+<p class="lede" style="max-width:66ch">Bottom-up: the memory model first, then each primitive built
+on it, then the actor layer on top. Every section names the crate that implements it and the ADR
+that decided it.</p>
+
+<div class="docgrid">
+<div>
+
+<section id="memory" class="first" style="padding-top:44px">
+  <div class="eyebrow">shm-core · ADR-0001</div>
+  <h2>The memory model</h2>
+  <p>Everything lives in <strong>segments</strong> (<code>shm_open</code> + <code>mmap</code>)
+  carved into <strong>fixed size-class pools</strong>. Allocation rounds a request up to the first
+  class that fits; free lists are lock-free Treiber stacks with tagged heads, so external
+  fragmentation is structurally impossible and ABA is designed out.</p>
+
+  <h3 id="chunkctrl">The chunk control word</h3>
+  <p>Every chunk carries a <code>ChunkCtrl</code>: state, owner, refcount and a
+  <strong>generation counter</strong>, packed so state and refcount move in one atomic word.</p>
+  <div class="flow" aria-label="Chunk lifecycle">
+    <div class="fnode">FREE<small>on the free-list</small></div>
+    <div class="farr">try_loan ▶<small>writer owns it</small></div>
+    <div class="fnode">LOANED<small>written exactly once</small></div>
+    <div class="farr">publish ▶<small>one CAS</small></div>
+    <div class="fnode hot">PUBLISHED<small>refcounted, immutable</small></div>
+    <div class="farr">refcount → 0 ▶<small>generation bumps</small></div>
+    <div class="fnode">FREE<small>recycled</small></div>
+  </div>
+  <ul>
+    <li><strong>Loans are exclusive.</strong> A writer serializes a payload into loaned chunks; nothing can observe them until <code>publish</code>.</li>
+    <li><strong>Published chunks are immutable.</strong> Readers take shared references (<code>borrow_shared</code> fails the instant a chunk is not <code>PUBLISHED</code> — there is no window where a count lands on a dying chunk).</li>
+    <li><strong>Generations make staleness detectable.</strong> A 24-byte <code>ChunkDesc</code> records the generation it was written at; any dereference validates it. A recycled chunk fails the check instead of leaking someone else's data.</li>
+  </ul>
+
+  <h3 id="journal">The borrow journal</h3>
+  <p>Each actor owns a fixed-slot <strong>journal</strong> in shared memory. Every cross-process
+  borrow — a staged chunk, a version pin, a write lease — records a slot; a clean release clears it.
+  When an actor dies, the coordinator's lease monitor <strong>replays the journal</strong>: staged
+  chunks are freed, pins decremented, leases force-released and <em>fenced</em> so a zombie that
+  wakes up later can never install anything. Crash safety is replay, not heuristics.</p>
+</section>
+
+<section id="arrow">
+  <div class="eyebrow">shm-arrow</div>
+  <h2>Arrow as the payload format</h2>
+  <p>A <code>RecordBatch</code> is serialized <strong>once</strong> into chunks in Arrow's own
+  buffer layout, with schemas interned to a <code>u32</code>. Reconstruction builds column buffers
+  that point <em>directly into the mapped segment</em> — a clone of the pin is the buffers'
+  keep-alive, so a batch can outlive the call that produced it but never the version it views.</p>
+  <ul>
+    <li>Reconstruct cost is <strong>flat vs. row count</strong>: 208–250 ns whether the table holds 1 000 or 1 000 000 rows.</li>
+    <li>A large or nested batch spans several chunks (spans are recorded per batch); it round-trips intact.</li>
+    <li>Write throughput (~80 GB/s on the dev machine) is memcpy throughput for this workload — the docs refuse to call it “ingestion”.</li>
+  </ul>
+</section>
+
+<section id="ring">
+  <div class="eyebrow">shm-ring</div>
+  <h2>Pub/sub: the broadcast ring</h2>
+  <p>A single-producer, multi-consumer ring of fixed slots with per-subscriber cursors. Producers
+  never wait on consumers; a slow subscriber observes loss explicitly rather than exerting
+  backpressure on the bus. Messages are descriptors, so fan-out costs the same whether the payload
+  is 100 bytes or 100 MB. One-way hop: 83.5 ns p50 cross-process — the same as cross-core, because
+  it is the same cache-coherency traffic.</p>
+</section>
+
+<section id="cells">
+  <div class="eyebrow">shm-artifact · ADR-0013 / 0016</div>
+  <h2>Versioned cells</h2>
+  <p>An <strong>artifact</strong> is a named, versioned Arrow table. One RCU head holds
+  <code>current</code>; commits install with a single linearising CAS; readers pin:</p>
+  <pre><code><span class="c">// reader: pin whatever is current, get a zero-copy view</span>
+<span class="k">let</span> pin  = artifact.<span class="a">pin</span>()?;                 <span class="c">// ≤ 1 tick, any history depth</span>
+<span class="k">let</span> view = pin.<span class="a">as_arrow_batches</span>(&registry)?; <span class="c">// buffers point into shm</span>
+
+<span class="c">// writer: exclusive (leased) or optimistic (CAS race)</span>
+<span class="k">let</span> <span class="k">mut</span> w = artifact.<span class="a">open_exclusive_journaled</span>(me, &journal)?;
+w.<span class="a">commit</span>(Commit::Append, &batch, &registry)?;   <span class="c">// O(new data)</span></code></pre>
+
+  <h3 id="manifests">Chained manifests</h3>
+  <p>Each version's manifest lists only its <em>own</em> chunks plus one refcounted link to its
+  predecessor — so the table is the chain, and <code>Append</code> costs O(new data) no matter how
+  long the lineage grows (measured flat past 100 000 versions). Retirement is a cascade that runs
+  exactly once per manifest, elected by CAS; a pinned old version keeps exactly its own chain
+  alive and nothing more.</p>
+
+  <h3 id="window">Windowed append + delta read</h3>
+  <p>High-churn cells stay bounded with three pieces (ADR-0016):</p>
+  <pre><code><span class="c">// producer: append, re-rooting on the newest K batches every K commits</span>
+<span class="k">let</span> policy = WindowPolicy::<span class="a">new</span>(<span class="g">256</span>);
+entry.<span class="a">append_windowed</span>(&policy, &tick_batch)?;   <span class="c">// zero bytes copied, ever</span>
+
+<span class="c">// consumer: pay only for what's new</span>
+<span class="k">let</span> (pin, delta) = entry.<span class="a">read_since</span>(last_seen)?;
+<span class="k">for</span> batch <span class="k">in</span> &delta.batches { <span class="a">apply</span>(batch); }   <span class="c">// ~290 ns, flat</span>
+<span class="k">if</span> delta.truncated { <span class="a">resync</span>(&delta.batches); }   <span class="c">// a Replace happened</span>
+last_seen = pin.<span class="a">version</span>();</code></pre>
+  <p><code>Commit::Window</code> builds a fresh root that re-lists the newest K batches
+  <em>by reference</em>; the tail of history cascades back to the pool. The root records which
+  version every kept batch came from, so <strong>a window is invisible to any reader that keeps
+  up</strong> — it receives exactly the rows it lacks. A <code>Replace</code> is never silently
+  papered over: <code>delta.truncated</code> tells the reader its history is gone. Live memory,
+  manifest size and read cost are all bounded by the policy, forever.</p>
+</section>
+
+<section id="task">
+  <div class="eyebrow">shm-task · ADR-0009 / 0012</div>
+  <h2>Tasks</h2>
+  <p>An MPMC queue whose messages are descriptors. Submit and claim are O(1) via FREE/READY index
+  stacks — measured identical at capacity 256 and 65 536. A claimed task carries a
+  <strong>lease</strong>; a worker that dies past its lease has the task redelivered, and the slot
+  records the attempt count so consumers can act on redelivery exactly.</p>
+  <p>The contention story is a case study in method (ADR-0012): aggregate throughput <em>fell</em>
+  with workers until per-worker counters isolated the defect — a handle clone costing two atomic
+  refcount RMWs per claim. Layout theories (padding, sharding) were tried first and changed
+  nothing. Counters, not theory: 4.5 M/s negative-scaling became a flat 5–9 M/s.</p>
+</section>
+
+<section id="stream">
+  <div class="eyebrow">shm-stream · ADR-0002</div>
+  <h2>Transactional streams</h2>
+  <pre><code><span class="k">let</span> <span class="k">mut</span> tx = StreamWriter::<span class="a">open</span>(&artifact, &seg, &journal, &reg, me,
+                              Commit::Append, Coordination::Exclusive)?;
+tx.<span class="a">append_batch</span>(&a)?;   <span class="c">// staged: LOANED, journaled, invisible</span>
+tx.<span class="a">append_batch</span>(&b)?;
+tx.<span class="a">commit</span>()?;            <span class="c">// one CAS: readers see v(n) then v(n+1)</span></code></pre>
+  <p>Isolation because staged chunks are loaned and named by no manifest; atomicity because the
+  install is the artifact's single CAS; abort (or <code>Drop</code>, or death) frees every staged
+  chunk with nothing published. A writer crash mid-transaction is unwound by journal replay — the
+  stream needs no extra crash machinery.</p>
+</section>
+
+<section id="store">
+  <div class="eyebrow">shm-store · ADR-0007 / 0008</div>
+  <h2>The keyed store</h2>
+  <p>Names over artifacts: a catalog maps byte keys to entries, each entry owning an artifact,
+  typed refs, and lifecycle. Slots reclaim under churn (create/evict far past capacity runs
+  indefinitely); a reclaimed slot gets a new <strong>incarnation</strong>, so stale handles fail
+  cleanly instead of resolving to a stranger. <code>evict_current</code> drops the data but keeps
+  the address — what a task-output cache wants for ack-and-clear.</p>
+</section>
+
+<section id="runtime">
+  <div class="eyebrow">shm-runtime · ADR-0003 / 0010 / 0014</div>
+  <h2>The runtime</h2>
+  <p>The coordinator hosts the registry and passes segment fds over a Unix socket
+  (<code>SCM_RIGHTS</code>). Actors register, receive their segments and journal, and never make
+  another control-plane call on the hot path. The lease monitor watches actor liveness: on death it
+  fences the actor's write leases and replays its journal. Doorbells are the platform seam —
+  one-byte UDS writes on the POSIX baseline, futex/eventfd on Linux — chosen because the
+  <em>substrate</em> costs 83.5 ns while a parked wake costs ~4.4 µs: the wake, not the memory
+  model, is the budget.</p>
+</section>
+
+<section id="holon">
+  <div class="eyebrow">holon-core / holon-actor · ADR-0015</div>
+  <h2>The Holon actor layer</h2>
+  <p><strong>Actors own no state; memory nodes own no code.</strong> An actor is a message loop:
+  envelopes ride the task queue, payloads live in versioned cells, and the handler pins the exact
+  cell version its message named. Dispatch is a sorted table of function pointers — no
+  <code>dyn</code>, no allocation on the message path.</p>
+  <pre><code><span class="k">let</span> <span class="k">mut</span> sys = ActorSystem::<span class="a">attach</span>(&node)?;
+sys.<span class="a">spawn</span>(<span class="g">"pricer"</span>, Pricer::<span class="a">new</span>(curve_ref))?;   <span class="c">// any number of actors,</span>
+sys.<span class="a">spawn</span>(<span class="g">"risk"</span>,   Risk::<span class="a">new</span>(curve_ref))?;     <span class="c">// one mailbox, routed by `to`</span>
+sys.<span class="a">run</span>()?;
+
+<span class="c">// client side</span>
+<span class="k">let</span> pricer = client.<span class="a">actor_ref</span>::&lt;PriceRequest&gt;(<span class="g">"pricer"</span>)?;
+<span class="k">let</span> reply  = pricer.<span class="a">ask</span>(&req, timeout)?;        <span class="c">// or .tell(&evt)</span></code></pre>
+  <ul>
+    <li><strong>One 64-byte envelope</strong> — one cache line, frozen ABI — is both the mailbox slot and, by design, the future TCP frame header. Small bodies ride inline; anything else is a packed reference into the shared pool.</li>
+    <li><strong>The asker allocates the reply chunk</strong> and names it in the request. This came out of the demo, not the whiteboard: the task slot's result word is reused by the free-list before the asker can poll it under concurrency, so the reply must live in memory the asker owns. Handlers time-fence their reply write at half the lease, so a lease-lapsed zombie never writes into freed memory.</li>
+    <li><strong>N processes of the same name form a pool</strong>; redelivery + incarnation-tagged replies make failover observable to the client that cares and invisible to the one that doesn't.</li>
+  </ul>
+  <p>Measured: ask round trip 9.5 µs p50 parked / 1.2 µs spinning; 168–186 K asks/s at 4 clients ×
+  4 pricers; the envelope layer itself accounts for ~2 µs parked, ~0.7 µs spinning — the rest is
+  the doorbell. Crash-to-successor is the lease plus one tick: 522–543 ms at a 500 ms lease, with
+  one redelivery, zero losses and an exact pool census after.</p>
+</section>
+
+<section id="platform">
+  <div class="eyebrow">Platform · ADR-0011</div>
+  <h2>Platform &amp; roadmap honesty</h2>
+  <ul>
+    <li><strong>Baseline (measured):</strong> portable POSIX — <code>shm_open</code> + <code>mmap</code>, UDS doorbells, coordinator leases for death detection. Dev on macOS.</li>
+    <li><strong>Linux fast paths (built, unmeasured):</strong> futex doorbells, memfd sealing behind the platform seam. They compile clean under <code>-D warnings</code> cross-target; no futex numbers are quoted because none have been measured.</li>
+    <li><strong>Not yet:</strong> cross-host transport (the envelope is designed as the frame header, but no network face ships), <code>Commit::Patch</code>, per-actor mailboxes (head-of-line isolation between co-hosted actors).</li>
+  </ul>
+</section>
+
+</div>
+<aside class="toc" aria-label="On this page">
+  <div class="t">On this page</div>
+  <a href="#memory">Memory model</a>
+  <a href="#arrow">Arrow payloads</a>
+  <a href="#ring">Pub/sub ring</a>
+  <a href="#cells">Versioned cells</a>
+  <a href="#task">Tasks</a>
+  <a href="#stream">Streams</a>
+  <a href="#store">Keyed store</a>
+  <a href="#runtime">Runtime</a>
+  <a href="#holon">Holon actors</a>
+  <a href="#platform">Platform</a>
+</aside>
+</div>
+</main>
+
+<footer class="site"><div class="in">
+  <div>shm-actors · Apache-2.0</div>
+  <div class="mono"><a href="adrs.html">decision record</a> · <a href="benchmarks.html">benchmarks</a> · <a href="api/shm_artifact/index.html">API</a></div>
+</div></footer>
+<script src="site.js"></script>
+</body>
+</html>

@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Benchmarks — shm-actors</title>
+<meta name="description" content="Every measured number: the flat set, the wake costs, the windowed-stream series, the losing shapes, and the method rules that keep the claims honest.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏹</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=Archivo:wght@400;500;600&family=Spline+Sans+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="topbar"><div class="in">
+  <a class="brand" href="./" style="text-decoration:none">shm-<em>actors</em></a>
+  <nav>
+    <a href="./">Overview</a>
+    <a href="guide.html">Guide</a>
+    <a href="benchmarks.html" class="on">Benchmarks</a>
+    <a href="adrs.html">ADRs</a>
+    <a href="api/shm_artifact/index.html">API</a>
+    <a class="gh" href="https://github.com/jamiepearcey/shm-actors">GitHub</a>
+    <button id="themeToggle" aria-label="Toggle theme">◒</button>
+  </nav>
+</div></div>
+
+<main class="wrap">
+<h1 class="page">Benchmarks</h1>
+<p class="lede" style="max-width:66ch">Reproduce everything with
+<code>cargo run -p shm-bench --release -- all</code> — the suite prints its own hardware profile
+first. Numbers below: Apple M4 Max (14 cores), macOS, release builds, ≥ 2 runs per session.</p>
+
+<section id="method" class="first" style="padding-top:44px">
+  <div class="eyebrow">Rules first</div>
+  <h2>Method &amp; wording</h2>
+  <ul>
+    <li><strong>The timer floor is 41.7 ns.</strong> A reading of “min 0, p50 42, p99 42” is quantised, not measured — such results are reported “≤ 1 tick”, never as a constant.</li>
+    <li><strong>Every suite runs at least twice.</strong> The machine drifts ±20–40 %; a single run once produced a phantom regression.</li>
+    <li><strong>“Zero-copy”</strong> = no payload-size-proportional copy. View construction costs ~200–540 ns and is reported.</li>
+    <li><strong>No invented comparisons.</strong> No baseline vs. iceoryx2 / Plasma / sockets has been run, so no “N× faster than X” appears anywhere.</li>
+    <li><strong>macOS dev profile.</strong> The Linux futex/memfd fast paths compile clean cross-target but are unmeasured; no futex number is quoted.</li>
+    <li><strong>Losing shapes ship in the suite.</strong> A change defaults on only after the row that punishes it exists.</li>
+  </ul>
+</section>
+
+<section id="flat">
+  <div class="eyebrow">The flat set</div>
+  <h2>Where the architecture claims O(1), it measures flat</h2>
+  <div class="tblwrap"><table>
+    <tr><th>operation</th><th class="n">p50</th><th>flat across</th></tr>
+    <tr><td>version pin + drop</td><td class="n">≤ 1 tick</td><td>1 → 10 000 committed versions</td></tr>
+    <tr><td>task claim</td><td class="n">≤ 1 tick</td><td>capacity 256 → 65 536</td></tr>
+    <tr><td><code>as_arrow</code> zero-copy reconstruct</td><td class="n">208–250 ns</td><td>1 000 → 1 000 000 rows</td></tr>
+    <tr><td><code>read_batch</code> view build</td><td class="n">459–541 ns</td><td>1 000 → 1 000 000 rows</td></tr>
+    <tr><td>ring hop, one way, cross-process</td><td class="n">83.5 ns</td><td>same as cross-core</td></tr>
+    <tr><td>append commit (chained manifests)</td><td class="n">1.4–1.6 µs</td><td>version 0 → 100 000</td></tr>
+    <tr><td>delta read, one version behind</td><td class="n">~290 ns</td><td>any history, any window size</td></tr>
+  </table></div>
+</section>
+
+<section id="wake">
+  <div class="eyebrow">The honest ledger</div>
+  <h2>Wake cost dominates everything</h2>
+  <div class="tblwrap"><table>
+    <tr><th>path</th><th class="n">p50</th><th>note</th></tr>
+    <tr><td>busy-poll ring hop</td><td class="n">83.5 ns</td><td>the substrate's floor</td></tr>
+    <tr><td>parked <code>poll(2)</code> wake</td><td class="n">~4.4 µs</td><td>53× the hop — the whole case for the futex ADR</td></tr>
+    <tr><td>bare task round trip, parked</td><td class="n">7.5 µs</td><td>submit → claim → complete, matched wake</td></tr>
+    <tr><td>full actor ask, parked</td><td class="n">9.5 µs</td><td>envelope + pool + catalog + journaled pin + Arrow adds ~2 µs</td></tr>
+    <tr><td>full actor ask, spinning</td><td class="n">1.2 µs</td><td>envelope layer's share: ~0.7 µs</td></tr>
+    <tr><td>in-process task round trip</td><td class="n">≤ 1 tick</td><td>the 7 : 1 parked ratio is wake cost, not envelope cost</td></tr>
+  </table></div>
+  <div class="tblwrap"><table>
+    <tr><th>actor throughput (parked)</th><th class="n">asks/s</th></tr>
+    <tr><td>1 client / 1 pricer</td><td class="n">99–105 K</td></tr>
+    <tr><td>4 clients / 1 pricer</td><td class="n">147–160 K</td></tr>
+    <tr><td>4 clients / 4 pricers</td><td class="n">168–186 K</td></tr>
+    <tr><td>task queue, N-pair drain (post ADR-0012)</td><td class="n">5–9 M/s flat</td></tr>
+  </table></div>
+</section>
+
+<section id="stream">
+  <div class="eyebrow">ADR-0016</div>
+  <h2>The windowed stream series</h2>
+  <p>100 000 commits of a 4-row batch under <code>WindowPolicy::new(keep)</code>. Append should be
+  flat; a Window costs O(keep) reference bumps once every <em>keep</em> commits; live memory and
+  reads stay bounded.</p>
+  <div class="tblwrap"><table>
+    <tr><th>keep</th><th class="n">append p50 / p99</th><th class="n">window p50 (n)</th><th class="n">delta read</th><th class="n">full read</th><th class="n">live chunks max (bound)</th></tr>
+    <tr><td class="n">16</td><td class="n">1.4 / 2–3.7 µs</td><td class="n">3.6–4.2 µs (6 250)</td><td class="n">0.29 µs</td><td class="n">7–8 µs · 32 batches</td><td class="n">48 (66)</td></tr>
+    <tr><td class="n">256</td><td class="n">1.4 / 1.8–3.3 µs</td><td class="n">31–36 µs (391)</td><td class="n">0.29 µs</td><td class="n">90–99 µs · 416 batches</td><td class="n">576 (1 026)</td></tr>
+    <tr><td class="n">4 096</td><td class="n">1.5 / 2.3–3.8 µs</td><td class="n">0.74–1.0 ms (25)</td><td class="n">0.29 µs</td><td class="n">1.3–1.7 ms · 5 792 batches</td><td class="n">7 488 (16 386)</td></tr>
+  </table></div>
+  <p>A Window costs ~120–180 ns per kept chunk (member parse + two generation validations + one CAS
+  + a 24 B descriptor write). Amortised over the policy that is 0.1–0.2 µs per commit — a seventh
+  of an append — but the per-window tail is real and reported, not hidden in an average.</p>
+
+  <h3>The losing shapes</h3>
+  <div class="tblwrap"><table>
+    <tr><th>shape</th><th>result</th><th>reading</th></tr>
+    <tr><td>Window on <em>every</em> commit (max_depth = 1, keep = 256)</td><td class="n">6.4–6.8 µs/commit · delta read 0.7 µs</td><td>4.5× an append and the member table is summed per read — the policy <em>is</em> the amortisation; don't set max_depth below keep.</td></tr>
+    <tr><td>Unbounded append, N = 20 000</td><td class="n">commit 1.4 µs · read 8.5 ms · 40 000 chunks live</td><td>Commit stays flat — memory and read cost are what the window exists to bound.</td></tr>
+    <tr><td>Reader pinned across 4 096 commits (keep = 256)</td><td class="n">768 → 1 536 → 768 chunks</td><td>A stale pin holds exactly the one window it pinned — 2× the policy bound, never the history.</td></tr>
+  </table></div>
+</section>
+
+<section id="crash">
+  <div class="eyebrow">ADR-0015</div>
+  <h2>Crash &amp; census</h2>
+  <div class="tblwrap"><table>
+    <tr><th>measurement</th><th class="n">run 1</th><th class="n">run 2</th></tr>
+    <tr><td>kill −9 → successor's first reply (500 ms lease)</td><td class="n">521.9 ms</td><td class="n">542.6 ms</td></tr>
+    <tr><td>restarts / redelivered / lost / errors</td><td class="n">1 / 1 / 0 / 0</td><td class="n">1 / 1 / 0 / 0</td></tr>
+    <tr><td>pool census after crash</td><td class="n">= baseline</td><td class="n">= baseline</td></tr>
+    <tr><td>census after evicting the cell</td><td class="n">= empty baseline</td><td class="n">= empty baseline</td></tr>
+  </table></div>
+  <p>The census is the invariant that makes every other number trustworthy: after any hostile
+  scenario — commit races, leaked-pin replay, <code>kill -9</code> churn loops — free chunks minus
+  baseline must equal the live data, to the chunk. It does, in 239 tests.</p>
+</section>
+
+<section id="repro">
+  <div class="eyebrow">Reproduce</div>
+  <h2>On your machine</h2>
+  <pre><code>cargo run -p shm-bench --release -- all        <span class="c"># full suite + hardware profile</span>
+cargo run -p shm-bench --release -- artifact   <span class="c"># pins, commits, windowed streams</span>
+cargo run -p shm-bench --release -- task       <span class="c"># claim scaling, drain shapes</span>
+cargo run -p holon-demo --release -- bench     <span class="c"># actor asks, throughput, crash row</span></code></pre>
+  <p class="kbd-note">Run everything twice. If your first run disagrees with your second by 30 %,
+  that's the machine, not the code — it's why the method section exists.</p>
+</section>
+</main>
+
+<footer class="site"><div class="in">
+  <div>shm-actors · Apache-2.0</div>
+  <div class="mono">no invented numbers · no unmeasured claims</div>
+</div></footer>
+<script src="site.js"></script>
+</body>
+</html>
