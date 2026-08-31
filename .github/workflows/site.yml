@@ -35,6 +35,7 @@ jobs:
           mkdir -p _site/adrs
           cp -r site/. _site/
           cp docs/decisions/*.md _site/adrs/
+          python3 scripts/gen_adr_index.py docs/decisions _site/adrs/index.json
           cp -r target/doc _site/api
           touch _site/.nojekyll
       - uses: actions/upload-pages-artifact@v3

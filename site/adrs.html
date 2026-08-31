@@ -45,30 +45,26 @@ evidence, in this exact sequence. These are the source files from
 <script src="site.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
 <script>
-const ADRS = [
-  ["0001","ADR-0001-foundation-and-scope.md","Foundation, build-vs-adopt, v0.1 scope"],
-  ["0002","ADR-0002-v0.2-scope.md","v0.2 scope, sequence, walking skeleton"],
-  ["0003","ADR-0003-v0.3-scope.md","v0.3 scope + the hostile cache loop"],
-  ["0003a","ADR-0003a-packedref-repack-and-pin-hazard.md","PackedRef repack + pin hazard handshake"],
-  ["0004","ADR-0004-v0.4-adversarial-release.md","v0.4: the Adversarial Release"],
-  ["0005","ADR-0005-arrowref-task-fabric-spike.md","ArrowRef task-fabric integration spike"],
-  ["0007","ADR-0007-typed-ref-envelope-and-keyed-store.md","Typed ref envelope + keyed store"],
-  ["0008","ADR-0008-holon-phase-0-substrate-prerequisites.md","Holon Phase 0: substrate prerequisites"],
-  ["0009","ADR-0009-p0-2-o1-task-claim.md","O(1) task claim via index stacks"],
-  ["0010","ADR-0010-p0-3-lifecycle-leases-and-evict-current.md","Lifecycle leases + evict-current"],
-  ["0011","ADR-0011-p0-4-linux-fast-paths.md","The Linux fast paths"],
-  ["0012","ADR-0012-task-queue-contention.md","Task-queue contention: the four fixes"],
-  ["0013","ADR-0013-chained-manifests.md","Chained manifests: Append in O(new data)"],
-  ["0014","ADR-0014-correctness-contracts-closed.md","Closing the residual correctness contracts"],
-  ["0015","ADR-0015-holon-demo.md","The Holon demo"],
-  ["0016","ADR-0016-windowed-append-and-delta-read.md","Windowed append + delta read"]
-];
+let ADRS = [];
+async function loadIndex(){
+  try {
+    const r = await fetch("adrs/index.json");
+    if (!r.ok) throw new Error(r.status);
+    ADRS = (await r.json()).map(e => [e.id, e.file, e.title]);
+  } catch (e) {
+    document.getElementById("adrbody").innerHTML =
+      '<p>Could not load the ADR index here (' + e.message +
+      '). Read them in the repo: <a href="https://github.com/jamiepearcey/shm-actors/tree/main/docs/decisions">docs/decisions/</a>.</p>';
+  }
+}
 const list = document.getElementById("adrlist"), body = document.getElementById("adrbody");
-ADRS.forEach(([n, file, title]) => {
-  const a = document.createElement("a");
-  a.href = "#" + n; a.innerHTML = '<span class="n">' + n + "</span>" + title;
-  a.dataset.n = n; list.appendChild(a);
-});
+function buildList(){
+  ADRS.forEach(([n, file, title]) => {
+    const a = document.createElement("a");
+    a.href = "#" + n; a.innerHTML = '<span class="n">' + n + "</span>" + title;
+    a.dataset.n = n; list.appendChild(a);
+  });
+}
 async function load(n) {
   const row = ADRS.find(r => r[0] === n) || ADRS[ADRS.length - 1];
   [...list.children].forEach(a => a.classList.toggle("on", a.dataset.n === row[0]));
@@ -86,7 +82,11 @@ async function load(n) {
   }
 }
 addEventListener("hashchange", () => load(location.hash.slice(1)));
-load(location.hash.slice(1) || "0001");
+loadIndex().then(() => {
+  if (!ADRS.length) return;
+  buildList();
+  load(location.hash.slice(1) || ADRS[0][0]);
+});
 </script>
 </body>
 </html>

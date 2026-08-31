@@ -102,8 +102,17 @@ sys.<span class="a">run</span>()?;
 <section id="crash">
   <div class="eyebrow">Fault tolerance</div>
   <h2>The crash story, measured — not promised</h2>
-  <p>The demo's supervisor injects <code>_exit(137)</code> into a pricer <em>while it holds a claimed
-  task and a journaled pin</em>. What follows is mechanical:</p>
+  <p>Below: the demo suite running, <strong>captured verbatim</strong> (macOS dev profile,
+  release, 2026-09-01). The supervisor <code>kill -9</code>s a pricer holding a claimed task and a
+  journaled pin; the client keeps its numbers.</p>
+
+  <div class="term" aria-label="Recorded terminal session">
+    <div class="bar"><span class="dot2"></span><span class="dot2"></span><span class="dot2"></span>
+      <span class="bt">holon-demo — captured 2026-09-01</span>
+      <button id="castReplay" aria-label="Replay the recording">↻ replay</button>
+    </div>
+    <pre id="cast" aria-live="off"></pre>
+  </div>
   <div class="flow" aria-label="Crash timeline">
     <div class="fnode">t = 0<small>pricer killed mid-message</small></div>
     <div class="farr">▶<small>lease runs out</small></div>
@@ -215,6 +224,46 @@ cargo run -p holon-demo --release -- bench</code></pre>
 <script src="site.js"></script>
 <script>
 buildEnvelope("bytegrid","envlegend","envinfo");
+
+/* terminal cast — every line verbatim from a real `holon-demo bench` run */
+(function(){
+  const L=[
+    ["p","$ cargo run -p holon-demo --release -- bench",0],
+    ["dim","holon-demo bench — MEASURED, macOS poll(2) wake (POSIX pipe doorbell)",300],
+    ["dim","store pool: 192 free chunks empty, 190 with curve v1",80],
+    ["","1. ask round trip, pricer PARKED: p50=9.6 µs p99=33.0 µs  n=100000 errors=0",500],
+    ["","2. ask round trip, BUSY-POLLING (the floor): p50=1.3 µs p99=2.4 µs  errors=0",420],
+    ["","3. throughput (parked): 4 clients/4 pricers = 127639 asks/s  errors=0/0/0",420],
+    ["hot","4. crash: SIGKILL(_exit 137) → first reply from successor = 538.7 ms;",900],
+    ["hot","   restarts=1 redelivered=1 lost=0 errors=0 incarnations=[(22171, 49), (22213, 1951)]",60],
+    ["ok","5. census after crash: 190 free (baseline with curve 190) — ZERO LEAK",700],
+    ["ok","final census after evicting curve: 192 free vs empty baseline 192 — ZERO LEAK",400]
+  ];
+  const el=document.getElementById("cast"), replay=document.getElementById("castReplay");
+  const reduced=matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let timer=null, runId=0;
+  function renderAll(){ el.innerHTML=L.map(([c,t])=>'<span class="'+c+'">'+t+"</span>").join("\n"); }
+  function play(){
+    const id=++runId; clearTimeout(timer); el.innerHTML="";
+    if(reduced){ renderAll(); return; }
+    let i=0;
+    function next(){
+      if(id!==runId) return;
+      if(i>=L.length){ el.innerHTML=el.innerHTML.replace(/<span class="cur"><\/span>/,""); return; }
+      const [c,t,delay]=L[i++];
+      timer=setTimeout(()=>{
+        if(id!==runId) return;
+        el.innerHTML=el.innerHTML.replace(/<span class="cur"><\/span>/,"");
+        el.innerHTML+='<span class="'+c+'">'+t+"</span>\n"+'<span class="cur"></span>';
+        next();
+      },delay);
+    }
+    next();
+  }
+  replay.addEventListener("click",play);
+  const obs=new IntersectionObserver(es=>{ es.forEach(e=>{ if(e.isIntersecting){ play(); obs.disconnect(); } }); },{threshold:.3});
+  obs.observe(el);
+})();
 
 /* chart 1: commit latency vs version index */
 (function(){
