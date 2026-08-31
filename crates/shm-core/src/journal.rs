@@ -361,12 +361,20 @@ impl<'s> BorrowJournal<'s> {
     /// Attach to a journal previously created in `segment`.
     pub fn attach(segment: &'s Segment) -> Result<BorrowJournal<'s>> {
         let base = segment.payload_ptr();
-        // SAFETY: header lives at the payload base.
-        let hdr = unsafe { base.cast::<JournalHeader>().read() };
-        if hdr.magic != JOURNAL_MAGIC {
+        let hp = base.cast::<JournalHeader>();
+        // Field-wise reads only — never a whole-struct read: the header's
+        // `hint` is an `AtomicU32` that concurrent recorders store into, and a
+        // struct copy would memcpy non-atomically across it (a formal data
+        // race; ThreadSanitizer rejects it). `magic` and `capacity` are
+        // written once at `create`, before any attach can see the magic.
+        // SAFETY: the header lives at the payload base; both fields are plain
+        // PODs read through `addr_of!` without materialising a reference.
+        let magic = unsafe { core::ptr::addr_of!((*hp).magic).read() };
+        if magic != JOURNAL_MAGIC {
             return Err(Error::LayoutMismatch);
         }
-        let capacity = hdr.capacity as usize;
+        // SAFETY: as above.
+        let capacity = unsafe { core::ptr::addr_of!((*hp).capacity).read() } as usize;
         let (bitmap_off, slots_off, words, _total) = layout(capacity);
         // SAFETY: offsets recomputed from the stored capacity are in-bounds.
         let bitmap = unsafe { base.add(bitmap_off).cast::<AtomicU64>() };
@@ -432,7 +440,11 @@ impl<'s> BorrowJournal<'s> {
         incarnation: u32,
         version: u64,
     ) -> Result<usize> {
-        self.record_entry(JournalEntry::artifact_pin(artifact_id, incarnation, version))
+        self.record_entry(JournalEntry::artifact_pin(
+            artifact_id,
+            incarnation,
+            version,
+        ))
     }
 
     /// Record an exclusive **write lease** (item K): a leaked one is crash-
