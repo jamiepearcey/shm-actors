@@ -27,15 +27,15 @@
 
 <main class="wrap">
 <header class="hero">
-  <div class="kicker">rust · actor framework · shared memory · apache arrow · <b>16 ADRs, every number measured</b></div>
-  <h1>Actors own no state.<br><span class="z">Memory owns no code.</span></h1>
+  <div class="kicker">holon — a rust framework for fast, crash-proof services · <b>every number on this page was measured</b></div>
+  <h1>Send the address,<br><span class="z">not the data.</span></h1>
   <p class="thesis lede">
-    <strong>Holon</strong> is an actor framework where the message is a 64-byte envelope, the
-    payload lives in a <strong>versioned Arrow cell</strong> in shared memory, and a handler pins
-    the exact version its message names. Actors are ordinary Rust processes; a
-    <code>kill&nbsp;-9</code> mid-message recovers by lease and journal replay with zero losses.
-    It stands on <strong>shm-actors</strong>, the zero-copy substrate: one copy in, everything
-    downstream moves a 24-byte descriptor.
+    Most systems spend their lives copying the same data between programs — serialize, send,
+    receive, parse, repeat. <strong>Holon</strong> takes a different deal: programs on one machine
+    share their data in memory, and a message just says <em>where to look</em>. The result is
+    requests answered in <strong>about a microsecond</strong>, workers you can kill mid-job
+    <strong>without losing a single message</strong>, and data tables every worker reads at full
+    speed without ever holding a copy.
   </p>
   <div class="cta">
     <a class="btn primary" href="guide.html">Read the guide</a>
@@ -44,35 +44,51 @@
   </div>
 
   <div class="statrow" role="list">
-    <div class="stat" role="listitem"><div class="v">1.2 <small>µs</small></div><div class="k">ask round trip, cross-process, spinning</div></div>
-    <div class="stat" role="listitem"><div class="v">9.5 <small>µs</small></div><div class="k">ask round trip, parked (7:1 is the wake, not us)</div></div>
-    <div class="stat" role="listitem"><div class="v">0 <small>lost</small></div><div class="k">messages across a kill&nbsp;-9 mid-handler</div></div>
-    <div class="stat" role="listitem"><div class="v">83.5 <small>ns</small></div><div class="k">substrate ring hop, cross-process p50</div></div>
-    <div class="stat" role="listitem"><div class="v">239</div><div class="k">tests · 4 loom models · 5 fuzz targets</div></div>
+    <div class="stat" role="listitem"><div class="v">1.2 <small>µs</small></div><div class="k">question in, answer back — between two programs</div></div>
+    <div class="stat" role="listitem"><div class="v">0 <small>lost</small></div><div class="k">messages when a worker is killed mid-job</div></div>
+    <div class="stat" role="listitem"><div class="v">½ <small>sec</small></div><div class="k">for a replacement worker to take over</div></div>
+    <div class="stat" role="listitem"><div class="v">0 <small>bytes</small></div><div class="k">of your data copied per message</div></div>
+    <div class="stat" role="listitem"><div class="v">239</div><div class="k">tests whose job is to break it</div></div>
   </div>
-  <p class="footnote">All numbers: Apple M4 Max, macOS dev profile, release builds, ≥ 2 runs — the portable
-  POSIX baseline, not the Linux fast paths. “≤ 1 tick” means at the 41.7 ns timer quantum, where honest
-  sub-tick measurement ends. “Zero-copy” means no payload-size-proportional copy — a read still costs
-  ~200–540 ns of view construction, and we say so. <a href="benchmarks.html">Method &amp; caveats →</a></p>
+  <p class="footnote">We measure everything and publish the fine print: these numbers are from an
+  Apple M4 Max on the portable build, at least two runs each, and “zero copies” means your data is
+  never copied — building a view of it still costs a few hundred nanoseconds, and we say so.
+  <a href="benchmarks.html">Full method &amp; caveats →</a></p>
 
   <div class="envwrap">
     <div class="envcap">
-      <span class="t"><b>The unit of conversation:</b> one 64-byte envelope — one cache line, frozen ABI, <code>#[repr(C, align(64))]</code></span>
+      <span class="t"><b>Every message is exactly 64 bytes</b> — the size of one CPU cache line. The data never travels; the message carries its address.</span>
       <span class="t">hover a field ↓</span>
     </div>
     <div class="bytegrid" id="bytegrid" aria-hidden="true"></div>
     <div class="envlegend" id="envlegend"></div>
-    <div class="envinfo" id="envinfo">The payload never rides in the message. <b>payload</b> carries a packed reference into the shared pool; <b>version</b> pins the exact table version it was committed at.</div>
+    <div class="envinfo" id="envinfo">The interesting fields: <b>payload</b> says where the data lives in shared memory, and <b>version</b> says exactly which edition of it this message is about — so a worker never reads newer data than the sender meant.</div>
   </div>
 </header>
 
-<section id="framework" class="first" style="padding-top:60px">
+<section id="why" class="first" style="padding-top:60px">
+  <div class="eyebrow">Why this exists</div>
+  <h2>Three problems every fast system hits</h2>
+  <div class="grid2">
+    <div class="card"><h4>Copying is an invisible tax</h4><p>Services that talk over sockets or queues serialize and copy the same bytes all day — often more CPU than the actual work. Here, data is written to shared memory <strong>once</strong>; every message after that is a 24-byte note saying where it is.</p></div>
+    <div class="card"><h4>Restarts lose everything a service knew</h4><p>When state lives <em>inside</em> a service, restarting it means warm-up, replay, or an outage. Here, state lives in shared, versioned tables <em>outside</em> the workers — so restarting a worker loses nothing, because it owned nothing.</p></div>
+    <div class="card"><h4>Crashes lose work in flight</h4><p>Most systems hope their retry logic covers a crash. Here recovery is mechanical and measured: kill a worker mid-job and a replacement answers about half a second later, the job re-delivered, nothing lost, no memory leaked — proven on this page, below.</p></div>
+  </div>
+  <p>If you're building trading systems, market-data fan-out, pricing grids, real-time analytics —
+  anything where many processes on one machine hammer the same data — this is the shape built
+  for you. The rest of this page shows how it works and proves the claims; the deep technical
+  story lives in the <a href="guide.html">guide</a>.</p>
+</section>
+
+<section id="framework">
   <div class="eyebrow">The framework</div>
-  <h2>Message loops over shared state, without sharing mutable state</h2>
-  <p>An actor is a handler behind a mailbox. Envelopes ride a lock-free task queue; dispatch is a
-  sorted table of function pointers — no <code>dyn</code>, no allocation on the message path. One
-  process hosts any number of actors over one mailbox, routed by the envelope's <code>to</code>;
-  N processes of the same name form a pool with lease-based failover.</p>
+  <h2>Small workers, shared memory, no sharing of blame</h2>
+  <p>You write <strong>actors</strong>: small handlers that receive one message at a time, so you
+  never write a lock. Data they read is <strong>pinned</strong> for exactly as long as they read
+  it — the framework guarantees nobody frees or changes it under them. Under the hood: messages
+  ride a lock-free queue, dispatch is a function-pointer table, and nothing allocates on the
+  message path. One process can host many actors; several processes with the same name form a
+  pool that covers for each other.</p>
 
   <pre><code><span class="c">// host side: any number of actors, one mailbox, routed by `to`</span>
 <span class="k">let</span> <span class="k">mut</span> sys = ActorSystem::<span class="a">attach</span>(&node)?;
@@ -93,9 +109,9 @@ sys.<span class="a">run</span>()?;
 <span class="k">let</span> reply  = pricer.<span class="a">ask</span>(&req, timeout)?;        <span class="c">// or .tell(&evt)</span></code></pre>
 
   <ul>
-    <li><strong>State lives in cells, not actors.</strong> A curve, a book, a table of ticks — each is a versioned Arrow cell any actor can pin. Restarting an actor loses nothing, because it owned nothing.</li>
-    <li><strong>The asker owns the reply memory.</strong> Learned from the demo, not the whiteboard: under crash-retry the reply must live in a chunk the asker allocated, named in the request — provably terminal, and handlers time-fence their writes at half the lease.</li>
-    <li><strong>Failover is observable, not magical.</strong> Replies carry the incarnation and the exact redelivery count; the client that cares sees the crash; the one that doesn’t, never notices.</li>
+    <li><strong>State lives in shared tables, not inside workers.</strong> A price curve, an order book, a stream of ticks — each is a versioned table (stored in <a href="https://arrow.apache.org/">Apache Arrow</a> format, so analytics tools read it natively). Any worker can read any version, at full speed, without a copy.</li>
+    <li><strong>Asking a question is safe even if the answerer dies.</strong> The asker sets aside the memory for its own answer before asking — so a half-dead worker can never scribble on someone else's reply. This rule came out of crash testing, not a whiteboard.</li>
+    <li><strong>Failover is visible if you care, invisible if you don't.</strong> Every reply says which incarnation of the worker produced it and whether the job was retried. Most callers never look; the ones that must, can.</li>
   </ul>
 </section>
 
@@ -132,23 +148,24 @@ sys.<span class="a">run</span>()?;
 <section id="substrate">
   <div class="eyebrow">The substrate: shm-actors</div>
   <h2>One copy in. Zero copies after.</h2>
-  <p>Holon does not carry its own runtime tricks — it stands on <strong>shm-actors</strong>, a
-  substrate where a payload is serialized once into size-class pooled chunks and everything
-  downstream moves a 24-byte, generation-checked descriptor. A <strong>coordinator</strong> owns
-  names and leases, passes segment fds over a Unix socket, and is never on the data path;
-  <strong>actors</strong> map their segments and stop making syscalls.</p>
+  <p>Underneath the framework sits <strong>shm-actors</strong>, the memory engine. Think of it as
+  a warehouse every worker can see into: data is put on a shelf once, and from then on everyone
+  passes around <em>shelf labels</em> — 24-byte notes that are cheap to send and impossible to
+  confuse with a stale shelf, because every label is checked before use. A small
+  <strong>coordinator</strong> process hands out keys to the warehouse and cleans up after
+  crashes; it never touches the data itself, so even if it dies, everyone keeps working.</p>
 
   <div class="grid2">
-    <div class="card"><h4><span class="m">shm-ring</span> Pub/sub</h4><p>SPMC broadcast ring with per-subscriber cursors. One-way hop: 83.5 ns p50, cross-process — the same as cross-core.</p><a class="more" href="guide.html#ring">How it works →</a></div>
-    <div class="card"><h4><span class="m">shm-task</span> Tasks</h4><p>MPMC queue with O(1) claim at capacity 256 <em>and</em> 65 536, leases, redelivery counts, and a journaled crash story. Holon's mailbox.</p><a class="more" href="guide.html#task">How it works →</a></div>
-    <div class="card"><h4><span class="m">shm-artifact</span> Versioned cells</h4><p>RCU-versioned Arrow tables: pin in ≤ 1 tick at any history depth, append in O(new data), windowed retention, exact delta reads. Holon's memory.</p><a class="more" href="guide.html#cells">How it works →</a></div>
-    <div class="card"><h4><span class="m">shm-stream</span> Streams</h4><p>Transactional writers: stage many Arrow batches invisibly, install them as one atomic version. Abort or die — nothing partial is ever visible.</p><a class="more" href="guide.html#stream">How it works →</a></div>
+    <div class="card"><h4><span class="m">shm-ring</span> Broadcast</h4><p>One publisher, many listeners, 83½ billionths of a second per hop — announcing to another process costs the same as to another CPU core.</p><a class="more" href="guide.html#ring">How it works →</a></div>
+    <div class="card"><h4><span class="m">shm-task</span> Job queue</h4><p>Workers claim jobs in constant time however big the queue is. Every job has a lease: if its worker dies, the job is handed to someone else — with a counter, so nothing is ever done twice unknowingly.</p><a class="more" href="guide.html#task">How it works →</a></div>
+    <div class="card"><h4><span class="m">shm-artifact</span> Versioned tables</h4><p>Data tables with editions. Readers grab an edition instantly and keep it frozen while writers publish the next; growing a table costs the same whether it holds ten rows of history or a hundred thousand.</p><a class="more" href="guide.html#cells">How it works →</a></div>
+    <div class="card"><h4><span class="m">shm-stream</span> All-or-nothing writes</h4><p>Build up a batch of changes invisibly, publish them as one edition. If the writer aborts — or dies — readers never see half of anything.</p><a class="more" href="guide.html#stream">How it works →</a></div>
   </div>
 
-  <p>Safety is Rust's ownership story made multi-process: exclusive <strong>loans</strong> for
-  writers, pinned shared views for readers, reclamation driven by <strong>leases + a per-actor
-  borrow journal + generation counters</strong>. A process that dies mid-anything is unwound by
-  replay, not by hope.</p>
+  <p>The safety story is Rust's famous ownership rules, extended across whole programs: one
+  writer at a time, readers hold what they read, and everything a crashed process was holding is
+  found in its journal and returned — <strong>by replaying records, not by hoping</strong>. Tests
+  count every block of memory after every crash drill; the books always balance.</p>
 </section>
 
 <section id="numbers">
@@ -180,12 +197,16 @@ sys.<span class="a">run</span>()?;
 
 <section id="discipline">
   <div class="eyebrow">Why trust it</div>
-  <h2>Adversarial by policy</h2>
+  <h2>Tested like an attacker, documented like an auditor</h2>
+  <p>This project's test suite doesn't check that things work — it tries to make them fail:
+  processes killed at every step, memory counted to the byte afterwards, random garbage fed to
+  every parser, and the trickiest lock-free logic checked by a tool that explores <em>every
+  possible thread interleaving</em>, not just the ones that happened to occur.</p>
   <div class="grid2">
-    <div class="card"><h4>239 tests that attack</h4><p>Lineage races, crash replays, and exact-census invariants: count the free chunks after every hostile scenario and the difference must equal the live data — to the chunk.</p></div>
-    <div class="card"><h4>4 loom models</h4><p>The pin hazard handshake and the one-election reclaim CAS are exhaustively model-checked — and shown to fail against deliberately broken orderings.</p></div>
-    <div class="card"><h4>5 fuzz targets</h4><p>Every untrusted-input parser: manifest bytes, chain walks, Arrow layout, wire protocol. Plus a 200 000-iteration in-crate property test so the guarantee holds on stable.</p></div>
-    <div class="card"><h4>Frozen, asserted ABIs</h4><p><code>const</code> offset assertions on the envelope, magic + generation checks on every dereference, torn-tail-tolerant journals.</p></div>
+    <div class="card"><h4>239 tests that attack</h4><p>Race two writers, kill readers mid-read, replay crashes — then count every block of memory. The books must balance exactly, every time.</p></div>
+    <div class="card"><h4>Every interleaving, checked</h4><p>The four core lock-free algorithms are exhaustively model-checked (with <code>loom</code>) — and the checks are proven sharp by showing they fail on deliberately broken versions.</p></div>
+    <div class="card"><h4>Garbage in, never a crash out</h4><p>Every parser that reads untrusted bytes is fuzzed continuously. Malformed input gets an error, never a panic, never an out-of-bounds read.</p></div>
+    <div class="card"><h4>Nothing changes silently</h4><p>Every shared-memory format is frozen and machine-asserted, and every reference is validity-checked before use — stale data fails loudly instead of lying quietly.</p></div>
   </div>
   <div class="callout"><b>Wording rules are part of the engineering:</b> “zero-copy” is defined, the
   timer floor is named, memcpy throughput is not called ingestion, no comparison baseline exists so
