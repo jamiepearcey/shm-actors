@@ -1,0 +1,16 @@
+name: Performance report
+description: A measured regression or a measured surprise
+labels: [performance]
+body:
+  - type: textarea
+    id: numbers
+    attributes:
+      label: The numbers
+      description: Paste `shm-bench` output (it includes your hardware profile). Two runs minimum — the machine drifts.
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected and why
+      description: Link the ADR or website table you were comparing against.
+    validations: { required: true }

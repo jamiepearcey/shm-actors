@@ -1,0 +1,22 @@
+name: Bug report
+description: Something is wrong (a leak, a lost message, a panic, a wrong result)
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, what did you expect
+      description: If a chunk census is involved, include the numbers.
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Commands or a test. `kill -9` timings welcome.
+    validations: { required: true }
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "OS + version, arch, toolchain (rustc -V), commit"
+    validations: { required: true }
