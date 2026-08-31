@@ -107,3 +107,54 @@ function tocHighlight() {
   document.querySelectorAll("section[id], h3[id]").forEach(s => obs.observe(s));
 }
 document.addEventListener("DOMContentLoaded", tocHighlight);
+
+/* auto-chrome for code blocks: language chip + copy button */
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll("pre").forEach(pre => {
+    if (pre.closest(".term") || pre.closest(".codeblock")) return;
+    const text = pre.textContent;
+    const lang = pre.dataset.lang ||
+      (/^\s*(\$|cargo |git |rustup )/m.test(text) ? "sh" :
+       /\b(fn |let |impl |pub |use )\b/.test(text) ? "rust" : "txt");
+    const wrap = document.createElement("div");
+    wrap.className = "codeblock";
+    const head = document.createElement("div");
+    head.className = "codehead";
+    head.innerHTML = '<span class="lang">' + lang + "</span>";
+    const btn = document.createElement("button");
+    btn.textContent = "copy";
+    btn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        btn.textContent = "copied"; btn.classList.add("ok");
+        setTimeout(() => { btn.textContent = "copy"; btn.classList.remove("ok"); }, 1600);
+      } catch (_) { btn.textContent = "select + ⌘C"; }
+    });
+    head.appendChild(btn);
+    pre.parentNode.insertBefore(wrap, pre);
+    wrap.appendChild(head); wrap.appendChild(pre);
+  });
+
+  /* hover anchors on identified headings */
+  document.querySelectorAll("main h2[id], main h3[id], .md h2[id], .md h3[id]").forEach(h => {
+    const a = document.createElement("a");
+    a.className = "hanchor"; a.href = "#" + h.id; a.textContent = "#";
+    a.setAttribute("aria-label", "Link to this section");
+    h.prepend(a);
+  });
+
+  /* on-this-page + sidenav section highlighting */
+  const links = [...document.querySelectorAll(".otp a, .sidenav a[href^='#']")];
+  if (links.length) {
+    const map = new Map(links.map(a => [a.getAttribute("href").slice(1), a]));
+    const obs = new IntersectionObserver(es => {
+      es.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(a => a.classList.remove("on"));
+          const a = map.get(e.target.id); if (a) a.classList.add("on");
+        }
+      });
+    }, { rootMargin: "-15% 0px -75% 0px" });
+    document.querySelectorAll("section[id]").forEach(s2 => obs.observe(s2));
+  }
+});

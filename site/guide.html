@@ -25,16 +25,37 @@
   </nav>
 </div></div>
 
-<main class="wrap">
-<h1 class="page">The guide</h1>
-<p class="lede" style="max-width:66ch">Bottom-up: the shm-actors substrate first — the memory
-model, then each primitive built on it — and the Holon actor framework on top. Every section names
-the crate that implements it and the ADR that decided it.</p>
+<div class="docshell">
+<nav class="sidenav" aria-label="Documentation">
+  <div class="g">Documentation</div>
+  <a class="pg" href="./">Overview</a>
+  <a class="pg here" href="guide.html">Guide</a>
+  <a class="pg" href="benchmarks.html">Benchmarks</a>
+  <a class="pg" href="adrs.html">Decision record</a>
+  <a class="pg" href="api/holon_actor/index.html">API reference</a>
+  <div class="g">The substrate</div>
+  <a href="#memory">Memory model</a>
+  <a href="#arrow">Arrow payloads</a>
+  <a href="#ring">Broadcast ring</a>
+  <a href="#cells">Versioned cells</a>
+  <a href="#task">Tasks</a>
+  <a href="#stream">Streams</a>
+  <a href="#store">Keyed store</a>
+  <a href="#runtime">Runtime</a>
+  <div class="g">The framework</div>
+  <a href="#holon">Holon actors</a>
+  <a href="#platform">Platform &amp; roadmap</a>
+</nav>
+<main>
+<div class="dochead">
+  <div class="crumb"><a href="./">docs</a> / <b>guide</b></div>
+  <h1>The guide</h1>
+  <p class="sub">Bottom-up: the shm-actors substrate first — the memory model, then each primitive
+  built on it — and the Holon actor framework on top. Every section names the crate that
+  implements it and the ADR that decided it.</p>
+</div>
 
-<div class="docgrid">
-<div>
-
-<section id="memory" class="first" style="padding-top:44px">
+<section id="memory" class="first" style="padding-top:28px">
   <div class="eyebrow">shm-core · ADR-0001</div>
   <h2>The memory model</h2>
   <p>Everything lives in <strong>segments</strong> (<code>shm_open</code> + <code>mmap</code>)
@@ -216,12 +237,16 @@ sys.<span class="a">run</span>()?;
   </ul>
 </section>
 
-</div>
-<aside class="toc" aria-label="On this page">
+<nav class="pgnav" aria-label="Pagination">
+  <a href="./"><span class="lab">← Previous</span><span class="ttl" style="display:block">Overview</span></a>
+  <a class="next" href="benchmarks.html"><span class="lab">Next →</span><span class="ttl" style="display:block">Benchmarks</span></a>
+</nav>
+</main>
+<aside class="otp" aria-label="On this page">
   <div class="t">On this page</div>
   <a href="#memory">Memory model</a>
   <a href="#arrow">Arrow payloads</a>
-  <a href="#ring">Pub/sub ring</a>
+  <a href="#ring">Broadcast ring</a>
   <a href="#cells">Versioned cells</a>
   <a href="#task">Tasks</a>
   <a href="#stream">Streams</a>
@@ -231,7 +256,6 @@ sys.<span class="a">run</span>()?;
   <a href="#platform">Platform</a>
 </aside>
 </div>
-</main>
 
 <footer class="site"><div class="in">
   <div>Holon · an actor framework on the shm-actors substrate · Apache-2.0</div>

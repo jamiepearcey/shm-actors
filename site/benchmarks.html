@@ -25,13 +25,32 @@
   </nav>
 </div></div>
 
-<main class="wrap">
-<h1 class="page">Benchmarks</h1>
-<p class="lede" style="max-width:66ch">Reproduce everything with
-<code>cargo run -p shm-bench --release -- all</code> — the suite prints its own hardware profile
-first. Numbers below: Apple M4 Max (14 cores), macOS, release builds, ≥ 2 runs per session.</p>
+<div class="docshell">
+<nav class="sidenav" aria-label="Documentation">
+  <div class="g">Documentation</div>
+  <a class="pg" href="./">Overview</a>
+  <a class="pg" href="guide.html">Guide</a>
+  <a class="pg here" href="benchmarks.html">Benchmarks</a>
+  <a class="pg" href="adrs.html">Decision record</a>
+  <a class="pg" href="api/holon_actor/index.html">API reference</a>
+  <div class="g">This page</div>
+  <a href="#method">Method &amp; wording</a>
+  <a href="#flat">The flat set</a>
+  <a href="#wake">Wake costs</a>
+  <a href="#stream">Windowed streams</a>
+  <a href="#crash">Crash &amp; census</a>
+  <a href="#repro">Reproduce</a>
+</nav>
+<main>
+<div class="dochead">
+  <div class="crumb"><a href="./">docs</a> / <b>benchmarks</b></div>
+  <h1>Benchmarks</h1>
+  <p class="sub">Reproduce everything with <code>cargo run -p shm-bench --release -- all</code> —
+  the suite prints its own hardware profile first. Numbers below: Apple M4 Max (14 cores), macOS,
+  release builds, ≥ 2 runs per session.</p>
+</div>
 
-<section id="method" class="first" style="padding-top:44px">
+<section id="method" class="first" style="padding-top:28px">
   <div class="eyebrow">Rules first</div>
   <h2>Method &amp; wording</h2>
   <ul>
@@ -130,7 +149,22 @@ cargo run -p holon-demo --release -- bench     <span class="c"># actor asks, thr
   <p class="kbd-note">Run everything twice. If your first run disagrees with your second by 30 %,
   that's the machine, not the code — it's why the method section exists.</p>
 </section>
+
+<nav class="pgnav" aria-label="Pagination">
+  <a href="guide.html"><span class="lab">← Previous</span><span class="ttl" style="display:block">Guide</span></a>
+  <a class="next" href="adrs.html"><span class="lab">Next →</span><span class="ttl" style="display:block">Decision record</span></a>
+</nav>
 </main>
+<aside class="otp" aria-label="On this page">
+  <div class="t">On this page</div>
+  <a href="#method">Method</a>
+  <a href="#flat">The flat set</a>
+  <a href="#wake">Wake costs</a>
+  <a href="#stream">Windowed streams</a>
+  <a href="#crash">Crash &amp; census</a>
+  <a href="#repro">Reproduce</a>
+</aside>
+</div>
 
 <footer class="site"><div class="in">
   <div>Holon · an actor framework on the shm-actors substrate · Apache-2.0</div>

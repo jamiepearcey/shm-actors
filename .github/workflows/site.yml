@@ -29,7 +29,7 @@ jobs:
       - name: Build API docs
         run: cargo doc --workspace --no-deps
         env:
-          RUSTDOCFLAGS: -D warnings
+          RUSTDOCFLAGS: -D warnings --default-theme=ayu
       - name: Assemble site
         run: |
           mkdir -p _site/adrs
