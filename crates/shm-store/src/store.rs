@@ -94,6 +94,23 @@ impl<'a> KeyedStore<'a> {
         &self.data_seg
     }
 
+    /// The calling actor's **borrow journal** segment. Exposed for the same
+    /// reason as [`data_segment`](Self::data_segment): a layer above that stages
+    /// its own chunks into the store's pool — a multi-batch object installed as
+    /// one version through `shm_stream::StreamWriter`, say — must journal them
+    /// in *this* actor's journal, the one the coordinator replays for it, and
+    /// commit them as [`owner`](Self::owner).
+    #[inline]
+    pub fn journal_segment(&self) -> &Arc<Segment> {
+        &self.journal_seg
+    }
+
+    /// The actor id this handle stamps on commits, leases and chunk loans.
+    #[inline]
+    pub fn owner(&self) -> u32 {
+        self.owner
+    }
+
     /// Attach a fresh [`Catalog`] handle over the mapped catalog segment.
     fn catalog(&self) -> Result<Catalog<'_>> {
         Catalog::attach(&self.catalog_seg)

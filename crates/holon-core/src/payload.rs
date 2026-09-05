@@ -7,8 +7,16 @@ use shm_core::{PackedRef, SharedPod};
 use crate::error::{Error, Result};
 
 /// The largest inline body: a 256-byte store chunk (the pool's smallest class)
-/// minus the 64-byte envelope. Bigger payloads belong in a cell.
+/// minus the 64-byte envelope. Bigger replies go by reference ([`Reply::bytes`]).
 pub const MAX_INLINE_BODY: usize = 192;
+
+/// The largest **by-reference** reply body, in bytes.
+///
+/// Bounded by [`Envelope::body_len`](crate::Envelope::body_len) being a `u16`:
+/// one envelope describes one body, on the shared-memory path and on the wire
+/// alike, so 65 535 is the architectural ceiling for a single-envelope reply.
+/// The asker's chunk bounds it further, per ask.
+pub const MAX_REPLY_BODY: usize = u16::MAX as usize;
 
 /// A `#[repr(C)]` POD message with a fixed schema id, moved as raw bytes.
 ///
@@ -133,19 +141,83 @@ impl core::fmt::Debug for InlineBody {
     }
 }
 
-/// What a handler returns: nothing, or a POD reply written to a reply chunk.
-#[derive(Clone, Copy, Debug)]
+/// A variable-length reply body: a schema id plus up to [`MAX_REPLY_BODY`]
+/// bytes, written into the reply chunk the asker sized, loaned and journaled,
+/// and read back **in place** by the asker.
+///
+/// Owned rather than borrowed so that no lifetime leaks into
+/// [`Dispatch`](crate::Dispatch) and every handler signature: a handler that
+/// computes its answer into a local buffer must be able to return it.
+#[derive(Clone, Debug)]
+pub struct ByteBody {
+    schema_id: u32,
+    bytes: Vec<u8>,
+}
+
+impl ByteBody {
+    /// Build from owned bytes (`len <= MAX_REPLY_BODY`).
+    pub fn new(schema_id: u32, bytes: impl Into<Vec<u8>>) -> Result<ByteBody> {
+        let bytes = bytes.into();
+        if bytes.len() > MAX_REPLY_BODY {
+            return Err(Error::BodyTooLarge {
+                len: bytes.len(),
+                max: MAX_REPLY_BODY,
+            });
+        }
+        Ok(ByteBody { schema_id, bytes })
+    }
+
+    /// The body's schema id.
+    #[inline]
+    pub fn schema_id(&self) -> u32 {
+        self.schema_id
+    }
+
+    /// The body bytes.
+    #[inline]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The body length.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the body is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// What a handler returns: nothing, a POD reply, or a variable-length body
+/// written by reference into the asker's chunk.
+#[derive(Clone, Debug)]
 pub enum Reply {
     /// No reply (a `tell`, or an ask that completes with an empty result).
     None,
-    /// An inline POD reply.
+    /// An inline POD reply: the 192-byte fast path, no heap allocation.
     Inline(InlineBody),
+    /// A variable-length reply, capped per ask by the asker's chunk
+    /// (`Cx::max_reply`).
+    Bytes(ByteBody),
 }
 
 impl Reply {
     /// Reply with the POD message `p`.
     pub fn of<P: Payload>(p: &P) -> Result<Reply> {
         Ok(Reply::Inline(InlineBody::new(P::SCHEMA_ID, p.as_bytes())?))
+    }
+
+    /// Reply with `bytes` under `schema_id`, by reference.
+    ///
+    /// Fitting the asker's chunk is checked where the chunk is known — a body
+    /// past the ask's cap fails the task rather than being truncated into
+    /// something that reads as a complete answer.
+    pub fn bytes(schema_id: u32, bytes: impl Into<Vec<u8>>) -> Result<Reply> {
+        Ok(Reply::Bytes(ByteBody::new(schema_id, bytes)?))
     }
 }
 
@@ -192,13 +264,33 @@ mod tests {
                 assert_eq!(b.len(), 16);
                 assert!(!b.is_empty());
             }
-            Reply::None => panic!("expected inline"),
+            Reply::None | Reply::Bytes(_) => panic!("expected inline"),
         }
         assert!(matches!(
             InlineBody::new(1, &[0u8; MAX_INLINE_BODY + 1]),
             Err(Error::BodyTooLarge { .. })
         ));
         assert!(InlineBody::new(1, &[0u8; MAX_INLINE_BODY]).is_ok());
+    }
+
+    #[test]
+    fn reply_bytes_caps_at_u16() {
+        assert_eq!(MAX_REPLY_BODY, u16::MAX as usize);
+        let r = Reply::bytes(1234, vec![9u8; 40_000]).unwrap();
+        match r {
+            Reply::Bytes(b) => {
+                assert_eq!(b.schema_id(), 1234);
+                assert_eq!(b.len(), 40_000);
+                assert!(!b.is_empty());
+                assert_eq!(b.bytes()[0], 9);
+            }
+            Reply::None | Reply::Inline(_) => panic!("expected bytes"),
+        }
+        assert!(matches!(
+            ByteBody::new(1, vec![0u8; MAX_REPLY_BODY + 1]),
+            Err(Error::BodyTooLarge { .. })
+        ));
+        assert!(ByteBody::new(1, vec![0u8; MAX_REPLY_BODY]).is_ok());
     }
 
     #[test]

@@ -349,6 +349,24 @@ impl<'s> Pool<'s> {
             .unwrap_or(0)
     }
 
+    /// The `(chunk_size, chunk_count)` of size class `i`, or `None` past the
+    /// last class.
+    ///
+    /// The **static** shape of the pool — how many chunks of each size were laid
+    /// down at creation — as opposed to [`free_count`](Self::free_count), which
+    /// walks a free list and answers a question about right now. A layer that
+    /// spreads one logical value across many chunks (a segmented object) needs
+    /// this to state its own ceiling: no value can ever occupy more chunks of a
+    /// class than the class was built with.
+    #[inline]
+    pub fn class_info(&self, i: usize) -> Option<(u32, u32)> {
+        if i >= self.num_classes {
+            return None;
+        }
+        let c = self.class(i);
+        Some((c.chunk_size, c.chunk_count))
+    }
+
     fn class(&self, i: usize) -> &ClassHeader {
         debug_assert!(i < self.num_classes);
         // SAFETY: `i < num_classes`; the class array has `num_classes` entries.
@@ -417,6 +435,32 @@ impl<'s> Pool<'s> {
             generation,
             offset: seg_offset as u32,
             len: class.chunk_size,
+            schema_id: 0,
+            _pad: 0,
+        })
+    }
+
+    /// The truthful descriptor of the chunk that starts at segment-base
+    /// `offset`: the class's real `chunk_size` and the control word's **live**
+    /// generation, read from the pool rather than assumed by the caller.
+    ///
+    /// A [`PackedRef`](crate::PackedRef) carries only `segment_id:32|offset:32`,
+    /// so a process handed one — the ask protocol's borrower of a reply chunk —
+    /// cannot know how big the chunk is or whether it has since been recycled.
+    /// Both answers live here, and reading them is what turns a lent address
+    /// into a bounds-checked, generation-checked borrow.
+    ///
+    /// Validation is inherited from [`locate`](Self::locate): a sub-header,
+    /// misaligned or out-of-range offset is rejected before anything is read.
+    pub fn desc_at(&self, offset: u32) -> Result<ChunkDesc> {
+        let (class_idx, _local, global) = self.locate(offset)?;
+        // SAFETY: `global < total_chunks`; the control array has that many.
+        let generation = unsafe { (*self.ctrls.add(global)).generation() };
+        Ok(ChunkDesc {
+            segment_id: self.segment.id(),
+            generation,
+            offset,
+            len: self.class(class_idx).chunk_size,
             schema_id: 0,
             _pad: 0,
         })

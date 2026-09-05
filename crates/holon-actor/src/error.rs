@@ -27,6 +27,16 @@ pub enum Error {
 
     /// The ask's task reached `Failed`: the handler returned an error, or the
     /// lease reap exhausted the retry cap (every attempt died).
+    /// The topic side (notification ring / schema intern) could not be opened.
+    #[error("topic side: {0}")]
+    Topic(String),
+
+    /// The object store rejected an operation, or its side could not be opened.
+    #[error(transparent)]
+    Object(#[from] holon_object::Error),
+
+    /// The handler answered with an error envelope, or the task went terminal
+    /// without an answer (retries exhausted).
     #[error("ask failed (handler error or retries exhausted)")]
     Failed,
 
@@ -37,6 +47,22 @@ pub enum Error {
     /// The ask completed with no reply body (the handler returned `Reply::None`).
     #[error("ask completed without a reply")]
     NoReply,
+
+    /// A reply body cap larger than one envelope can describe
+    /// ([`MAX_REPLY_BODY`](holon_core::MAX_REPLY_BODY)), raised by
+    /// [`ask_start_sized`](crate::ActorRef::ask_start_sized).
+    ///
+    /// The symmetric case — a *handler* whose
+    /// [`Reply::Bytes`](holon_core::Reply::Bytes) over-runs the chunk the asker
+    /// sized — is answered on the wire as an error envelope, so the asker sees
+    /// [`Error::Failed`]: a truncated answer must never read as a whole one.
+    #[error("reply cap {got} B exceeds the {cap} B one envelope can describe")]
+    ReplyTooLarge {
+        /// The cap that was asked for.
+        got: usize,
+        /// The largest a single-envelope reply body can be.
+        cap: usize,
+    },
 
     /// The reply chunk did not match the ask (kind / correlation id).
     #[error("reply does not match the ask (kind {kind}, corr {got} != {expected})")]

@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 holon-core = { workspace = true }
+holon-topic = { workspace = true }
+holon-object = { workspace = true }
 shm-core = { workspace = true }
 shm-arrow = { workspace = true }
 shm-artifact = { workspace = true }
@@ -19,3 +21,6 @@ shm-runtime = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

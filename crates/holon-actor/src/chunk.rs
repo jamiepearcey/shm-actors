@@ -1,23 +1,30 @@
 //! [`MessagePool`]: message chunks (envelope + inline body) in the keyed
 //! store's shared data pool — allocate, write, read, free.
 //!
-//! The chunk is popped from the pool's free list and never *loaned*
-//! (`ChunkCtrl` stays `FREE`), exactly like `shm_store::write_typed_ref`: the
-//! chunk's owner is whoever holds its descriptor, and ownership moves with the
-//! descriptor through the task queue. See the crate docs for who frees what.
+//! A **request** chunk is popped from the pool's free list and never *loaned*
+//! (`ChunkCtrl` stays `FREE`), exactly like `shm_store::write_typed_ref`: its
+//! owner is whoever holds its descriptor, and ownership moves with the
+//! descriptor through the task queue.
+//!
+//! A **reply** chunk is different, and deliberately so: the asker loans it
+//! ([`loan_reply`](MessagePool::loan_reply)) and journals it, because the
+//! coordinator's crash reclaim only recycles a journaled chunk that is
+//! `LOANED` or `PUBLISHED` — a journaled `FREE` chunk is replayed and dropped
+//! on the floor. The loan is also what makes the chunk's generation move on a
+//! reclaim, which is what a handler checks before writing. See the crate docs
+//! for who frees what.
 
 use std::sync::Arc;
 
 use holon_core::{
-    decode_message, encode_message, Envelope, LocalRef, ENVELOPE_SIZE, SCHEMA_ENVELOPE,
+    decode_message, encode_message, Envelope, LocalRef, ENVELOPE_SIZE, MAX_INLINE_BODY,
+    SCHEMA_ENVELOPE,
 };
-use shm_core::{ChunkDesc, Pool, Segment};
+use shm_core::{BorrowJournal, ChunkDesc, Pool, Segment};
 
-/// The size of the **reply chunk** an asker allocates and a handler writes
-/// into: the pool's smallest class. The asker allocates it, names it in the
-/// request envelope as a [`LocalRef`], and frees it — a handler only ever
-/// resolves the ref and writes at most this many bytes.
-pub const REPLY_CHUNK_BYTES: u32 = 256;
+/// The default **reply chunk** body cap, in bytes: [`MAX_INLINE_BODY`], so an
+/// ask that names no size gets the pool's smallest class exactly as before.
+pub const DEFAULT_REPLY_BODY: u32 = MAX_INLINE_BODY as u32;
 
 use crate::error::{Error, Result};
 
@@ -58,29 +65,88 @@ impl MessagePool {
         Ok(desc)
     }
 
-    /// Allocate an empty **reply chunk** ([`REPLY_CHUNK_BYTES`]) with a zeroed
-    /// envelope, so a read before any handler wrote it fails validation
-    /// (`BadEnvelope`) rather than decoding garbage.
-    pub fn alloc_reply(&self) -> Result<ChunkDesc> {
+    /// Allocate an empty **reply chunk** holding an envelope plus `max_body`
+    /// bytes, with a zeroed envelope so a read before any handler wrote it
+    /// fails validation (`BadEnvelope`) rather than decoding garbage.
+    ///
+    /// The pool rounds up to a size class, so the chunk the handler is lent may
+    /// be larger than asked for; [`reply_desc`](Self::reply_desc) reports the
+    /// real size and that is the cap the handler is told.
+    pub fn alloc_reply(&self, max_body: u32) -> Result<ChunkDesc> {
         let pool = Pool::attach(&self.seg)?;
-        let mut desc = pool.alloc(REPLY_CHUNK_BYTES)?;
+        let mut desc = pool.alloc(ENVELOPE_SIZE as u32 + max_body)?;
         desc.schema_id = SCHEMA_ENVELOPE;
         self.with_chunk_mut(&desc, |buf| buf[..ENVELOPE_SIZE].fill(0))?;
         Ok(desc)
     }
 
-    /// The descriptor of a reply chunk named by a [`LocalRef`] (always
-    /// [`REPLY_CHUNK_BYTES`] long, tagged [`SCHEMA_ENVELOPE`]).
-    #[inline]
-    pub fn reply_desc(&self, r: LocalRef) -> ChunkDesc {
-        ChunkDesc {
-            segment_id: r.segment_id(),
-            generation: 0,
-            offset: r.offset(),
-            len: REPLY_CHUNK_BYTES,
-            schema_id: SCHEMA_ENVELOPE,
-            _pad: 0,
+    /// The **truthful** descriptor of the reply chunk a [`LocalRef`] names: the
+    /// pool's own class size and live generation, tagged [`SCHEMA_ENVELOPE`].
+    ///
+    /// A `LocalRef` carries only `segment_id|offset`, so nothing about the
+    /// chunk may be assumed from the sender — the length that bounds the
+    /// handler's write and the generation that says whether the asker is still
+    /// alive both come from the pool.
+    pub fn reply_desc(&self, r: LocalRef) -> Result<ChunkDesc> {
+        if r.segment_id() != self.seg.id() {
+            return Err(Error::Core(holon_core::Error::BadEnvelope));
         }
+        let pool = Pool::attach(&self.seg)?;
+        let mut desc = pool.desc_at(r.offset())?;
+        desc.schema_id = SCHEMA_ENVELOPE;
+        Ok(desc)
+    }
+
+    /// Take exclusive ownership of a freshly allocated reply chunk: loan it to
+    /// `owner`, then journal it. Returns the journal slot, which **is** the
+    /// ownership token (ADR-0014 §4).
+    ///
+    /// The order is load-bearing and matches `shm-stream`'s staging recipe: a
+    /// recorded-but-unloaned chunk is invisible to the coordinator's reclaim,
+    /// and a loaned-but-unrecorded chunk leaks if the recorder dies between the
+    /// two. On a journal-full backpressure the loan is unwound so a rejected
+    /// ask leaks nothing.
+    pub fn loan_reply(
+        &self,
+        desc: &ChunkDesc,
+        owner: u32,
+        journal_seg: &Arc<Segment>,
+    ) -> Result<usize> {
+        let pool = Pool::attach(&self.seg)?;
+        let ctrl = pool.ctrl(desc)?;
+        ctrl.try_loan(owner)?;
+        let journal = BorrowJournal::attach(journal_seg)?;
+        match journal.record(*desc) {
+            Ok(slot) => Ok(slot),
+            Err(e) => {
+                let _ = ctrl.drop_loan();
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Release a loaned + journaled reply chunk, exactly once.
+    ///
+    /// [`BorrowJournal::release`] is an election: the coordinator's crash
+    /// replay clears the same bit before it reclaims, so whoever observes the
+    /// bit set performs the shared-memory release and the loser does nothing.
+    /// Returns whether this caller won (and therefore freed).
+    pub fn release_reply(
+        &self,
+        desc: &ChunkDesc,
+        slot: usize,
+        journal_seg: &Arc<Segment>,
+    ) -> Result<bool> {
+        let journal = BorrowJournal::attach(journal_seg)?;
+        if !journal.release(slot)? {
+            return Ok(false); // replay already reclaimed it
+        }
+        let pool = Pool::attach(&self.seg)?;
+        if let Ok(ctrl) = pool.ctrl(desc) {
+            let _ = ctrl.drop_loan();
+        }
+        pool.free(desc)?;
+        Ok(true)
     }
 
     /// Write `env` + `body` into an existing chunk the caller owns (or has been
@@ -185,24 +251,36 @@ mod tests {
             Err(Error::Core(holon_core::Error::BadEnvelope))
         ));
 
-        // A reply chunk starts unreadable and becomes readable once written into.
-        let reply = msgs.alloc_reply().unwrap();
+        // A reply chunk starts unreadable and becomes readable once written
+        // into. Sized by the asker: envelope + 4 000 bytes lands in the 4 KiB
+        // class, and `reply_desc` reports that real size, not an assumed 256.
+        let reply = msgs.alloc_reply(4_000).unwrap();
+        assert_eq!(reply.len, 4096);
         assert!(matches!(
             msgs.read_message(&reply),
             Err(Error::Core(holon_core::Error::BadEnvelope))
         ));
         let r = LocalRef(shm_core::PackedRef::from_desc(&reply));
-        let rd = msgs.reply_desc(r);
+        let rd = msgs.reply_desc(r).unwrap();
         assert_eq!(
-            (rd.segment_id, rd.offset, rd.len),
-            (reply.segment_id, reply.offset, 256)
+            (rd.segment_id, rd.offset, rd.len, rd.generation),
+            (reply.segment_id, reply.offset, reply.len, reply.generation),
+            "the pool, not the sender, says how big the chunk is"
         );
-        let renv = Envelope::reply_to(&env, 1002, 4);
-        msgs.write_message_into(&rd, &renv, &[1, 2, 3, 4]).unwrap();
+        let big = vec![0xabu8; 4_000];
+        let renv = Envelope::reply_to(&env, 1002, big.len() as u16);
+        msgs.write_message_into(&rd, &renv, &big).unwrap();
         let (got, got_body) = msgs.read_message(&reply).unwrap();
         assert_eq!(got, renv);
-        assert_eq!(got_body, &[1, 2, 3, 4]);
+        assert_eq!(got_body, &big[..]);
         msgs.free(&reply).unwrap();
+
+        // A ref into another segment is refused before any pool attach.
+        let alien = LocalRef(shm_core::PackedRef::pack(seg.id() + 1, reply.offset));
+        assert!(matches!(
+            msgs.reply_desc(alien),
+            Err(Error::Core(holon_core::Error::BadEnvelope))
+        ));
 
         msgs.free(&desc).unwrap();
         let free1: usize = {
@@ -221,5 +299,65 @@ mod tests {
         };
         assert_eq!(free0, free2);
         seg.unlink().ok();
+    }
+
+    #[test]
+    fn loan_journal_release_is_leak_free() {
+        let id = 91_000 + (std::process::id() & 0x3ff);
+        let _ = Segment::unlink_by_id(id);
+        let seg = Arc::new(Segment::create(id, 1 << 20).unwrap());
+        Pool::create(&seg, &PoolConfig::power_of_two(256, 8192, 8)).unwrap();
+        let jid = 92_000 + (std::process::id() & 0x3ff);
+        let _ = Segment::unlink_by_id(jid);
+        let jseg = Arc::new(Segment::create(jid, 1 << 16).unwrap());
+        shm_core::BorrowJournal::create(&jseg, 8).unwrap();
+        let msgs = MessagePool::new(seg.clone());
+        let census = || {
+            let p = Pool::attach(&seg).unwrap();
+            (0..p.num_classes()).map(|c| p.free_count(c)).sum::<usize>()
+        };
+        let free0 = census();
+
+        let desc = msgs.alloc_reply(192).unwrap();
+        let slot = msgs.loan_reply(&desc, 7, &jseg).unwrap();
+        let journal = shm_core::BorrowJournal::attach(&jseg).unwrap();
+        assert_eq!(journal.len(), 1, "the borrow is on the crash ledger");
+        assert_eq!(
+            Pool::attach(&seg).unwrap().ctrl(&desc).unwrap().state(),
+            shm_core::LOANED,
+            "a FREE journaled chunk would be replayed and reclaimed as nothing"
+        );
+        assert!(msgs.release_reply(&desc, slot, &jseg).unwrap());
+        assert!(journal.is_empty());
+        assert_eq!(census(), free0, "loan + journal + release is leak-free");
+
+        // Losing the election (replay got there first) releases nothing twice:
+        // `Pool::free` validates nothing, so a double push would corrupt the
+        // free list rather than be detected.
+        let desc = msgs.alloc_reply(192).unwrap();
+        let slot = msgs.loan_reply(&desc, 7, &jseg).unwrap();
+        assert!(journal.release(slot).unwrap(), "stand in for the replayer");
+        assert!(!msgs.release_reply(&desc, slot, &jseg).unwrap());
+        assert_eq!(census(), free0 - 1, "the replayer owes the free, not us");
+
+        // Journal full is backpressure, and it unwinds the loan it just took.
+        let held: Vec<usize> = (0..8)
+            .map(|_| journal.record(desc).expect("fill the journal"))
+            .collect();
+        let extra = msgs.alloc_reply(192).unwrap();
+        assert!(matches!(
+            msgs.loan_reply(&extra, 7, &jseg),
+            Err(Error::Shm(shm_core::Error::JournalFull))
+        ));
+        assert_eq!(
+            Pool::attach(&seg).unwrap().ctrl(&extra).unwrap().state(),
+            shm_core::FREE,
+            "a rejected ask leaves no loan behind"
+        );
+        for s in held {
+            journal.release(s).unwrap();
+        }
+        seg.unlink().ok();
+        jseg.unlink().ok();
     }
 }

@@ -79,7 +79,7 @@ jobs:
       # soak locally; it is intentionally NOT lengthened in CI to keep the gate fast.
       - name: Test (per crate)
         run: |
-          for c in shm-core shm-arrow shm-ring shm-task shm-artifact shm-stream shm-store shm-runtime; do
+          for c in shm-core shm-arrow shm-ring shm-task shm-artifact shm-stream shm-store shm-runtime holon-core holon-actor holon-topic holon-net holon-demo holon-net-demo; do
             echo "::group::test $c"
             cargo test -p "$c"
             echo "::endgroup::"

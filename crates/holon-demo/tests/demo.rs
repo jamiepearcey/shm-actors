@@ -10,6 +10,12 @@
 //!   journaled pin; the lease reap redelivers the in-flight ask to the
 //!   successor; 0 lost, 0 errored, ≥ 1 restart, replies from both
 //!   incarnations, and the store pool back to baseline after quiescence.
+//! - [`asker_killed_holding_a_reply_ref`] — the by-reference reply's ownership
+//!   proof: a client `_exit(137)`s while a live `ReplyRef` holds its reply
+//!   chunk LOANED with its journal slot occupied. Nothing in that process can
+//!   free it; the coordinator's journal replay must, and the census says so.
+//!   This test fails against a journal-only implementation — `reclaim_one`
+//!   reclaims nothing for a `FREE` chunk, so the loan is not decoration.
 //! - [`four_clients_two_pricers`] — concurrent askers over the one mailbox:
 //!   a completed task slot is reused by the next submit (LIFO FREE stack), so
 //!   the reply must live in the asker-owned reply chunk, never in the slot's
@@ -26,8 +32,8 @@ use std::time::Duration;
 use holon_actor::{ActorRef, ActorSystem};
 use holon_core::{ActorId, Payload};
 use holon_demo::orchestrate::{
-    crash_scenario, publish_curve, run_client, spawn_pricer, unique_seg_base, wait_until,
-    ClientOpts, PricerOpts,
+    crash_scenario, publish_curve, run_client, run_client_killed, spawn_pricer, unique_seg_base,
+    wait_until, ClientOpts, PricerOpts,
 };
 use holon_demo::roles::publish_curve_with;
 use holon_demo::{
@@ -158,9 +164,27 @@ fn ask_reply_single_process() {
         .unwrap_err();
     assert!(matches!(err, holon_actor::Error::Failed), "got {err:?}");
 
-    // Stop the system: set the flag, nudge it with one more message.
+    // The same answer read by reference: the guard borrows the reply chunk in
+    // place and releases it — loan, journal slot and all — when it drops.
+    {
+        let req = PriceRequest {
+            tenor: 3.0,
+            notional: 2.0,
+            seq: 123,
+        };
+        let guard = actor
+            .ask_ref(PriceRequest::SCHEMA_ID, req.as_bytes(), 4_000)
+            .expect("by-ref ask");
+        assert_eq!(guard.len(), core::mem::size_of::<PriceReply>());
+        let rep: PriceReply = guard.payload().expect("decode");
+        let expected = price(interpolate(&v2, 3.0).unwrap(), 3.0, 2.0);
+        assert!((rep.px - expected).abs() < 1e-12);
+        assert_eq!(rep.curve_version, 2);
+    }
+
+    // Stop the system: the flag is observed within one park cycle (no
+    // message needed — a nudge would leave one unclaimed chunk behind).
     stop.store(true, Ordering::Release);
-    actor.tell(&req).expect("tell");
     pricer.join().expect("pricer thread");
 
     // Evict + census → baseline (every envelope and reply chunk was freed).
@@ -387,6 +411,47 @@ fn two_actors_one_mailbox_multiprocess() {
             coord.store_data_free_total() == Some(with_curve)
         }),
         "census {:?} != with-curve baseline {with_curve}",
+        coord.store_data_free_total()
+    );
+}
+
+#[test]
+fn asker_killed_holding_a_reply_ref() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let uds = dir.path().join("coord.sock");
+    let uds_s = uds.to_str().unwrap().to_string();
+    let config = RuntimeConfig::with_seg_base(unique_seg_base());
+    let mut coord = Coordinator::bind(&uds, config).expect("bind");
+    coord.start().expect("start");
+    let exe = env!("CARGO_BIN_EXE_holon-demo");
+    publish_curve(exe, &uds_s, 0.0);
+    let with_curve = coord.store_data_free_total().expect("census");
+
+    {
+        let _pricer = spawn_pricer(exe, &uds_s, dir.path(), "killref", &PricerOpts::default());
+        // 10 ordinary asks, then one by-reference ask the client dies holding:
+        // its 4 KiB reply chunk is LOANED to the client's node and recorded in
+        // that node's borrow journal, and no destructor runs.
+        run_client_killed(
+            exe,
+            &uds_s,
+            dir.path(),
+            "killref",
+            &ClientOpts {
+                kill_after_reply: Some(10),
+                ..ClientOpts::parked(20)
+            },
+        );
+    }
+
+    // The lease monitor declares the dead node's heartbeat lapsed, replays its
+    // journal, wins the slot, and reclaims the loaned chunk.
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            coord.store_data_free_total() == Some(with_curve)
+        }),
+        "census {:?} != with-curve baseline {with_curve}: the reply chunk of a \
+         killed asker leaked",
         coord.store_data_free_total()
     );
 }

@@ -35,12 +35,22 @@ const DATASET: &str = "dataset/X";
 const RESULT: &str = "result/X";
 
 fn unique_seg_base() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64;
     let pid = std::process::id() as u64;
-    100_000 + (((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 2_000_000) as u32
+    // Within the band, the per-call counter owns the low 16 slots and the
+    // pid/clock hash picks one of 16 sub-blocks above them, so two tests in
+    // THIS binary can never draw overlapping ranges (they ran in parallel
+    // threads and the loser died `EEXIST` on bind) while separate runs stay
+    // apart. Everything stays inside this binary's 4 MiB-wide band.
+    104194304
+        + n * 16_384
+        + ((((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 16) as u32) * 16_384 * 16
 }
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {

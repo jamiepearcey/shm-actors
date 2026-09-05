@@ -435,6 +435,18 @@ impl Node {
         &self.name
     }
 
+    /// A shared handle to this node's **borrow journal** segment — the crash
+    /// ledger the coordinator replays when the node dies.
+    ///
+    /// The journal is granted per registered *node*, not per hosted actor: a
+    /// process running several actors shares one journal and one
+    /// [`actor_id`](Node::actor_id), and that id is the `owner` a loan must be
+    /// taken under for the coordinator's reclaim to recognise it.
+    #[inline]
+    pub fn journal_segment(&self) -> &Arc<Segment> {
+        &self.journal_seg
+    }
+
     /// A shared handle to the payload segment (e.g. to inspect a `ChunkCtrl`).
     #[inline]
     pub fn payload_segment(&self) -> &Arc<Segment> {
@@ -514,6 +526,26 @@ impl Node {
         // SAFETY: `base` points at `region_len` writable bytes the coordinator
         // initialized with `Ring::init`, mapped and kept alive by `t.segment`.
         Ok(unsafe { Ring::attach(base, t.region_len)? })
+    }
+
+    /// A descriptor-only publisher for `topic` that does not borrow the node.
+    ///
+    /// The returned handle owns its own mapping of the topic ring and a clone
+    /// of the doorbell, so it can be held across `store()` (which borrows the
+    /// node mutably) and moved to another thread. It publishes bare
+    /// [`ChunkDesc`]s — the caller decides what they mean. The intended use is
+    /// **notification rings** whose descriptors carry the whole message
+    /// (e.g. [`VersionEvent::to_desc`], ADR-0017 `holon-topic`): nothing is
+    /// allocated, pinned or reclaimed, and lapping loses only a wake-up that
+    /// a cursor-based reader recovers from the source of truth.
+    pub fn topic_publisher(&mut self, topic: &str) -> Result<TopicPublisher> {
+        self.ensure_topic(topic, false)?;
+        let t = self.topics.get(topic).expect("topic ensured above");
+        Ok(TopicPublisher {
+            segment: t.segment.clone(),
+            region_len: t.region_len,
+            doorbell: t.doorbell.try_clone()?,
+        })
     }
 
     /// Loan a chunk, serialize `batch` into it, publish it to `topic`, and
@@ -906,6 +938,36 @@ pub struct Pin {
     pub slot: usize,
     /// The reconstructed record batch (buffers point into shared memory).
     pub batch: RecordBatch,
+}
+
+/// A node-independent, descriptor-only topic publisher (see
+/// [`Node::topic_publisher`]).
+pub struct TopicPublisher {
+    segment: Arc<Segment>,
+    region_len: usize,
+    doorbell: OwnedFd,
+}
+
+impl TopicPublisher {
+    /// Publish one descriptor; rings the doorbell iff a subscriber is parked.
+    pub fn publish(&self, desc: ChunkDesc) -> Result<()> {
+        let ring = unsafe { Ring::attach(self.segment.payload_ptr(), self.region_len)? };
+        Publisher::with_notifier(ring, DoorbellNotifier::new(self.doorbell.as_raw_fd()))
+            .publish(desc);
+        Ok(())
+    }
+
+    /// Publish a [`VersionEvent`] packed into a descriptor.
+    #[inline]
+    pub fn publish_event(&self, ev: VersionEvent) -> Result<()> {
+        self.publish(ev.to_desc())
+    }
+
+    /// The ring's current head (next sequence to be published).
+    pub fn head(&self) -> Result<u64> {
+        let ring = unsafe { Ring::attach(self.segment.payload_ptr(), self.region_len)? };
+        Ok(ring.head())
+    }
 }
 
 /// A write transaction opened via [`Node::stream`].

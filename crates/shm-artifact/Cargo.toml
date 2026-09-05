@@ -12,7 +12,7 @@ shm-arrow = { workspace = true }
 shm-ring = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-arrow-select = "58"
+arrow-select = "59"
 thiserror = { workspace = true }
 
 [dev-dependencies]

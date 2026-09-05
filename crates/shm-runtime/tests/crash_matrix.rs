@@ -58,7 +58,13 @@ fn unique_seg_base() -> u32 {
         .unwrap()
         .as_nanos() as u64;
     let pid = std::process::id() as u64;
-    700_000 + n * 100_000 + (((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 50_000) as u32
+    // Own band, disjoint from every other test binary's, with the per-call
+    // sequence and the random slot both quantised to a stride wider than one
+    // coordinator's segment span. The old 700_000 base overlapped four other
+    // binaries' windows.
+    133_554_432
+        + n * 16_384 * 256
+        + ((((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 256) as u32) * 16_384
 }
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {

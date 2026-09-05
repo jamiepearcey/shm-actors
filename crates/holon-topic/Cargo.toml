@@ -1,0 +1,22 @@
+[package]
+name = "holon-topic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+shm-arrow = { workspace = true }
+shm-artifact = { workspace = true }
+shm-store = { workspace = true }
+shm-runtime = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+shm-ring = { workspace = true }
+shm-core = { workspace = true }

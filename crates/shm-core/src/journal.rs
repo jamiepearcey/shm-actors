@@ -57,6 +57,16 @@ pub const DEFAULT_CAPACITY: usize = 1024;
 /// governs occupancy, so a set bit always names a real tagged entry).
 pub const ENTRY_EMPTY: u32 = 0;
 /// Entry-kind tag: a chunk pin, payload = a [`ChunkDesc`] (v0.2 semantics).
+///
+/// Three producers record this: `shm-stream`'s staged batch chunks, a node's
+/// `pin_and_read`, and a Holon **ask reply chunk** (the asker allocates it,
+/// loans it, journals it, and lends its address to the handler).
+///
+/// All three take the borrow *before* recording it, and they must: the
+/// coordinator's crash replay reclaims a journaled chunk only when its
+/// [`ChunkCtrl`](crate::ChunkCtrl) is `LOANED` or `PUBLISHED`. A chunk that is
+/// merely popped off a free list stays `FREE`, and replaying its descriptor is
+/// a no-op — the journal record alone reclaims nothing.
 pub const ENTRY_CHUNK_PIN: u32 = 1;
 /// Entry-kind tag: an artifact version pin, payload =
 /// `{artifact_id, incarnation, version}`.

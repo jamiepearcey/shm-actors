@@ -14,6 +14,10 @@ members = [
     "crates/holon-core",
     "crates/holon-actor",
     "crates/holon-demo",
+    "crates/holon-topic",
+    "crates/holon-object",
+    "crates/holon-net",
+    "crates/holon-net-demo",
 ]
 # The cargo-fuzz harnesses (v0.4 stage N) are a separate nightly-only crate with
 # their own detached workspace; keep them out of the pinned-stable workspace so
@@ -49,17 +53,20 @@ shm-store = { path = "crates/shm-store", version = "0.1.0", registry = "kellnr" 
 shm-runtime = { path = "crates/shm-runtime", version = "0.1.0", registry = "kellnr" }
 holon-core = { path = "crates/holon-core" }
 holon-actor = { path = "crates/holon-actor" }
+holon-topic = { path = "crates/holon-topic" }
+holon-object = { path = "crates/holon-object" }
+holon-net = { path = "crates/holon-net" }
 
 # External
 bytemuck = { version = "1", features = ["derive"] }
 libc = "0.2"
 nix = { version = "0.29", default-features = false, features = ["socket", "uio", "mman", "fs", "signal", "process", "poll"] }
 thiserror = "2"
-arrow = { version = "58", default-features = false, features = ["ipc"] }
-arrow-schema = "58"
-arrow-buffer = "58"
-arrow-array = "58"
-arrow-data = "58"
+arrow = { version = "59", default-features = false, features = ["ipc"] }
+arrow-schema = "59"
+arrow-buffer = "59"
+arrow-array = "59"
+arrow-data = "59"
 tempfile = "3"
 
 [profile.release]

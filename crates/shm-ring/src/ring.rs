@@ -347,12 +347,19 @@ impl Ring {
     }
 
     /// Register interest as a parked subscriber (increment `waiters`).
-    pub(crate) fn add_waiter(&self) {
+    ///
+    /// Public so an external reactor that parks on the doorbell fd *outside*
+    /// [`crate::Subscriber::recv`] (a `poll(2)` loop over sockets + doorbells,
+    /// ADR-0017) can follow the same protocol: `add_waiter` → re-check the ring
+    /// with `try_recv` → park → `remove_waiter`. A producer rings the doorbell
+    /// only while `waiters > 0`, so skipping this step means never being woken.
+    pub fn add_waiter(&self) {
         self.header().waiters.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Withdraw from the parked set (decrement `waiters`).
-    pub(crate) fn remove_waiter(&self) {
+    /// Withdraw from the parked set (decrement `waiters`). Pairs with
+    /// [`Ring::add_waiter`].
+    pub fn remove_waiter(&self) {
         self.header().waiters.fetch_sub(1, Ordering::AcqRel);
     }
 

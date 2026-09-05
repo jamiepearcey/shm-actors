@@ -132,7 +132,7 @@ impl MessageKind {
 /// | `magic`       | `u32` | 52     | [`ENVELOPE_MAGIC`]                                   |
 /// | `abi_version` | `u16` | 56     | [`ENVELOPE_ABI_VERSION`]                             |
 /// | `body_len`    | `u16` | 58     | inline body length (`FLAG_INLINE_PAYLOAD`)           |
-/// | `_reserved`   | `u32` | 60     | must be zero                                         |
+/// | `reply_gen`   | `u32` | 60     | reply chunk's generation at ask time (`0` otherwise) |
 ///
 /// The same struct is meant to be the shm mailbox slot and the TCP frame
 /// header; today it rides inside a store-pool chunk (see the crate docs).
@@ -165,8 +165,14 @@ pub struct Envelope {
     pub abi_version: u16,
     /// Inline body length in bytes.
     pub body_len: u16,
-    /// Reserved; must be zero.
-    pub _reserved: u32,
+    /// The [`ChunkCtrl`](shm_core::ChunkCtrl) generation the asker observed on
+    /// the reply chunk it named in `payload`; `0` on every other kind.
+    ///
+    /// A handler re-reads the chunk's live generation from the pool and refuses
+    /// to write when it differs: the asker died and the coordinator recycled
+    /// the chunk under it. This word is what makes that check an epoch check
+    /// rather than a clock heuristic.
+    pub reply_gen: u32,
 }
 
 // SAFETY: `#[repr(C)]`, all-POD fields summing to exactly 64 bytes (asserted
@@ -188,7 +194,7 @@ const _: () = assert!(core::mem::offset_of!(Envelope, epoch) == 48);
 const _: () = assert!(core::mem::offset_of!(Envelope, magic) == 52);
 const _: () = assert!(core::mem::offset_of!(Envelope, abi_version) == 56);
 const _: () = assert!(core::mem::offset_of!(Envelope, body_len) == 58);
-const _: () = assert!(core::mem::offset_of!(Envelope, _reserved) == 60);
+const _: () = assert!(core::mem::offset_of!(Envelope, reply_gen) == 60);
 
 impl Envelope {
     /// Build an envelope with an **inline** body of `body_len` bytes.
@@ -218,7 +224,7 @@ impl Envelope {
             magic: ENVELOPE_MAGIC,
             abi_version: ENVELOPE_ABI_VERSION,
             body_len,
-            _reserved: 0,
+            reply_gen: 0,
         }
     }
 
@@ -246,14 +252,23 @@ impl Envelope {
     }
 
     /// Name the asker-owned **reply chunk** the handler must write its reply
-    /// into: `payload` carries the [`LocalRef`] and `FLAG_LOCAL_REF` is set.
+    /// into: `payload` carries the [`LocalRef`], `FLAG_LOCAL_REF` is set, and
+    /// `reply_gen` records the chunk generation the asker allocated at.
     /// The reply never rides the task slot's result word, which is reusable
     /// capacity the instant the task completes.
     #[inline]
-    pub fn with_reply_ref(mut self, r: LocalRef) -> Envelope {
+    pub fn with_reply_ref(mut self, r: LocalRef, generation: u32) -> Envelope {
         self.payload = r.0 .0;
         self.flags |= FLAG_LOCAL_REF;
+        self.reply_gen = generation;
         self
+    }
+
+    /// The generation the asker observed on its reply chunk (`0` when the
+    /// envelope names none).
+    #[inline]
+    pub fn reply_gen(&self) -> u32 {
+        self.reply_gen
     }
 
     /// Stamp the coarse deadline from an absolute nanosecond deadline.
@@ -299,13 +314,14 @@ impl Envelope {
         (self.flags & FLAG_LOCAL_REF != 0).then_some(LocalRef(PackedRef(self.payload)))
     }
 
-    /// Validate `magic`, `abi_version` and the reserved word.
+    /// Validate `magic` and `abi_version`.
+    ///
+    /// `reply_gen` is *not* validated: it is a live generation number and any
+    /// 32-bit value is legal. It is checked where it means something — against
+    /// the pool's current generation for the chunk `payload` names.
     #[inline]
     pub fn validate(&self) -> Result<()> {
-        if self.magic != ENVELOPE_MAGIC
-            || self.abi_version != ENVELOPE_ABI_VERSION
-            || self._reserved != 0
-        {
+        if self.magic != ENVELOPE_MAGIC || self.abi_version != ENVELOPE_ABI_VERSION {
             return Err(Error::BadEnvelope);
         }
         MessageKind::from_u16(self.kind)?;
@@ -418,13 +434,17 @@ mod tests {
     #[test]
     fn reply_swaps_addresses_and_keeps_corr() {
         let ask = Envelope::inline(MessageKind::Ask, ActorId(5), ActorId(9), 77, 1, 0)
-            .with_reply_ref(LocalRef(PackedRef::pack(3, 4096)));
+            .with_reply_ref(LocalRef(PackedRef::pack(3, 4096)), 11);
         assert_eq!(ask.payload_ref(), Some(LocalRef(PackedRef::pack(3, 4096))));
+        assert_eq!(ask.reply_gen(), 11);
         let e = Envelope::err_to(&ask);
         assert_eq!(e.kind().unwrap(), MessageKind::Err);
         assert_eq!(e.corr, 77);
         assert!(e.payload_ref().is_none());
+        assert_eq!(e.reply_gen(), 0, "an error reply names no chunk");
         let r = Envelope::reply_to(&ask, 2, 8);
+        assert_eq!(r.reply_gen(), 0, "a reply names no chunk");
+        assert!(r.payload_ref().is_none());
         assert_eq!(r.to, 9);
         assert_eq!(r.from, 5);
         assert_eq!(r.corr, 77);

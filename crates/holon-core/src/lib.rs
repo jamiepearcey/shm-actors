@@ -33,4 +33,6 @@ pub use envelope::{
     SCHEMA_ENVELOPE,
 };
 pub use error::{Error, Result};
-pub use payload::{InlineBody, LocalRef, Payload, Reply, MAX_INLINE_BODY};
+pub use payload::{
+    ByteBody, InlineBody, LocalRef, Payload, Reply, MAX_INLINE_BODY, MAX_REPLY_BODY,
+};

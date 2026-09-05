@@ -202,6 +202,51 @@ fn pool_alloc_free_and_exhaustion() {
 }
 
 #[test]
+fn desc_at_round_trips_alloc() {
+    let seg = small_pool_segment();
+    let cfg = PoolConfig {
+        classes: vec![
+            shm_core::SizeClass {
+                chunk_size: 64,
+                chunk_count: 4,
+            },
+            shm_core::SizeClass {
+                chunk_size: 256,
+                chunk_count: 4,
+            },
+        ],
+    };
+    let pool = Pool::create(&seg, &cfg).unwrap();
+
+    // Every class: the descriptor the pool mints for an address equals the one
+    // `alloc` handed out. This is what lets a borrower of a bare
+    // `segment_id|offset` stop fabricating `len` and `generation`.
+    for size in [64u32, 256] {
+        let a = pool.alloc(size).unwrap();
+        let d = pool.desc_at(a.offset).unwrap();
+        assert_eq!(
+            (d.segment_id, d.generation, d.offset, d.len),
+            (a.segment_id, a.generation, a.offset, a.len)
+        );
+    }
+
+    // A recycle bumps the generation, so a stale holder's descriptor no longer
+    // matches what the pool reports — the ask path's staleness check.
+    let a = pool.alloc(64).unwrap();
+    let ctrl = pool.ctrl(&a).unwrap();
+    ctrl.try_loan(7).unwrap();
+    ctrl.drop_loan().unwrap();
+    assert_eq!(pool.desc_at(a.offset).unwrap().generation, a.generation + 1);
+
+    // Validation is inherited from `locate`.
+    assert!(matches!(pool.desc_at(a.offset + 1), Err(Error::Misaligned)));
+    assert!(matches!(pool.desc_at(0), Err(Error::OutOfBounds)));
+    assert!(matches!(pool.desc_at(u32::MAX), Err(Error::OutOfBounds)));
+
+    seg.unlink().unwrap();
+}
+
+#[test]
 fn pool_treiber_aba_safety() {
     let seg = small_pool_segment();
     let cfg = PoolConfig {

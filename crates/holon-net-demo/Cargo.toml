@@ -1,0 +1,27 @@
+[package]
+name = "holon-net-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+holon-core = { workspace = true }
+holon-actor = { workspace = true }
+holon-topic = { workspace = true }
+holon-net = { workspace = true }
+shm-core = { workspace = true }
+shm-arrow = { workspace = true }
+shm-runtime = { workspace = true }
+bytemuck = { workspace = true }
+libc = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "holon-net-demo"
+path = "src/main.rs"

@@ -25,7 +25,12 @@ fn unique_seg_base() -> u32 {
         .unwrap()
         .as_nanos() as u64;
     let pid = std::process::id() as u64;
-    2_100_000 + (((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 2_000_000) as u32
+    // Disjoint band per test binary, and draws quantised to a stride wider
+    // than the ~10k segment ids one coordinator spans. The old form was
+    // `BASE + hash % 2_000_000` with bases only 200k apart, so two binaries
+    // running in parallel regularly drew within one coordinator's range of
+    // each other and the loser died with EEXIST on bind.
+    129360128 + ((((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 256) as u32) * 16384
 }
 
 const IN_KEY: &[u8] = b"task/in";

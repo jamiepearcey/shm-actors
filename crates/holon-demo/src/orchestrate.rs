@@ -278,6 +278,10 @@ pub struct ClientOpts {
     pub bare: bool,
     /// Alternate asks between the `pricer` and `risk` actors (odd `seq` → risk).
     pub mix: bool,
+    /// `_exit(137)` on the n-th ask **while still holding its `ReplyRef`** —
+    /// the reply chunk loaned, its journal slot occupied, its bytes half read.
+    /// The fixture for the asker-death reclaim path.
+    pub kill_after_reply: Option<u64>,
 }
 
 impl ClientOpts {
@@ -289,6 +293,7 @@ impl ClientOpts {
             spin: false,
             bare: false,
             mix: false,
+            kill_after_reply: None,
         }
     }
 }
@@ -317,6 +322,10 @@ pub fn run_client(exe: &str, uds: &str, dir: &Path, tag: &str, opts: &ClientOpts
     if opts.mix {
         args.push("--mix".into());
     }
+    if let Some(k) = opts.kill_after_reply {
+        args.push("--kill-after-reply".into());
+        args.push(k.to_string());
+    }
     let status = Command::new(exe)
         .args(&args)
         .stdout(Stdio::null())
@@ -324,6 +333,40 @@ pub fn run_client(exe: &str, uds: &str, dir: &Path, tag: &str, opts: &ClientOpts
         .expect("run client");
     assert!(status.success(), "client {tag} exited with {status}");
     ClientReport::from_file(&result)
+}
+
+/// Run a client that is expected to `_exit(137)` mid-run
+/// ([`ClientOpts::kill_after_reply`]) and assert it did. There is no report:
+/// the process died before writing one, which is the point.
+pub fn run_client_killed(exe: &str, uds: &str, dir: &Path, tag: &str, opts: &ClientOpts) {
+    let result = dir.join(format!("client-{tag}.result"));
+    let _ = std::fs::remove_file(&result);
+    let mut args = vec![
+        "client".to_string(),
+        "--uds".into(),
+        uds.into(),
+        "--n".into(),
+        opts.n.to_string(),
+        "--clients".into(),
+        "1".into(),
+        "--result".into(),
+        result.display().to_string(),
+        "--kill-after-reply".into(),
+        opts.kill_after_reply.expect("kill_after_reply").to_string(),
+    ];
+    if opts.spin {
+        args.push("--spin".into());
+    }
+    let status = Command::new(exe)
+        .args(&args)
+        .stdout(Stdio::null())
+        .status()
+        .expect("run client");
+    assert_eq!(
+        status.code(),
+        Some(137),
+        "client {tag} was meant to die holding a reply ref, exited with {status}"
+    );
 }
 
 /// Spawn `curve-publish` and wait for it to exit (the commit is synchronous).

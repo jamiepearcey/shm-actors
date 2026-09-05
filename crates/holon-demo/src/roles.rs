@@ -8,7 +8,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use holon_actor::{ActorRef, ActorSystem};
-use holon_core::ActorId;
+use holon_core::{ActorId, Payload};
 use shm_arrow::SchemaRegistry;
 use shm_core::ChunkDesc;
 use shm_runtime::{Coordinator, Node, RuntimeConfig};
@@ -278,6 +278,13 @@ struct ClientThreadReport {
     incarnations: HashMap<u32, (u64, u64)>,
 }
 
+/// The reply-body cap the by-ref ask in [`client_thread`] sizes its chunk to.
+/// Deliberately far past [`holon_core::MAX_INLINE_BODY`] so the reclaimed chunk
+/// comes from a larger size class than the ordinary ask's 256-byte one — a leak
+/// of it would be unmistakable in the census.
+const KILL_REPLY_CAP: u32 = 4_000;
+
+#[allow(clippy::too_many_arguments)]
 fn client_thread(
     uds: &str,
     idx: u32,
@@ -285,6 +292,7 @@ fn client_thread(
     spin: bool,
     bare: bool,
     mix: bool,
+    kill_after_reply: Option<u64>,
     barrier: &Barrier,
 ) -> Result<ClientThreadReport, String> {
     let mut node = connect(uds, &format!("client-{idx}"))?;
@@ -351,6 +359,23 @@ fn client_thread(
         let tenor = 0.25 + ((seq.wrapping_mul(7919)) % 2975) as f64 / 100.0;
         let notional = 1_000_000.0;
         let to_risk = mix && seq % 2 == 1;
+        if kill_after_reply == Some(seq) {
+            // Die holding a live `ReplyRef`: the chunk is LOANED, its journal
+            // slot occupied, and its bytes only half read. Nothing this process
+            // does can free it — the coordinator's replay must.
+            let req = PriceRequest {
+                tenor,
+                notional,
+                seq,
+            };
+            let guard = actor
+                .ask_ref(PriceRequest::SCHEMA_ID, req.as_bytes(), KILL_REPLY_CAP)
+                .map_err(|e| e.to_string())?;
+            assert!(!guard.bytes().is_empty(), "read half the answer");
+            // SAFETY: `_exit` is always sound; skipping every destructor,
+            // including the guard's, is exactly what is being tested.
+            unsafe { libc::_exit(137) }
+        }
         let t0 = Instant::now();
         // Both arms fold to (curve_version, incarnation, attempt) once verified.
         let res: Result<(u64, u32, u32), String> = if to_risk {
@@ -422,6 +447,7 @@ fn run_client_role(opts: &Opts) -> i32 {
     let spin = opts.flag("--spin");
     let bare = opts.flag("--bare");
     let mix = opts.flag("--mix");
+    let kill_after_reply = opts.num::<u64>("kill-after-reply");
     let barrier = Arc::new(Barrier::new(clients as usize + 1));
     let mut handles = Vec::new();
     for i in 0..clients {
@@ -434,7 +460,7 @@ fn run_client_role(opts: &Opts) -> i32 {
         let uds = uds.clone();
         let barrier = barrier.clone();
         handles.push(std::thread::spawn(move || {
-            client_thread(&uds, i, per, spin, bare, mix, &barrier)
+            client_thread(&uds, i, per, spin, bare, mix, kill_after_reply, &barrier)
         }));
     }
     barrier.wait();

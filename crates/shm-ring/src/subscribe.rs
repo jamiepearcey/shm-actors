@@ -118,6 +118,13 @@ impl<P: Parker> Subscriber<P> {
         self.cursor
     }
 
+    /// The parker this subscriber sleeps on (a reactor that parks *outside*
+    /// [`Subscriber::recv`] needs its fd — see [`crate::Ring::add_waiter`]).
+    #[inline]
+    pub fn parker(&self) -> &P {
+        &self.parker
+    }
+
     /// The ring this subscriber reads from.
     pub fn ring(&self) -> &Ring {
         &self.ring

@@ -1478,17 +1478,40 @@ impl TaskQueue {
             {
                 return task;
             }
-            self.header().waiters_work.fetch_add(1, Ordering::AcqRel);
-            let task =
-                self.claim_with_lease(worker_id, crate::now_nanos().wrapping_add(lease_nanos));
-            if task.is_none() {
-                parker.park();
-            }
-            self.header().waiters_work.fetch_sub(1, Ordering::AcqRel);
-            if let Some(task) = task {
+            if let Some(task) = self.claim_once_parked(worker_id, lease_nanos, parker) {
                 return task;
             }
         }
+    }
+
+    /// One park cycle of [`claim_blocking_with_lease`](TaskQueue::claim_blocking_with_lease):
+    /// register as a work waiter, re-check, park **once** (until the doorbell
+    /// or the parker's timeout), withdraw. `None` = nothing claimed this
+    /// cycle — the caller may check a stop flag and call again. A worker that
+    /// must be able to exit while idle (an actor system with a stop flag,
+    /// ADR-0017) needs this; the blocking variants never return without a task.
+    pub fn claim_once_parked<P: Parker>(
+        &self,
+        worker_id: u32,
+        lease_nanos: u64,
+        parker: &P,
+    ) -> Option<ClaimedTask<'_>> {
+        if let Some(task) =
+            self.claim_with_lease(worker_id, crate::now_nanos().wrapping_add(lease_nanos))
+        {
+            return Some(task);
+        }
+        self.header().waiters_work.fetch_add(1, Ordering::AcqRel);
+        // Re-check after registering: a submit that raced our registration is
+        // still observed here before we sleep. The fence is the worker half of
+        // the Dekker pairing with `submit` (see `claim_blocking`).
+        shm_core::substrate::fence(Ordering::SeqCst);
+        let task = self.claim_with_lease(worker_id, crate::now_nanos().wrapping_add(lease_nanos));
+        if task.is_none() {
+            parker.park();
+        }
+        self.header().waiters_work.fetch_sub(1, Ordering::AcqRel);
+        task
     }
 
     // ---- Requester API ----
@@ -1556,6 +1579,21 @@ impl TaskQueue {
         }
     }
 
+    /// Register as a requester parked on the done doorbell **outside**
+    /// [`wait`](TaskQueue::wait) — for a reactor that `poll(2)`s the done fd
+    /// alongside sockets (ADR-0017). Completion rings the doorbell only while
+    /// `waiters_done > 0`, so the protocol is: `add_done_waiter` → re-`poll`
+    /// every handle of interest → park → `remove_done_waiter`.
+    pub fn add_done_waiter(&self) {
+        self.header().waiters_done.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Withdraw from the done-doorbell waiter set. Pairs with
+    /// [`add_done_waiter`](TaskQueue::add_done_waiter).
+    pub fn remove_done_waiter(&self) {
+        self.header().waiters_done.fetch_sub(1, Ordering::AcqRel);
+    }
+
     /// Request cancellation of a task, validating the handle's `seq`.
     ///
     /// If still `QUEUED`, CASes it `QUEUED→CANCELLED` (no worker ever runs it).
@@ -1563,7 +1601,14 @@ impl TaskQueue {
     /// observes it via [`ClaimedTask::is_cancelled`] and should `fail`/exit.
     /// Terminal tasks are left unchanged. Returns [`Error::StaleHandle`] on a
     /// reused slot.
-    pub fn cancel(&self, handle: TaskHandle) -> Result<()> {
+    /// Returns `true` when the **pre-claim** cancel won: the task was still
+    /// QUEUED, is now CANCELLED, and will never be claimed. That matters to the
+    /// caller because a task that is never claimed is never executed, so
+    /// anything the request owns — its chunk above all — will never be freed by
+    /// a worker, and the canceller is the only party left that can free it.
+    /// `false` means the cancel lost the race: the task is claimed (or gone)
+    /// and its worker still owns the request.
+    pub fn cancel(&self, handle: TaskHandle) -> Result<bool> {
         let idx = handle.slot_idx as usize;
         if idx >= self.capacity {
             return Err(Error::StaleHandle);
@@ -1586,7 +1631,7 @@ impl TaskQueue {
             if self.header().waiters_done.load(Ordering::Acquire) > 0 {
                 self.done.notify();
             }
-            return Ok(());
+            return Ok(true);
         }
         // Lost the pre-claim cancel (already claimed, or gone): uncount.
         self.header().cancelled.fetch_sub(1, Ordering::AcqRel);
@@ -1597,7 +1642,7 @@ impl TaskQueue {
         {
             slot.cancel.store(1, Ordering::Release);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// **P0.3 (ADR-0010, G12) — consume a terminal outcome and take its

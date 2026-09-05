@@ -2,22 +2,28 @@
 //! [`ActorRef`], and the per-message [`Cx`] with its RAII [`Pinned`] cell view.
 
 use std::ops::Deref;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use holon_core::{ActorId, Dispatch, Envelope, LocalRef, MessageKind, Payload, Reply};
+use holon_core::{
+    ActorId, Dispatch, Envelope, LocalRef, MessageKind, Payload, Reply, ENVELOPE_SIZE,
+    MAX_REPLY_BODY,
+};
+use holon_object::{ObjectSide, ObjectStore};
+use holon_topic::{TopicLog, TopicPolicy, TopicSide};
 use shm_arrow::SchemaRegistry;
 use shm_artifact::VersionPin;
-use shm_core::{ChunkDesc, PackedRef};
+use shm_core::{ChunkDesc, PackedRef, Segment};
 use shm_ring::DoorbellParker;
 use shm_runtime::{Node, TaskQueueHandle};
 use shm_store::KeyedStore;
-use shm_task::{now_nanos, Error as TaskError, Outcome, TaskStatus};
+use shm_task::{now_nanos, Error as TaskError, Outcome, TaskHandle, TaskStatus};
 
-use crate::chunk::MessagePool;
+use crate::chunk::{MessagePool, DEFAULT_REPLY_BODY};
 use crate::error::{Error, Result};
 
 /// The default claim lease a running system stamps on each claim: a handler
@@ -85,13 +91,16 @@ impl Deref for Pinned {
 /// The per-message context the system lends a handler.
 pub struct Cx<'a> {
     store: &'a KeyedStore<'a>,
+    topics: &'a TopicLog<'a>,
+    objects: &'a ObjectStore<'a>,
     self_id: ActorId,
     sender: ActorId,
     corr: u64,
     attempt: u32,
+    reply_cap: u32,
 }
 
-impl Cx<'_> {
+impl<'a> Cx<'a> {
     /// Pin `cell`'s current version zero-copy: `open(key)` (a key-cache hit +
     /// catalog scan) → journaled `pin()` → `read()`.
     pub fn pin(&self, cell: &CellRef) -> holon_core::Result<Pinned> {
@@ -110,6 +119,79 @@ impl Cx<'_> {
     }
 
     /// This actor's id.
+    /// Publish `data` to `topic` under the default [`TopicPolicy`]; returns the
+    /// message seq (ADR-0017). Visible to every SSE/TCP/HTTP subscriber of the
+    /// topic through the gateways — the actor never sees a socket.
+    pub fn publish(&self, topic: &str, event: &str, data: &[u8]) -> holon_core::Result<u64> {
+        self.publish_with(topic, TopicPolicy::default(), event, "", data)
+    }
+
+    /// [`Cx::publish`] with an explicit policy and content type.
+    pub fn publish_with(
+        &self,
+        topic: &str,
+        policy: TopicPolicy,
+        event: &str,
+        content_type: &str,
+        data: &[u8],
+    ) -> holon_core::Result<u64> {
+        self.topics
+            .publish(topic, policy, event, content_type, data)
+            .map_err(|e| holon_core::Error::Cell(e.to_string()))
+    }
+
+    /// The topic log (for reads from inside a handler).
+    #[inline]
+    pub fn topics(&self) -> &'a TopicLog<'a> {
+        self.topics
+    }
+
+    /// The object store ([`holon_object`]): opaque, versioned payloads keyed in
+    /// the same keyed store the topics live in.
+    ///
+    /// This is the handler's answer to the one thing a reply chunk cannot do —
+    /// hand a *remote* caller a large body. A `LocalRef` is refused at the
+    /// holon-net wire guards, so an edge caller cannot be given a reference to
+    /// shared memory; it can be given a **handle** (a key and a version), which
+    /// is not an address and crosses fine. The handler commits the bytes here
+    /// and replies with the handle; the gateway serves them from
+    /// `GET /objects/{key}?version=`, streamed out of the same pinned pages.
+    #[inline]
+    pub fn objects(&self) -> &'a ObjectStore<'a> {
+        self.objects
+    }
+
+    /// Commit a new immutable version of object `key`; returns its version.
+    ///
+    /// Descriptor-only notification rides [`holon_topic::TOPIC_EVENTS`] for
+    /// free — nothing is allocated, copied or pinned for it.
+    pub fn put_object(
+        &self,
+        key: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> holon_core::Result<u64> {
+        self.objects
+            .put(key, content_type, bytes)
+            .map_err(|e| holon_core::Error::Cell(e.to_string()))
+    }
+
+    /// The largest payload one object may hold, read from the store pool rather
+    /// than assumed — see [`ObjectStore::max_object`].
+    ///
+    /// A handler that asks before it encodes can refuse an oversized answer as
+    /// *data*, with the number in the message, instead of discovering the
+    /// ceiling as a store error after the work is done. This is the **object**
+    /// ceiling — a payload is split across as many segments as it needs and all
+    /// of them install as one version — not one chunk's worth; a handler that
+    /// wants the per-segment figure asks [`ObjectStore::max_payload`].
+    pub fn max_object_bytes(&self) -> holon_core::Result<u64> {
+        self.objects
+            .max_object()
+            .map_err(|e| holon_core::Error::Cell(e.to_string()))
+    }
+
+    /// The id of the actor handling this message.
     #[inline]
     pub fn self_id(&self) -> ActorId {
         self.self_id
@@ -132,6 +214,17 @@ impl Cx<'_> {
     #[inline]
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    /// The largest [`Reply::Bytes`] body this ask can carry, in bytes: the
+    /// asker's reply chunk minus the envelope (`0` for a tell).
+    ///
+    /// Ask before encoding. A handler that over-runs this gets its task failed
+    /// rather than a truncated answer delivered as a whole one, so the budget
+    /// is a decision the handler makes up front, not a limit it discovers.
+    #[inline]
+    pub fn max_reply(&self) -> u32 {
+        self.reply_cap
     }
 }
 
@@ -321,28 +414,55 @@ impl ActorSystem {
         let tq: TaskQueueHandle = node.task_queue()?;
         let parker: DoorbellParker = tq.work_parker()?;
         let worker_id = tq.worker_id();
+        let side = TopicSide::open(&mut node).map_err(|e| Error::Topic(e.to_string()))?;
+        // Interned and opened before `node.store()` takes the borrow, exactly
+        // as the topic side is: `ObjectSide` is the half of the object store
+        // that needs the node, and `ObjectStore` is the half that needs the
+        // keyed store. Every actor in this process shares one.
+        let oside = ObjectSide::open(&mut node)?;
+        let registry = node.registry().clone();
         let store: KeyedStore<'_> = node.store()?;
         let store_ref = &store;
+        let topics = TopicLog::new(store_ref, &side, registry.clone());
+        let objects = ObjectStore::new(store_ref, &oside, registry);
+        let planes = Planes {
+            store: store_ref,
+            topics: &topics,
+            objects: &objects,
+        };
         let mut hosts = bind(actors);
         let msgs = MessagePool::new(store.data_segment().clone());
         let stopped = || stop.as_ref().is_some_and(|s| s.load(Ordering::Acquire));
+        // `HOLON_TRACE=1` prints handler errors (they cross the wire as a bare
+        // `Err` envelope, so this is the only place the text is visible).
+        let trace = std::env::var_os("HOLON_TRACE").is_some();
 
         loop {
             if stopped() {
                 return Ok(());
             }
+            // Idle workers re-check the stop flag every park cycle (the
+            // parker's timeout bounds the wait), so a system stops without
+            // needing one more message to arrive.
             let claimed = if spin {
                 loop {
                     if let Some(t) = tq.claim(lease_nanos) {
                         break t;
                     }
+                    if stopped() {
+                        return Ok(());
+                    }
                     std::hint::spin_loop();
                 }
             } else {
-                tq.queue()
-                    .claim_blocking_with_lease(worker_id, lease_nanos, &parker)
+                match tq
+                    .queue()
+                    .claim_once_parked(worker_id, lease_nanos, &parker)
+                {
+                    Some(t) => t,
+                    None => continue,
+                }
             };
-            let claimed_at = Instant::now();
             let req = claimed.request();
             let attempt = claimed.attempt();
 
@@ -355,10 +475,51 @@ impl ActorSystem {
                     continue;
                 }
             };
-            let outcome = route(&mut hosts, store_ref, &env, body, attempt);
+
+            // Resolve the asker's reply chunk BEFORE dispatch: its real size is
+            // the handler's byte budget, and its live generation says whether
+            // the asker is still there to read the answer.
+            let rdesc = if env.no_reply() {
+                None
+            } else {
+                // An ask names the asker's reply chunk; one without is malformed.
+                match env.payload_ref().map(|r| msgs.reply_desc(r)) {
+                    Some(Ok(d)) => Some(d),
+                    _ => {
+                        if claimed.fail().is_ok() {
+                            let _ = msgs.free(&req);
+                        }
+                        continue;
+                    }
+                }
+            };
+            // Epoch check. A reply chunk is loaned, so the only thing that can
+            // move its generation is a release — the asker's own, or the
+            // coordinator reclaiming a node it has declared dead. Either way
+            // the asker is gone: fail the task rather than write into a chunk
+            // that now belongs to someone else.
+            if let Some(d) = &rdesc {
+                if d.generation != env.reply_gen {
+                    if claimed.fail().is_ok() {
+                        let _ = msgs.free(&req);
+                    }
+                    continue;
+                }
+            }
+            let reply_cap = rdesc.as_ref().map_or(0, |d| d.len - ENVELOPE_SIZE as u32);
+
+            let outcome = route(&mut hosts, &planes, &env, body, attempt, reply_cap);
+            if let Err(e) = &outcome {
+                if trace {
+                    eprintln!(
+                        "[holon-actor] handler error to={:#x} schema={} attempt={attempt}: {e}",
+                        env.to, env.schema_id
+                    );
+                }
+            }
 
             // A tell: nothing to write back; complete/fail and free the request.
-            if env.no_reply() {
+            let Some(rdesc) = rdesc else {
                 let done = match outcome {
                     Ok(_) => claimed.complete(ChunkDesc::ZERO),
                     Err(_) => claimed.fail(),
@@ -367,35 +528,37 @@ impl ActorSystem {
                     let _ = msgs.free(&req);
                 }
                 continue;
-            }
-
-            // An ask names the asker's reply chunk; one without is malformed.
-            let Some(reply_ref) = env.payload_ref() else {
-                if claimed.fail().is_ok() {
-                    let _ = msgs.free(&req);
-                }
-                continue;
             };
-            // Time fence: past half the lease this claim may already have been
-            // reaped and redelivered, and the asker may have been answered by
-            // the successor and freed the chunk — do not write into it. The
-            // reap (re)delivers the message; the claim is left to lapse.
-            if claimed_at.elapsed() > lease / 2 {
-                continue;
+
+            // A body past the asker's chunk is refused, never truncated: a
+            // short answer that decodes is worse than no answer.
+            let over_cap = match &outcome {
+                Ok(Reply::Bytes(b)) => b.len() > reply_cap as usize,
+                _ => false,
+            };
+            if over_cap && trace {
+                eprintln!(
+                    "[holon-actor] reply too large to={:#x} schema={} cap={reply_cap}",
+                    env.to, env.schema_id
+                );
             }
-            let rdesc = msgs.reply_desc(reply_ref);
             let wrote = match &outcome {
                 Ok(Reply::Inline(b)) => msgs.write_message_into(
                     &rdesc,
                     &Envelope::reply_to(&env, b.schema_id(), b.len()),
                     b.bytes(),
                 ),
+                Ok(Reply::Bytes(b)) if !over_cap => msgs.write_message_into(
+                    &rdesc,
+                    &Envelope::reply_to(&env, b.schema_id(), b.len() as u16),
+                    b.bytes(),
+                ),
                 Ok(Reply::None) => {
                     msgs.write_message_into(&rdesc, &Envelope::reply_to(&env, 0, 0), &[])
                 }
-                Err(_) => msgs.write_message_into(&rdesc, &Envelope::err_to(&env), &[]),
+                _ => msgs.write_message_into(&rdesc, &Envelope::err_to(&env), &[]),
             };
-            let done = if outcome.is_ok() && wrote.is_ok() {
+            let done = if outcome.is_ok() && !over_cap && wrote.is_ok() {
                 claimed.complete(ChunkDesc::ZERO)
             } else {
                 claimed.fail()
@@ -409,13 +572,26 @@ impl ActorSystem {
     }
 }
 
+/// The three shared-memory planes every handler in this process is lent, built
+/// once in [`ActorSystem::run`] and borrowed by every [`Cx`].
+///
+/// A struct rather than three parameters because they are one thing — the
+/// process's view of the store — and because a fourth plane should not mean a
+/// fourth argument at every call site between `run` and a handler.
+struct Planes<'s> {
+    store: &'s KeyedStore<'s>,
+    topics: &'s TopicLog<'s>,
+    objects: &'s ObjectStore<'s>,
+}
+
 /// Validate the envelope's kind, find the host `to` names, and dispatch.
 fn route<'s>(
     hosts: &mut [(u64, Box<dyn Hosted<'s> + 's>)],
-    store: &'s KeyedStore<'s>,
+    planes: &Planes<'s>,
     env: &Envelope,
     body: &[u8],
     attempt: u32,
+    reply_cap: u32,
 ) -> holon_core::Result<Reply> {
     match env.kind()? {
         MessageKind::Tell | MessageKind::Ask => {}
@@ -426,11 +602,14 @@ fn route<'s>(
         .map_err(|_| holon_core::Error::NoSuchActor(env.to))?;
     let (id, host) = &mut hosts[i];
     let mut cx = Cx {
-        store,
+        store: planes.store,
+        topics: planes.topics,
+        objects: planes.objects,
         self_id: ActorId(*id),
         sender: env.from(),
         corr: env.corr,
         attempt,
+        reply_cap,
     };
     host.handle(env, body, &mut cx)
 }
@@ -443,29 +622,216 @@ pub struct ActorRef {
     tq: TaskQueueHandle,
     done_parker: DoorbellParker,
     msgs: MessagePool,
+    /// This node's borrow journal — the crash ledger every reply chunk is
+    /// recorded in, and the election that makes its release exactly-once.
+    journal_seg: Arc<Segment>,
+    /// The coordinator-issued id of this node, stamped as the reply chunk's
+    /// loan owner. It is what `reclaim_dead` compares against.
+    owner: u32,
     to: ActorId,
     from: ActorId,
     corr: AtomicU64,
     spin: bool,
+    /// Reply chunks of asks that were dropped before going terminal, with the
+    /// journal slot that owns each. A handler may still write into them, so
+    /// they are released only once the task is observed terminal
+    /// (`sweep_orphans`) — and through the journal election, never blind.
+    orphans: Mutex<Vec<(TaskHandle, ChunkDesc, usize)>>,
+}
+
+/// An ask in flight, started by [`ActorRef::ask_start`] and driven by
+/// [`ActorRef::ask_poll`] — the non-blocking half of the ask protocol that a
+/// reactor multiplexing many asks needs (ADR-0017 §2).
+///
+/// The reply chunk is owned by the asker. Dropping a `PendingAsk` before it
+/// went terminal does **not** free the chunk (a handler may still write into
+/// it); it is cancelled if still queued and otherwise parked as an orphan on
+/// the `ActorRef`, freed when observed terminal.
+#[derive(Debug)]
+pub struct PendingAsk {
+    handle: TaskHandle,
+    reply: ChunkDesc,
+    /// The journal slot the reply chunk was recorded in: the ownership token.
+    journal_slot: usize,
+    /// The request chunk. A worker frees this when it claims the task, so the
+    /// asker normally never touches it — but a cancel that wins the pre-claim
+    /// race means no worker ever will, and then this is the only handle left
+    /// to it.
+    request: ChunkDesc,
+    corr: u64,
+    done: bool,
+}
+
+impl PendingAsk {
+    /// The task handle (for diagnostics; opaque otherwise).
+    #[inline]
+    pub fn handle(&self) -> TaskHandle {
+        self.handle
+    }
+
+    /// The correlation id stamped in the request envelope.
+    #[inline]
+    pub fn corr(&self) -> u64 {
+        self.corr
+    }
+
+    /// The largest reply body this ask can carry, in bytes (the chunk the
+    /// asker allocated, minus the envelope).
+    #[inline]
+    pub fn reply_cap(&self) -> u32 {
+        self.reply.len - ENVELOPE_SIZE as u32
+    }
+}
+
+/// The asker's view of a by-reference reply: the reply chunk it allocated,
+/// loaned and journaled, borrowed **in place**.
+///
+/// [`bytes`](ReplyRef::bytes) points straight into the store's data segment;
+/// nothing is copied. The guard is what makes the release exactly-once across
+/// every exit path of the code that reads it, which a bare descriptor could
+/// not: dropping it runs the journal election and, if it wins, drops the loan
+/// and returns the chunk to the pool.
+pub struct ReplyRef<'a> {
+    msgs: &'a MessagePool,
+    journal_seg: &'a Arc<Segment>,
+    desc: ChunkDesc,
+    slot: usize,
+    env: Envelope,
+    body: &'a [u8],
+    released: bool,
+}
+
+impl<'a> ReplyRef<'a> {
+    /// The reply envelope.
+    #[inline]
+    pub fn envelope(&self) -> &Envelope {
+        &self.env
+    }
+
+    /// The reply body's schema id.
+    #[inline]
+    pub fn schema_id(&self) -> u32 {
+        self.env.schema_id
+    }
+
+    /// The reply body length in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Whether the reply body is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.body.is_empty()
+    }
+
+    /// The reply body, borrowed from the shared data segment.
+    #[inline]
+    pub fn bytes(&self) -> &'a [u8] {
+        self.body
+    }
+
+    /// Decode the body as the POD message `R`.
+    pub fn payload<R: Payload>(&self) -> Result<R> {
+        if self.env.schema_id != R::SCHEMA_ID {
+            return Err(holon_core::Error::SchemaMismatch {
+                expected: R::SCHEMA_ID,
+                got: self.env.schema_id,
+            }
+            .into());
+        }
+        Ok(R::from_bytes(self.body)?)
+    }
+
+    /// Release the chunk now instead of at drop. Identical work; explicit.
+    pub fn release(mut self) {
+        self.release_now();
+    }
+
+    fn release_now(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let _ = self
+            .msgs
+            .release_reply(&self.desc, self.slot, self.journal_seg);
+    }
+}
+
+impl Drop for ReplyRef<'_> {
+    fn drop(&mut self) {
+        self.release_now();
+    }
+}
+
+impl core::fmt::Debug for ReplyRef<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReplyRef")
+            .field("schema_id", &self.env.schema_id)
+            .field("len", &self.body.len())
+            .field("slot", &self.slot)
+            .finish()
+    }
 }
 
 impl ActorRef {
     /// Build a ref to `to` over `node` (maps the store + task queue on first
     /// use). `node` stays usable afterwards; the ref owns its own handles.
     pub fn new(node: &mut Node, to: ActorId) -> Result<ActorRef> {
-        let from = ActorId::new(0, node.actor_id());
+        let owner = node.actor_id();
+        let from = ActorId::new(0, owner);
         let tq = node.task_queue()?;
         let done_parker = tq.done_parker()?;
         let seg = node.store()?.data_segment().clone();
+        let journal_seg = node.journal_segment().clone();
         Ok(ActorRef {
             tq,
             done_parker,
             msgs: MessagePool::new(seg),
+            journal_seg,
+            owner,
             to,
             from,
             corr: AtomicU64::new(1),
             spin: false,
+            orphans: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The done-doorbell fd: readable when some task went terminal. A reactor
+    /// polls it alongside its sockets and then `ask_poll`s its pending asks.
+    /// Drain it with [`ActorRef::drain_done_fd`] after a wake.
+    #[inline]
+    pub fn done_fd(&self) -> RawFd {
+        self.done_parker.read_fd()
+    }
+
+    /// Drain the done doorbell (non-blocking) after `poll(2)` reported it
+    /// readable. The doorbell is level-signalled by bytes; leaving them makes
+    /// the next poll return immediately.
+    pub fn drain_done_fd(&self) {
+        let _ = shm_core::doorbell_park(self.done_parker.read_fd(), Duration::ZERO);
+    }
+
+    /// Register as a done-doorbell waiter (a reactor parks on
+    /// [`ActorRef::done_fd`] only after this, and re-polls its pending asks
+    /// in between — the lost-wakeup rule of `TaskQueue::wait`).
+    #[inline]
+    pub fn add_done_waiter(&self) {
+        self.tq.queue().add_done_waiter();
+    }
+
+    /// Pairs with [`ActorRef::add_done_waiter`].
+    #[inline]
+    pub fn remove_done_waiter(&self) {
+        self.tq.queue().remove_done_waiter();
+    }
+
+    /// Re-target this ref at another actor (same node, same queue).
+    pub fn retarget(&mut self, to: ActorId) {
+        self.to = to;
     }
 
     /// Busy-poll for replies instead of parking on the done doorbell.
@@ -493,27 +859,27 @@ impl ActorRef {
 
     /// Write the envelope chunk and submit it; returns the task handle and the
     /// correlation id stamped on the envelope.
-    fn submit(
+    fn submit_to(
         &self,
+        to: ActorId,
         kind: MessageKind,
         schema_id: u32,
         body: &[u8],
-        reply: Option<LocalRef>,
-    ) -> Result<(shm_task::TaskHandle, u64)> {
+        reply: Option<(LocalRef, u32)>,
+    ) -> Result<(TaskHandle, u64, ChunkDesc)> {
         let corr = match kind {
             MessageKind::Tell => 0,
             _ => self.corr.fetch_add(1, Ordering::Relaxed),
         };
         let deadline = now_nanos().wrapping_add(SUBMIT_HORIZON.as_nanos() as u64);
-        let mut env =
-            Envelope::inline(kind, self.to, self.from, corr, schema_id, body.len() as u16)
-                .with_deadline_nanos(deadline);
-        if let Some(r) = reply {
-            env = env.with_reply_ref(r);
+        let mut env = Envelope::inline(kind, to, self.from, corr, schema_id, body.len() as u16)
+            .with_deadline_nanos(deadline);
+        if let Some((r, generation)) = reply {
+            env = env.with_reply_ref(r, generation);
         }
         let desc = self.msgs.write_message(&env, body)?;
         match self.tq.submit(desc, deadline) {
-            Ok(h) => Ok((h, corr)),
+            Ok(h) => Ok((h, corr, desc)),
             Err(e) => {
                 let _ = self.msgs.free(&desc);
                 Err(e.into())
@@ -523,7 +889,13 @@ impl ActorRef {
 
     /// Fire-and-forget: one envelope chunk + one submit.
     pub fn tell<P: Payload>(&self, msg: &P) -> Result<()> {
-        self.submit(MessageKind::Tell, P::SCHEMA_ID, msg.as_bytes(), None)?;
+        self.submit_to(
+            self.to,
+            MessageKind::Tell,
+            P::SCHEMA_ID,
+            msg.as_bytes(),
+            None,
+        )?;
         Ok(())
     }
 
@@ -547,18 +919,264 @@ impl ActorRef {
     /// waits for the task to go terminal (a `StaleHandle` counts: the slot was
     /// reused, so it went terminal first), then reads and frees the reply chunk.
     pub fn ask_raw(&self, schema_id: u32, body: &[u8]) -> Result<(Envelope, Vec<u8>)> {
-        let reply = self.msgs.alloc_reply()?;
-        let rref = LocalRef(PackedRef::from_desc(&reply));
-        let (handle, corr) = match self.submit(MessageKind::Ask, schema_id, body, Some(rref)) {
-            Ok(v) => v,
+        self.ask_raw_to(self.to, schema_id, body)
+    }
+
+    /// [`ActorRef::ask_raw`] addressed to `to` instead of this ref's target.
+    pub fn ask_raw_to(
+        &self,
+        to: ActorId,
+        schema_id: u32,
+        body: &[u8],
+    ) -> Result<(Envelope, Vec<u8>)> {
+        let mut pending = self.ask_start_to(to, schema_id, body)?;
+        let terminal = match self.await_terminal(&pending) {
+            Ok(t) => t,
+            Err(e) => {
+                // Unknown state: keep the chunk until observed terminal.
+                self.orphan(&mut pending);
+                return Err(e.into());
+            }
+        };
+        self.finish(&mut pending, terminal)
+    }
+
+    /// Start an ask without waiting: allocate the reply chunk, submit, and
+    /// hand back the [`PendingAsk`] to drive with [`ActorRef::ask_poll`].
+    pub fn ask_start(&self, schema_id: u32, body: &[u8]) -> Result<PendingAsk> {
+        self.ask_start_to(self.to, schema_id, body)
+    }
+
+    /// [`ActorRef::ask_start`] addressed to `to`.
+    pub fn ask_start_to(&self, to: ActorId, schema_id: u32, body: &[u8]) -> Result<PendingAsk> {
+        self.ask_start_sized(to, schema_id, body, DEFAULT_REPLY_BODY)
+    }
+
+    /// [`ActorRef::ask_start_to`] with an explicit reply-body cap in bytes:
+    /// allocate a chunk for `64 + max_reply`, loan it to this node, journal it,
+    /// and name it (with its generation) in the request envelope.
+    ///
+    /// Failures are all real and none are silent: `LayoutOverflow` when no size
+    /// class fits `max_reply` (a deployment shaped its store pool too small —
+    /// never a truncated answer), `PoolExhausted` when the pool is full, and
+    /// `JournalFull` as backpressure when this node already holds every borrow
+    /// slot. Every arm unwinds the loan, the journal record and the chunk.
+    pub fn ask_start_sized(
+        &self,
+        to: ActorId,
+        schema_id: u32,
+        body: &[u8],
+        max_reply: u32,
+    ) -> Result<PendingAsk> {
+        // One envelope describes one body through a `u16` `body_len`, so a cap
+        // past that could not be honoured — refuse it here rather than promise
+        // a handler capacity the reply envelope cannot express.
+        if max_reply as usize > MAX_REPLY_BODY {
+            return Err(Error::ReplyTooLarge {
+                got: max_reply as usize,
+                cap: MAX_REPLY_BODY,
+            });
+        }
+        let reply = self.msgs.alloc_reply(max_reply)?;
+        let slot = match self.msgs.loan_reply(&reply, self.owner, &self.journal_seg) {
+            Ok(slot) => slot,
             Err(e) => {
                 let _ = self.msgs.free(&reply);
                 return Err(e);
             }
         };
-        let terminal = if self.spin {
+        let rref = LocalRef(PackedRef::from_desc(&reply));
+        match self.submit_to(
+            to,
+            MessageKind::Ask,
+            schema_id,
+            body,
+            Some((rref, reply.generation)),
+        ) {
+            Ok((handle, corr, request)) => Ok(PendingAsk {
+                handle,
+                reply,
+                journal_slot: slot,
+                request,
+                corr,
+                done: false,
+            }),
+            Err(e) => {
+                let _ = self.msgs.release_reply(&reply, slot, &self.journal_seg);
+                Err(e)
+            }
+        }
+    }
+
+    /// A tell addressed to `to`.
+    pub fn tell_raw_to(&self, to: ActorId, schema_id: u32, body: &[u8]) -> Result<()> {
+        self.submit_to(to, MessageKind::Tell, schema_id, body, None)?;
+        Ok(())
+    }
+
+    /// Poll a pending ask. `Ok(None)` = still in flight. `Ok(Some(..))` /
+    /// `Err(..)` = terminal; the reply chunk has been freed and the
+    /// `PendingAsk` must not be polled again.
+    pub fn ask_poll(&self, pending: &mut PendingAsk) -> Result<Option<(Envelope, Vec<u8>)>> {
+        match self.poll_terminal(pending)? {
+            Some(terminal) => self.finish(pending, terminal).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// `true` when the ask is terminal (a following `ask_poll` will not
+    /// return `Ok(None)`). Does not consume anything.
+    pub fn ask_ready(&self, pending: &PendingAsk) -> bool {
+        !matches!(
+            self.tq.queue().poll(pending.handle),
+            Ok(TaskStatus::Queued | TaskStatus::Claimed)
+        )
+    }
+
+    /// Free the reply chunks of dropped asks that have since gone terminal.
+    /// NOT called implicitly: `holon-net`'s reactor calls it each pass, and any other caller that abandons asks must call it too or its orphaned reply chunks are only reclaimed when the node dies; a reactor may call it on a
+    /// timer too. Returns how many were freed.
+    pub fn sweep_orphans(&self) -> usize {
+        let mut orphans = self.orphans.lock().expect("orphans poisoned");
+        let before = orphans.len();
+        orphans.retain(|(h, desc, slot)| match self.tq.queue().poll(*h) {
+            Ok(TaskStatus::Queued | TaskStatus::Claimed) => true,
+            _ => {
+                let _ = self.msgs.release_reply(desc, *slot, &self.journal_seg);
+                false
+            }
+        });
+        before - orphans.len()
+    }
+
+    /// Number of orphaned reply chunks still waiting for their task to end.
+    pub fn orphan_count(&self) -> usize {
+        self.orphans.lock().expect("orphans poisoned").len()
+    }
+
+    fn orphan(&self, pending: &mut PendingAsk) {
+        if pending.done {
+            return;
+        }
+        pending.done = true;
+        // Still queued: cancel wins → terminal now → release now. A won
+        // pre-claim cancel also means the task will never be claimed, so no
+        // worker will ever free the request chunk; without this the chunk is
+        // lost for the life of the coordinator, and a peer that fires asks and
+        // disconnects drains the store pool monotonically.
+        if let Ok(true) = self.tq.queue().cancel(pending.handle) {
+            let _ = self.msgs.free(&pending.request);
+        }
+        match self.tq.queue().poll(pending.handle) {
+            Ok(TaskStatus::Queued | TaskStatus::Claimed) => self
+                .orphans
+                .lock()
+                .expect("orphans poisoned")
+                .push((pending.handle, pending.reply, pending.journal_slot)),
+            _ => {
+                let _ = self.msgs.release_reply(
+                    &pending.reply,
+                    pending.journal_slot,
+                    &self.journal_seg,
+                );
+            }
+        }
+    }
+
+    fn finish(&self, pending: &mut PendingAsk, terminal: Outcome) -> Result<(Envelope, Vec<u8>)> {
+        let guard = self.finish_ref(pending, terminal)?;
+        Ok((*guard.envelope(), guard.bytes().to_vec()))
+    }
+
+    /// The by-reference half of [`finish`](Self::finish): read the reply chunk
+    /// in place and hand back the guard that owns it.
+    ///
+    /// On the success path nothing is freed — the guard does that on drop. On
+    /// every failing path the chunk is released here, through the journal
+    /// election, before the error is returned.
+    fn finish_ref(&self, pending: &mut PendingAsk, terminal: Outcome) -> Result<ReplyRef<'_>> {
+        pending.done = true;
+        let release = |e: Error| -> Error {
+            let _ =
+                self.msgs
+                    .release_reply(&pending.reply, pending.journal_slot, &self.journal_seg);
+            e
+        };
+        match terminal {
+            Outcome::Cancelled => return Err(release(Error::Cancelled)),
+            Outcome::Failed => return Err(release(Error::Failed)),
+            Outcome::Done(_) => {}
+        }
+        // A chunk nobody wrote (zeroed) fails validation: the task went
+        // terminal without a handler answering (reaped out of retries).
+        let (renv, rbody) = match self.msgs.read_message(&pending.reply) {
+            Ok(v) => v,
+            Err(_) => return Err(release(Error::Failed)),
+        };
+        match renv.kind()? {
+            MessageKind::Reply if renv.corr == pending.corr => Ok(ReplyRef {
+                msgs: &self.msgs,
+                journal_seg: &self.journal_seg,
+                desc: pending.reply,
+                slot: pending.journal_slot,
+                env: renv,
+                body: rbody,
+                released: false,
+            }),
+            MessageKind::Err if renv.corr == pending.corr => Err(release(Error::Failed)),
+            _ => Err(release(Error::BadReply {
+                kind: renv.kind,
+                got: renv.corr,
+                expected: pending.corr,
+            })),
+        }
+    }
+
+    /// Request/reply **by reference**: the answer stays in the reply chunk this
+    /// ref allocated, and the guard borrows those bytes in place.
+    ///
+    /// `max_reply` is the body cap in bytes; the chunk allocated holds
+    /// `64 + max_reply` rounded up to a pool size class, and the handler is
+    /// told the real figure through [`Cx::max_reply`].
+    pub fn ask_ref(&self, schema_id: u32, body: &[u8], max_reply: u32) -> Result<ReplyRef<'_>> {
+        self.ask_ref_to(self.to, schema_id, body, max_reply)
+    }
+
+    /// [`ActorRef::ask_ref`] addressed to `to`.
+    pub fn ask_ref_to(
+        &self,
+        to: ActorId,
+        schema_id: u32,
+        body: &[u8],
+        max_reply: u32,
+    ) -> Result<ReplyRef<'_>> {
+        let mut pending = self.ask_start_sized(to, schema_id, body, max_reply)?;
+        let terminal = match self.await_terminal(&pending) {
+            Ok(t) => t,
+            Err(e) => {
+                // Unknown state: keep the chunk until observed terminal.
+                self.orphan(&mut pending);
+                return Err(e.into());
+            }
+        };
+        self.finish_ref(&mut pending, terminal)
+    }
+
+    /// [`ActorRef::ask_poll`] by reference: `Ok(None)` = still in flight;
+    /// `Ok(Some(guard))` = the answer, borrowed in place.
+    pub fn ask_poll_ref(&self, pending: &mut PendingAsk) -> Result<Option<ReplyRef<'_>>> {
+        match self.poll_terminal(pending)? {
+            Some(terminal) => self.finish_ref(pending, terminal).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Block until `pending`'s task is terminal. A `StaleHandle` counts: the
+    /// slot was reused, which only happens after it went terminal.
+    fn await_terminal(&self, pending: &PendingAsk) -> core::result::Result<Outcome, TaskError> {
+        if self.spin {
             loop {
-                match self.tq.queue().poll(handle) {
+                match self.tq.queue().poll(pending.handle) {
                     Ok(TaskStatus::Done(_)) => break Ok(Outcome::Done(ChunkDesc::ZERO)),
                     Ok(TaskStatus::Failed) => break Ok(Outcome::Failed),
                     Ok(TaskStatus::Cancelled) => break Ok(Outcome::Cancelled),
@@ -568,30 +1186,35 @@ impl ActorRef {
                 }
             }
         } else {
-            match self.tq.queue().wait(handle, &self.done_parker) {
+            match self.tq.queue().wait(pending.handle, &self.done_parker) {
                 Err(TaskError::StaleHandle) => Ok(Outcome::Done(ChunkDesc::ZERO)),
                 other => other,
             }
-        };
-        // Whatever happened, the reply chunk is ours: read it, then free it.
-        let read = self.msgs.read_message(&reply).map(|(e, b)| (e, b.to_vec()));
-        let _ = self.msgs.free(&reply);
-        match terminal? {
-            Outcome::Cancelled => return Err(Error::Cancelled),
-            Outcome::Failed => return Err(Error::Failed),
-            Outcome::Done(_) => {}
         }
-        // A chunk nobody wrote (zeroed) fails validation: the task went
-        // terminal without a handler answering (reaped out of retries).
-        let (renv, rbody) = read.map_err(|_| Error::Failed)?;
-        match renv.kind()? {
-            MessageKind::Reply if renv.corr == corr => Ok((renv, rbody)),
-            MessageKind::Err if renv.corr == corr => Err(Error::Failed),
-            _ => Err(Error::BadReply {
-                kind: renv.kind,
-                got: renv.corr,
-                expected: corr,
-            }),
+    }
+
+    /// One non-blocking look at `pending`'s task. `Ok(None)` = still in flight.
+    /// An unknown state orphans the ask (its chunk is kept until terminal).
+    fn poll_terminal(&self, pending: &mut PendingAsk) -> Result<Option<Outcome>> {
+        if pending.done {
+            return Err(Error::Failed);
         }
+        Ok(Some(match self.tq.queue().poll(pending.handle) {
+            Ok(TaskStatus::Done(_)) => Outcome::Done(ChunkDesc::ZERO),
+            Ok(TaskStatus::Failed) => Outcome::Failed,
+            Ok(TaskStatus::Cancelled) => Outcome::Cancelled,
+            Ok(TaskStatus::Queued | TaskStatus::Claimed) => return Ok(None),
+            // The slot was reused: that only happens after terminal.
+            Err(TaskError::StaleHandle) => Outcome::Done(ChunkDesc::ZERO),
+            Err(e) => {
+                self.orphan(pending);
+                return Err(e.into());
+            }
+        }))
+    }
+
+    /// Abandon a pending ask (connection gone). Safe at any point.
+    pub fn ask_abandon(&self, mut pending: PendingAsk) {
+        self.orphan(&mut pending);
     }
 }
