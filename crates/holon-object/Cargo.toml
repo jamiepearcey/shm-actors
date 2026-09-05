@@ -16,6 +16,8 @@ shm-stream = { workspace = true }
 shm-runtime = { workspace = true }
 holon-topic = { workspace = true }
 arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-data = { workspace = true }
 arrow-schema = { workspace = true }
 thiserror = { workspace = true }
 

@@ -139,6 +139,16 @@ struct CoordState {
     /// coordinator's reap backstop (ADR-0010 P0.3 observability).
     task_bindings_reclaimed: u64,
     created_seg_ids: Vec<u32>,
+    /// Dedicated payload segments, by id: one large object each.
+    ///
+    /// Coordinator-owned so a segment outlives the actor that asked for it —
+    /// the object is the thing with the lifetime, not the writer. Kept mapped
+    /// so the fd stays grantable to later readers.
+    payload_segments: HashMap<u32, Arc<Segment>>,
+    /// Payload segment slots handed out, and slots returned for reuse. Ids are
+    /// recycled because the range is bounded.
+    next_payload_slot: u32,
+    free_payload_slots: Vec<u32>,
     /// Master schema catalog (ADR-0003 item E): the process-independent
     /// [`shm_arrow::schema_content_hash`] → issued `schema_id`. The coordinator
     /// is the *authoritative* registry; nodes cache their learned mappings
@@ -291,6 +301,9 @@ impl Coordinator {
             state: Mutex::new(CoordState {
                 next_actor_id: 1,
                 next_topic_index: 0,
+                payload_segments: HashMap::new(),
+                next_payload_slot: 0,
+                free_payload_slots: Vec::new(),
                 next_artifact_index: 0,
                 next_name_id: 1,
                 actors: HashMap::new(),
@@ -600,6 +613,15 @@ impl Coordinator {
         self.shared.task_queue.reap(now_nanos)
     }
 
+    /// How many dedicated payload segments are live.
+    ///
+    /// The census for the large-object path: a segment that outlives its owner
+    /// shows up here, which is what makes the crash story testable rather than
+    /// asserted.
+    pub fn payload_segments_live(&self) -> usize {
+        self.shared.state.lock().unwrap().payload_segments.len()
+    }
+
     /// Drive one keyed-store tombstone sweep, returning how many slots it
     /// returned to the free list (ADR-0008 P0.1). Exposes the exact path the
     /// monitor runs, for deterministic same-process tests.
@@ -717,6 +739,12 @@ fn handle_connection(shared: Arc<CoordShared>, stream: UnixStream) -> Result<()>
             Request::OpenTaskQueue => {
                 grant_task_queue(&shared, &stream)?;
             }
+            Request::CreatePayloadSegment { bytes } => {
+                grant_payload_segment(&shared, bytes, &stream)?;
+            }
+            Request::ReleasePayloadSegment { seg_id } => {
+                release_payload_segment(&shared, seg_id);
+            }
             Request::InternSchema { schema_bytes } => {
                 let schema_id = intern_schema(&shared, &schema_bytes);
                 let resp = Response::SchemaInterned { schema_id };
@@ -803,6 +831,83 @@ fn register_actor(shared: &Arc<CoordShared>, name: &str, stream: &UnixStream) ->
     let fds = [shared.payload_seg.as_raw_fd(), journal_seg.as_raw_fd()];
     send_frame(stream, &resp.encode(), &fds)?;
     Ok(actor_id)
+}
+
+/// Release a dedicated payload segment: unlink it and recycle its id.
+///
+/// One place, called both by an explicit
+/// [`Request::ReleasePayloadSegment`] and by journal replay after the owner
+/// died, so a crashed writer's segment is reclaimed by the same ledger that
+/// reclaims every other borrow rather than surviving until shutdown.
+fn release_payload_segment(shared: &Arc<CoordShared>, seg_id: u32) -> bool {
+    let mut st = shared.state.lock().unwrap();
+    let Some(seg) = st.payload_segments.remove(&seg_id) else {
+        return false;
+    };
+    // Existing mappings stay valid; the name simply stops resolving.
+    let _ = seg.unlink();
+    if let Some(slot) = seg_id.checked_sub(shared.config.payload_object_seg_id(0)) {
+        st.free_payload_slots.push(slot);
+    }
+    true
+}
+
+/// Create a dedicated segment for one large payload and grant its fd.
+///
+/// The large-object path, and the same split a process allocator makes: small
+/// values come from the shared pool's size classes, a large one gets its own
+/// mapping. Contiguous by construction, and it cannot fragment the shared arena
+/// because it is never carved out of it.
+///
+/// **Reclamation is explicit.** The segment is released by
+/// [`Request::ReleasePayloadSegment`] or when the coordinator shuts down. It is
+/// deliberately not tied to the requesting actor's lifetime — the object
+/// outlives the writer — which means an actor that dies without releasing leaks
+/// one segment until shutdown. That is bounded by
+/// [`MAX_PAYLOAD_SEGMENTS`](crate::config::MAX_PAYLOAD_SEGMENTS) and is the one
+/// gap in this path's crash story.
+fn grant_payload_segment(shared: &Arc<CoordShared>, bytes: u64, stream: &UnixStream) -> Result<()> {
+    let (seg_id, fd, len) = {
+        let mut st = shared.state.lock().unwrap();
+        let slot = match st.free_payload_slots.pop() {
+            Some(s) => s,
+            None => {
+                let s = st.next_payload_slot;
+                if s >= crate::config::MAX_PAYLOAD_SEGMENTS {
+                    let resp = Response::Error {
+                        message: format!(
+                            "payload segments exhausted ({} live)",
+                            crate::config::MAX_PAYLOAD_SEGMENTS
+                        ),
+                    };
+                    send_frame(stream, &resp.encode(), &[])?;
+                    return Ok(());
+                }
+                st.next_payload_slot = s + 1;
+                s
+            }
+        };
+        let seg_id = shared.config.payload_object_seg_id(slot);
+        let want = shm_core::segment::HEADER_SIZE + bytes as usize;
+        let seg = match create_segment(seg_id, want) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                st.free_payload_slots.push(slot);
+                let resp = Response::Error {
+                    message: format!("payload segment: {e}"),
+                };
+                send_frame(stream, &resp.encode(), &[])?;
+                return Ok(());
+            }
+        };
+        let fd = seg.as_raw_fd();
+        let len = seg.size() as u64;
+        st.payload_segments.insert(seg_id, seg);
+        (seg_id, fd, len)
+    };
+    let resp = Response::PayloadSegmentGranted { seg_id, len };
+    send_frame(stream, &resp.encode(), &[fd])?;
+    Ok(())
 }
 
 /// Ensure a topic's ring segment (and doorbell) exists and pass their fds to
@@ -1339,6 +1444,14 @@ fn reclaim_dead(
                     write_leases += 1;
                 }
             }
+            JournalRecord::PayloadSegment { segment_id } => {
+                // The owner died holding a dedicated segment. Nothing in the
+                // pool describes it, so `reclaim_one` would never see it; this
+                // is the only thing that frees it.
+                if release_payload_segment(shared, segment_id) {
+                    artifact_pins += 1;
+                }
+            }
             JournalRecord::StagedManifest {
                 artifact_id,
                 incarnation,
@@ -1460,9 +1573,13 @@ pub(crate) fn replay_and_reclaim(
         .replay()
         .filter_map(|rec| match rec {
             JournalRecord::ChunkPin(desc) => reclaim_one(pool, &desc, actor_id),
+            // This helper only knows one pool. Artifact-scoped records and a
+            // dedicated segment are reclaimed by the coordinator's own replay,
+            // which can reach the artifact registry and the segment table.
             JournalRecord::ArtifactPin { .. }
             | JournalRecord::WriteLease { .. }
-            | JournalRecord::StagedManifest { .. } => None,
+            | JournalRecord::StagedManifest { .. }
+            | JournalRecord::PayloadSegment { .. } => None,
         })
         .collect()
 }

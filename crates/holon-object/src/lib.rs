@@ -82,6 +82,9 @@ const PUT_RETRIES: u32 = 64;
 /// Errors of the object store.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The store's pool has no size class big enough to hold one segment.
+    #[error("no usable size class for an object segment")]
+    NoUsableClass,
     /// The producer handed to [`ObjectStore::write_with`] failed, or staging a
     /// segment did. Nothing was installed.
     #[error("streaming write failed: {0}")]
@@ -188,6 +191,9 @@ pub fn object_schema() -> SchemaRef {
 
 /// Build the one-row batch for **one segment** of an object.
 ///
+/// Crate-private: see [`borrowed_buffer`] for why the visibility is the
+/// soundness argument.
+///
 /// One row per batch, and one batch per segment, deliberately. Splitting a
 /// payload across *rows* does not raise the ceiling: Arrow lays a `Binary`
 /// column's values out back to back in a single contiguous values buffer, so N
@@ -197,15 +203,69 @@ pub fn object_schema() -> SchemaRef {
 ///
 /// `content_type` is repeated in every segment; it is the object's, not the
 /// segment's, and readers take it from the first.
-pub fn encode_segment(schema: &SchemaRef, content_type: &str, data: &[u8]) -> RecordBatch {
+pub(crate) fn encode_segment(schema: &SchemaRef, content_type: &str, data: &[u8]) -> RecordBatch {
+    // `BinaryArray::from(vec![data])` would copy the whole payload into an
+    // Arrow-owned buffer, and `write_batch_chunks` then copies that into the
+    // chunk — two passes over every byte for one stored object. Measured on a
+    // 16 MiB put: 225 us each, together 98.5% of the call, against a 221 us
+    // raw-memcpy floor. So the values buffer is built as a *view* of the
+    // caller's bytes and only the copy into shared memory remains.
+    let values = borrowed_buffer(data);
+    let offsets = arrow_buffer::Buffer::from_slice_ref([0i32, data.len() as i32]);
+    // SAFETY: the layout is Binary's own — one i32 offsets buffer of two
+    // entries for one row, and a values buffer of exactly `data.len()` bytes,
+    // which is what the offsets describe. No nulls, so no validity buffer.
+    let array = unsafe {
+        arrow_data::ArrayData::new_unchecked(
+            DataType::Binary,
+            1,
+            Some(0),
+            None,
+            0,
+            vec![offsets, values],
+            vec![],
+        )
+    };
     RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(StringArray::from(vec![content_type])),
-            Arc::new(BinaryArray::from(vec![data])),
+            Arc::new(BinaryArray::from(array)),
         ],
     )
     .expect("two same-length columns matching the object schema")
+}
+
+/// An Arrow buffer that *borrows* `data` instead of copying it.
+///
+/// **Crate-private on purpose.** The soundness argument is that the batch never
+/// outlives the call that built it — it is written into a chunk and dropped —
+/// and that is only checkable while every caller is in this file. Exporting
+/// [`encode_segment`] would let a caller hold the batch past the slice it
+/// borrows, which is undefined behaviour that no test would catch. If this ever
+/// needs to be public it must return something that ties the two lifetimes
+/// together, not a bare `RecordBatch`.
+fn borrowed_buffer(data: &[u8]) -> arrow_buffer::Buffer {
+    // `Allocation` is blanket-implemented for anything Send + Sync + unwind
+    // safe, so an empty guard is all that is needed: it owns nothing and frees
+    // nothing when the buffer drops.
+    struct NoOp;
+
+    if data.is_empty() {
+        return arrow_buffer::Buffer::from_vec(Vec::<u8>::new());
+    }
+    let keep: Arc<dyn arrow_buffer::alloc::Allocation> = Arc::new(NoOp);
+    // SAFETY: `ptr` is `data`'s own base, non-null because `data` is non-empty,
+    // and `data.len()` bytes are readable and immutable for the lifetime of the
+    // borrow. The buffer is consumed within this call, so it cannot outlive
+    // `data`.
+    unsafe {
+        arrow_buffer::Buffer::from_custom_allocation(
+            std::ptr::NonNull::new_unchecked(data.as_ptr() as *mut u8),
+            data.len(),
+            keep,
+        )
+    }
 }
 
 /// Split a one-row object batch into its two columns.
@@ -427,30 +487,17 @@ impl<'a> ObjectStore<'a> {
     pub fn max_object(&self) -> Result<u64> {
         let pool =
             shm_core::Pool::attach(self.store.data_segment()).map_err(shm_store::Error::from)?;
-        let cap = pool.max_chunk_size();
-        // Chunks of the largest class, one of which the manifest itself takes.
-        let class_chunks = (0..pool.num_classes())
+        let ct = " ".repeat(MAX_CONTENT_TYPE);
+        let (size, per_segment) = self.best_class(&ct)?;
+        let count = (0..pool.num_classes())
             .filter_map(|i| pool.class_info(i))
-            .find(|(size, _)| *size == cap)
-            .map(|(_, count)| count as usize)
-            .unwrap_or(0)
-            .saturating_sub(1);
-        // Segments whose descriptors + spans still fit one manifest chunk.
-        // `manifest_len` is monotone in the segment count, so bisect it rather
-        // than assume a closed form for a layout `shm-artifact` owns.
-        let (mut lo, mut hi) = (0usize, cap as usize);
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            if shm_artifact::manifest_len(mid, mid, 0) <= cap as usize {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        let by_manifest = lo;
-        let segments = by_manifest.min(class_chunks);
-        let per_segment = self.segment_size(&" ".repeat(MAX_CONTENT_TYPE))?;
-        Ok(segments as u64 * per_segment as u64)
+            .find(|(s, _)| *s == size)
+            .map(|(_, c)| c as usize)
+            .unwrap_or(0);
+        let usable = count
+            .saturating_sub(1)
+            .min(Self::segments_per_manifest(pool.max_chunk_size()));
+        Ok(usable as u64 * per_segment as u64)
     }
 
     /// The largest `data` slice one segment can carry: the chunk cap less the
@@ -460,11 +507,66 @@ impl<'a> ObjectStore<'a> {
     /// an empty segment, so nothing here is a guess or a hardcoded fraction, and
     /// each segment lands in exactly one chunk.
     fn segment_size(&self, content_type: &str) -> Result<usize> {
-        let cap = self.max_payload()? as usize;
+        Ok(self.best_class(content_type)?.1)
+    }
+
+    /// The size class to cut segments from, and the payload one segment holds.
+    ///
+    /// **Not the largest class.** A segment takes one whole chunk, so the
+    /// object's ceiling is `usable chunks x payload per segment`, and the
+    /// largest class is often not the one that maximises it: a pool typically
+    /// gives its biggest class very few chunks. RAE's shape has four 8 MiB
+    /// chunks and eight of 4 MiB, so cutting at 8 MiB yields three segments
+    /// (one chunk holds the manifest) for 24 MiB, while cutting at 4 MiB yields
+    /// seven for 28 MiB — a bigger object from a smaller chunk.
+    ///
+    /// Ties go to the larger chunk: fewer, bigger segments mean a shorter
+    /// manifest and fewer descriptors to walk on every read.
+    fn best_class(&self, content_type: &str) -> Result<(u32, usize)> {
+        let pool =
+            shm_core::Pool::attach(self.store.data_segment()).map_err(shm_store::Error::from)?;
         let probe = encode_segment(&self.side.schema, content_type, &[]);
         let overhead =
             shm_arrow::serialized_len(&probe).expect("the object schema is serializable");
-        Ok(cap.saturating_sub(overhead).max(1))
+        let by_manifest = Self::segments_per_manifest(pool.max_chunk_size());
+
+        let mut best: Option<(u64, u32, usize)> = None;
+        for i in 0..pool.num_classes() {
+            let Some((size, count)) = pool.class_info(i) else {
+                continue;
+            };
+            let per_segment = (size as usize).saturating_sub(overhead);
+            if per_segment == 0 || count == 0 {
+                continue;
+            }
+            // One chunk of *some* class holds the manifest; charging it to this
+            // class is the conservative reading and keeps the number honest for
+            // a pool whose classes are unevenly stocked.
+            let usable = (count as usize).saturating_sub(1).min(by_manifest);
+            let reach = usable as u64 * per_segment as u64;
+            if best.is_none_or(|(r, s, _)| reach > r || (reach == r && size > s)) {
+                best = Some((reach, size, per_segment));
+            }
+        }
+        let (_, size, per_segment) = best.ok_or(Error::NoUsableClass)?;
+        Ok((size, per_segment.max(1)))
+    }
+
+    /// How many segments' descriptors and spans fit one manifest chunk.
+    ///
+    /// `manifest_len` is monotone in the segment count, so this bisects rather
+    /// than assuming a closed form for a layout `shm-artifact` owns.
+    fn segments_per_manifest(cap: u32) -> usize {
+        let (mut lo, mut hi) = (0usize, cap as usize);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if shm_artifact::manifest_len(mid, mid, 0) <= cap as usize {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
     }
 
     /// Get-or-create the entry for `key`. Only [`put`](Self::put) takes this
@@ -576,6 +678,17 @@ impl<'a> ObjectStore<'a> {
     /// to the pool) and installs nothing, so the pool census returns to exactly
     /// where it was and the object keeps the version it had.
     fn install(&self, entry: &Entry, content_type: &str, parts: &[&[u8]]) -> Result<u64> {
+        self.install_coordinated(entry, content_type, parts, Coordination::Exclusive)
+    }
+
+    fn install_coordinated(
+        &self,
+        entry: &Entry,
+        content_type: &str,
+        parts: &[&[u8]],
+        coordination: Coordination,
+    ) -> Result<u64> {
+        let optimistic = matches!(coordination, Coordination::Optimistic { .. });
         let journal = BorrowJournal::attach(self.store.journal_segment())?;
         let mut tries = 0u32;
         loop {
@@ -586,10 +699,10 @@ impl<'a> ObjectStore<'a> {
                 &self.registry,
                 self.store.owner(),
                 Commit::Replace,
-                Coordination::Exclusive,
+                coordination,
             ) {
                 Ok(w) => w,
-                Err(e) if is_contention(&e) => {
+                Err(e) if is_contention(&e, optimistic) => {
                     if tries >= PUT_RETRIES {
                         return Err(Error::Contended(tries));
                     }
@@ -614,7 +727,7 @@ impl<'a> ObjectStore<'a> {
                 Ok(v) => return Ok(v),
                 // The install itself lost the lease (fenced/contended); the
                 // staged chunks were already returned to the pool by the commit.
-                Err(e) if is_contention(&e) => {
+                Err(e) if is_contention(&e, optimistic) => {
                     if tries >= PUT_RETRIES {
                         return Err(Error::Contended(tries));
                     }
@@ -624,6 +737,55 @@ impl<'a> ObjectStore<'a> {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// Replace `key` only if its current version is still `expect`.
+    ///
+    /// The compare-and-set a read-modify-write needs. Without it, two writers
+    /// that each read a value, change it and write it back silently lose one of
+    /// the two updates — which is exactly how a shared index loses an entry.
+    ///
+    /// `expect` of 0 means "only if this key holds no version yet", so a
+    /// create can be made to fail rather than clobber.
+    ///
+    /// Returns [`Error::VersionMismatch`] when it lost: the caller re-reads and
+    /// retries. Nothing is installed and no chunk is left staged.
+    pub fn put_if(&self, key: &str, content_type: &str, bytes: &[u8], expect: u64) -> Result<u64> {
+        check_content_type(content_type)?;
+        let (entry, kid) = self.entry_or_create(key)?;
+        let seg = self.segment_size(content_type)?;
+        let parts: Vec<&[u8]> = if bytes.is_empty() {
+            vec![&[]]
+        } else {
+            bytes.chunks(seg).collect()
+        };
+        let version = match self.install_coordinated(
+            &entry,
+            content_type,
+            &parts,
+            Coordination::Optimistic {
+                expect_version: expect,
+            },
+        ) {
+            Ok(v) => v,
+            Err(Error::Stream(shm_stream::Error::Artifact(shm_artifact::Error::Conflict {
+                ..
+            })))
+            | Err(Error::Store(shm_store::Error::Artifact(shm_artifact::Error::Conflict {
+                ..
+            }))) => {
+                return Err(Error::VersionMismatch {
+                    requested: expect,
+                    current: entry.current_version(),
+                })
+            }
+            Err(e) => return Err(e),
+        };
+        let _ =
+            self.side
+                .events
+                .publish_event(VersionEvent::new(kid, version, CommitKind::Replace));
+        Ok(version)
     }
 
     /// Write an object by **streaming into it**, never materialising the whole
@@ -750,13 +912,19 @@ impl<'a> ObjectStore<'a> {
 
 /// Whether a staging/commit failure is a lost race for the entry's write lease
 /// — the one class of failure a `put` retries.
-fn is_contention(e: &shm_stream::Error) -> bool {
-    matches!(
-        e,
-        shm_stream::Error::Artifact(
-            shm_artifact::Error::WriteLocked | shm_artifact::Error::Conflict { .. }
-        )
-    )
+/// Is this worth retrying?
+///
+/// A lost **write lease** is: another writer holds it and will let go. A lost
+/// **install CAS** is only contention when nobody asked for a precondition —
+/// under [`Coordination::Optimistic`] a `Conflict` IS the answer, and retrying
+/// it would turn a compare-and-set into a loop that eventually overwrites the
+/// value the caller was guarding against.
+fn is_contention(e: &shm_stream::Error, optimistic: bool) -> bool {
+    match e {
+        shm_stream::Error::Artifact(shm_artifact::Error::WriteLocked) => true,
+        shm_stream::Error::Artifact(shm_artifact::Error::Conflict { .. }) => !optimistic,
+        _ => false,
+    }
 }
 
 /// Where [`ObjectStore::write_with`]'s producer writes.
@@ -1448,5 +1616,240 @@ mod tests {
             "a streamed write leaked: {:?} vs {baseline}",
             coord.store_data_free_total()
         );
+    }
+
+    #[test]
+    fn the_segment_class_is_chosen_by_reach_not_by_size() {
+        // A pool shaped like RAE's: a few very large chunks, more medium ones.
+        // Cutting at the largest class would give 3 segments (one chunk pays for
+        // the manifest); the 4 MiB class gives 7. The bigger object comes from
+        // the smaller chunk, which is the whole point of choosing by reach.
+        let mut cfg = config();
+        cfg.store_pool = shm_core::PoolConfig {
+            classes: vec![
+                shm_core::SizeClass {
+                    chunk_size: 256,
+                    chunk_count: 64,
+                },
+                shm_core::SizeClass {
+                    chunk_size: 4 << 20,
+                    chunk_count: 8,
+                },
+                shm_core::SizeClass {
+                    chunk_size: 8 << 20,
+                    chunk_count: 4,
+                },
+            ],
+        };
+        cfg.store_data_size = 96 << 20;
+
+        let dir = tempfile::tempdir().unwrap();
+        let uds = dir.path().join("coord.sock");
+        let mut coord = Coordinator::bind(&uds, cfg).unwrap();
+        coord.start().unwrap();
+
+        let mut node = connect(&uds, "w");
+        let side = ObjectSide::open(&mut node).unwrap();
+        let registry = node.registry().clone();
+        let store = node.store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry);
+
+        let ceiling = objects.max_object().unwrap();
+        let largest_class_reach = 3 * (8u64 << 20);
+        assert!(
+            ceiling > largest_class_reach,
+            "cutting at the largest class would give {largest_class_reach}; \
+             choosing by reach gave {ceiling}"
+        );
+
+        // And the ceiling is real, not advertised: write one segment past what
+        // the largest class could have held.
+        let n = (largest_class_reach + (1 << 20)) as usize;
+        let big: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        objects
+            .put("wide", "application/octet-stream", &big)
+            .unwrap();
+        let read = objects.get("wide", Version::Latest).unwrap();
+        assert_eq!(read.len(), n);
+        assert!(
+            read.segments().flat_map(|s| s.iter()).eq(big.iter()),
+            "payload differs"
+        );
+    }
+
+    #[test]
+    fn put_if_is_a_compare_and_set_so_a_read_modify_write_cannot_lose_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let uds = dir.path().join("coord.sock");
+        let mut coord = Coordinator::bind(&uds, config()).unwrap();
+        coord.start().unwrap();
+
+        let mut node = connect(&uds, "w");
+        let side = ObjectSide::open(&mut node).unwrap();
+        let registry = node.registry().clone();
+        let store = node.store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry);
+
+        // Create-if-absent: version 0 means "nothing committed yet".
+        assert_eq!(objects.put_if("cas", "text/plain", b"one", 0).unwrap(), 1);
+        // The same create again must lose rather than clobber.
+        assert!(matches!(
+            objects.put_if("cas", "text/plain", b"other", 0),
+            Err(Error::VersionMismatch { .. })
+        ));
+        assert_eq!(
+            joined(&objects.get("cas", Version::Latest).unwrap()).as_slice(),
+            &b"one"[..]
+        );
+
+        // The interleaving that loses an update without a precondition: two
+        // writers each read v1, each write back. The second must be refused.
+        let seen = objects.get("cas", Version::Latest).unwrap().version();
+        assert_eq!(
+            objects.put_if("cas", "text/plain", b"two", seen).unwrap(),
+            2
+        );
+        assert!(
+            matches!(
+                objects.put_if("cas", "text/plain", b"three", seen),
+                Err(Error::VersionMismatch { requested, current })
+                    if requested == seen && current == 2
+            ),
+            "a stale writer overwrote a newer version"
+        );
+        assert_eq!(
+            joined(&objects.get("cas", Version::Latest).unwrap()).as_slice(),
+            &b"two"[..]
+        );
+
+        // A refused write installs nothing and stages nothing.
+        assert_eq!(objects.head("cas").unwrap(), Some(2));
+    }
+
+    /// Where a large `put` actually spends its time.
+    ///
+    /// Run with `cargo test -p holon-object --release -- --ignored --nocapture
+    /// where_a_put_spends`. Ignored because it is a measurement, not an
+    /// assertion: it exists to decide whether removing the last copy is worth
+    /// invasive unsafe work, and the repo's own rule is to measure first.
+    #[test]
+    #[ignore]
+    fn where_a_put_spends_its_time() {
+        use std::time::Instant;
+
+        let mut cfg = config();
+        cfg.store_pool = shm_core::PoolConfig {
+            classes: vec![
+                shm_core::SizeClass {
+                    chunk_size: 256,
+                    chunk_count: 256,
+                },
+                shm_core::SizeClass {
+                    chunk_size: 4 << 20,
+                    chunk_count: 16,
+                },
+            ],
+        };
+        cfg.store_data_size = 192 << 20;
+
+        let dir = tempfile::tempdir().unwrap();
+        let uds = dir.path().join("coord.sock");
+        let mut coord = Coordinator::bind(&uds, cfg).unwrap();
+        coord.start().unwrap();
+        let mut node = connect(&uds, "probe");
+        let side = ObjectSide::open(&mut node).unwrap();
+        let registry = node.registry().clone();
+        let store = node.store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry.clone());
+
+        let ct = "application/octet-stream";
+        let seg = objects.segment_size(ct).unwrap();
+        const N: usize = 16 << 20;
+        let payload: Vec<u8> = (0..N).map(|i| (i % 251) as u8).collect();
+        let parts: Vec<&[u8]> = payload.chunks(seg).collect();
+        let reps = 5;
+
+        // A raw memcpy of the same bytes: the floor any copy is measured against.
+        let mut sink = vec![0u8; N];
+        let mut memcpy = u128::MAX;
+        for _ in 0..reps {
+            let t = Instant::now();
+            sink.copy_from_slice(&payload);
+            memcpy = memcpy.min(t.elapsed().as_micros());
+        }
+        std::hint::black_box(&sink);
+
+        // Phase 1: building the Arrow batch. This is copy #1 — the caller's
+        // slice into an Arrow-owned buffer.
+        let mut encode = u128::MAX;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let batches: Vec<_> = parts
+                .iter()
+                .map(|part| encode_segment(&side.schema, ct, part))
+                .collect();
+            encode = encode.min(t.elapsed().as_micros());
+            std::hint::black_box(batches);
+        }
+
+        // Phase 2: serialising into chunks. This is copy #2 — the one removing
+        // would take a new shm-arrow API and fresh unsafe.
+        let batches: Vec<_> = parts
+            .iter()
+            .map(|part| encode_segment(&side.schema, ct, part))
+            .collect();
+        let data_seg = store.data_segment().clone();
+        let pool = shm_core::Pool::attach(&data_seg).unwrap();
+        let alloc = shm_arrow::PoolAllocator::new(&pool, &data_seg);
+        let mut stage = u128::MAX;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let mut all = Vec::new();
+            for b in &batches {
+                all.extend(shm_arrow::write_batch_chunks(&alloc, &registry, b).unwrap());
+            }
+            stage = stage.min(t.elapsed().as_micros());
+            for c in &all {
+                shm_arrow::ChunkAllocator::free(&alloc, c);
+            }
+        }
+
+        // Phase 3: the whole thing, including the staged commit.
+        let mut total = u128::MAX;
+        for _ in 0..reps {
+            let t = Instant::now();
+            objects.put("probe", ct, &payload).unwrap();
+            total = total.min(t.elapsed().as_micros());
+        }
+
+        let rest = total.saturating_sub(encode + stage);
+        let pct = |v: u128| (v as f64) * 100.0 / (total as f64);
+        println!(
+            "\n  {} MiB in {} segments of {seg} B, best of {reps}",
+            N >> 20,
+            parts.len()
+        );
+        println!("  raw memcpy of the payload   {memcpy:>7} us   (the floor)");
+        println!(
+            "  1 build arrow batches       {encode:>7} us   {:>5.1}%",
+            pct(encode)
+        );
+        println!(
+            "  2 serialise into chunks     {stage:>7} us   {:>5.1}%",
+            pct(stage)
+        );
+        println!(
+            "  3 everything else           {rest:>7} us   {:>5.1}%",
+            pct(rest)
+        );
+        println!("  ----------------------------------------------");
+        println!("  put, end to end             {total:>7} us");
+        println!(
+            "\n  Removing the last copy targets phase 2 only, and cannot beat\n  \
+             the memcpy floor within it. Upper bound on the win: {:.1}% of a put.\n",
+            pct(stage)
+        );
+
+        objects.delete("probe").unwrap();
     }
 }

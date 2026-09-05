@@ -94,6 +94,20 @@ pub const ARTIFACT_ID_OFFSET: u32 = 4096;
 /// well above the per-artifact range so populations never collide.
 pub const STORE_ID_OFFSET: u32 = 8192;
 
+/// First id for a **dedicated payload segment** (one large object each).
+///
+/// Sits above the store's ids and below the next coordinator's base, so a
+/// coordinator's whole id span stays bounded — which is what lets parallel
+/// coordinators stride safely.
+pub const PAYLOAD_ID_OFFSET: u32 = 12_288;
+
+/// How many dedicated payload segments one coordinator may have live.
+///
+/// Bounded on purpose: ids must not run into the next coordinator's base, and
+/// an unbounded count would also mean an unbounded number of mappings per
+/// reader. Ids are recycled on release.
+pub const MAX_PAYLOAD_SEGMENTS: u32 = 2048;
+
 /// First lineage `artifact_id` the keyed store issues (ADR-0007 G3). Kept far
 /// above the coordinator's per-name artifact id space (which starts at 1) so a
 /// journaled entry pin's `artifact_id` unambiguously routes to the store rather
@@ -158,6 +172,12 @@ impl RuntimeConfig {
     #[inline]
     pub fn journal_seg_id(&self, actor_id: u32) -> u32 {
         self.seg_base + JOURNAL_ID_OFFSET + actor_id
+    }
+
+    /// The id of dedicated payload segment `i`.
+    #[inline]
+    pub fn payload_object_seg_id(&self, i: u32) -> u32 {
+        self.seg_base + PAYLOAD_ID_OFFSET + i
     }
 
     /// The built-in task-queue segment id.

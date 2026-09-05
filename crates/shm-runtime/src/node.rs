@@ -19,7 +19,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use shm_arrow::{read_batch, write_batch, PinGuard, PoolAllocator, SchemaRegistry};
 use shm_artifact::{Artifact, VersionEvent, ARTIFACTS_TOPIC};
-use shm_core::{BorrowJournal, ChunkDesc, Pool, Segment};
+use shm_core::{BorrowJournal, ChunkDesc, JournalEntry, Pool, Segment};
 use shm_ring::{DoorbellNotifier, DoorbellParker, Msg, Publisher, Ring, Subscriber};
 use shm_store::{read_typed_ref, write_typed_ref, KeyResolver, KeyedStore, TypedRef};
 use shm_stream::{Commit, Coordination, StreamWriter};
@@ -100,6 +100,13 @@ pub struct Node {
     store: Option<StoreMap>,
     /// The local key cache (filled by [`intern_key`](Node::intern_key)).
     keys: Mutex<KeyCache>,
+    /// Dedicated payload segments this node has mapped, by id.
+    ///
+    /// The registry that makes a descriptor from *any* segment resolvable: the
+    /// shared data segment is one mapping, and each large object is another.
+    /// Held so a reader can resolve `ChunkDesc::segment_id` without asking the
+    /// coordinator again.
+    payload_segments: Mutex<HashMap<u32, (Arc<Segment>, usize)>>,
     /// Guarded send side (shared with the heartbeat thread).
     send: Arc<Mutex<UnixStream>>,
     /// Read side (responses only; main thread).
@@ -175,6 +182,7 @@ impl Node {
             task_queue: None,
             store: None,
             keys: Mutex::new(KeyCache::default()),
+            payload_segments: Mutex::new(HashMap::new()),
             send,
             read_stream,
             heartbeat: None,
@@ -698,6 +706,82 @@ impl Node {
     }
 
     // ---- v0.2 cache-loop API (ADR-0002 item A + walking skeleton) ----
+
+    /// Ask the coordinator for a **dedicated segment** holding one large
+    /// payload, and map it.
+    ///
+    /// The large-object path. The shared data segment is carved into fixed size
+    /// classes, so a value bigger than the largest class cannot sit in it
+    /// contiguously; this gives the value its own mapping instead — the same
+    /// split `malloc` makes at `M_MMAP_THRESHOLD`. Contiguous by construction,
+    /// and it cannot fragment the shared arena because it is never carved from
+    /// it.
+    ///
+    /// The segment is coordinator-owned and outlives this node, so an object
+    /// survives its writer. Release it with
+    /// [`release_payload_segment`](Node::release_payload_segment).
+    pub fn create_payload_segment(&mut self, bytes: u64) -> Result<Arc<Segment>> {
+        let (resp, mut fds) = self.request(&Request::CreatePayloadSegment { bytes })?;
+        let seg_id = match resp {
+            Response::PayloadSegmentGranted { seg_id, .. } => seg_id,
+            Response::Error { message } => return Err(Error::Rejected(message)),
+            _ => return Err(Error::Protocol("expected PayloadSegmentGranted")),
+        };
+        if fds.len() != 1 {
+            return Err(Error::MissingFds {
+                expected: 1,
+                received: fds.len(),
+            });
+        }
+        let fd = fds.pop().unwrap();
+        // SAFETY: a freshly-received SCM_RIGHTS fd naming the payload segment
+        // the coordinator just created; ownership transfers to the mapping.
+        let seg = Arc::new(unsafe { Segment::from_raw_fd(into_raw(fd), seg_id)? });
+        // Journal it before returning. The segment is not described by any
+        // pool, so the coordinator's chunk reclamation cannot see it; the
+        // borrow journal is what ties its lifetime to this node's liveness, and
+        // replay unlinks it if this process dies without releasing.
+        let journal = BorrowJournal::attach(&self.journal_seg)?;
+        let slot = journal.record_entry(JournalEntry::payload_segment(seg_id))?;
+        self.payload_segments
+            .lock()
+            .expect("payload segments poisoned")
+            .insert(seg_id, (seg.clone(), slot));
+        Ok(seg)
+    }
+
+    /// A dedicated payload segment this node has already mapped.
+    ///
+    /// How a `ChunkDesc` pointing outside the shared data segment is resolved.
+    pub fn mapped_payload_segment(&self, seg_id: u32) -> Option<Arc<Segment>> {
+        self.payload_segments
+            .lock()
+            .expect("payload segments poisoned")
+            .get(&seg_id)
+            .map(|(seg, _)| seg.clone())
+    }
+
+    /// Drop this node's mapping and ask the coordinator to unlink the segment.
+    ///
+    /// Existing mappings held by other processes stay valid; the name simply
+    /// stops resolving, exactly as [`Segment::unlink`] describes.
+    pub fn release_payload_segment(&mut self, seg_id: u32) -> Result<()> {
+        let slot = self
+            .payload_segments
+            .lock()
+            .expect("payload segments poisoned")
+            .remove(&seg_id)
+            .map(|(_, slot)| slot);
+        // Cross the journal entry off first: if this process dies between the
+        // two, replay finds nothing to release and the coordinator's own
+        // release is still authoritative. The other order would risk a double
+        // release of a recycled id.
+        if let Some(slot) = slot {
+            let journal = BorrowJournal::attach(&self.journal_seg)?;
+            let _ = journal.release(slot);
+        }
+        self.fire(&Request::ReleasePayloadSegment { seg_id })
+    }
 
     /// Open (creating on first reference) the named artifact, mapping its head +
     /// data segments and wiring a commit **watch sink** that publishes a

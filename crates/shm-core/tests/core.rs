@@ -18,7 +18,8 @@ fn chunk_offsets(jrn: &BorrowJournal) -> Vec<u32> {
             JournalRecord::ChunkPin(d) => Some(d.offset),
             JournalRecord::ArtifactPin { .. }
             | JournalRecord::WriteLease { .. }
-            | JournalRecord::StagedManifest { .. } => None,
+            | JournalRecord::StagedManifest { .. }
+            | JournalRecord::PayloadSegment { .. } => None,
         })
         .collect();
     offs.sort_unstable();
@@ -485,6 +486,7 @@ fn journal_tagged_entries_roundtrip_all_kinds() {
                 incarnation,
                 fence,
             } => leases.push((artifact_id, incarnation, fence)),
+            JournalRecord::PayloadSegment { .. } => {}
             JournalRecord::StagedManifest { .. } => {}
         }
     }

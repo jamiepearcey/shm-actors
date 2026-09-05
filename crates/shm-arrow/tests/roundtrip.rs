@@ -494,3 +494,100 @@ fn corrupt_node_buffer_count_is_rejected_not_paniced() {
         "corrupt node table must be a clean Layout error, got {out:?}"
     );
 }
+
+/// Reserving space and letting a producer fill it must be indistinguishable
+/// from building a batch and copying it in.
+///
+/// This is the whole safety argument for the write-in-place path: the reader
+/// cannot tell the two apart, because the node table, the buffer table and
+/// every offset come from the same `plan_batch`/`pack` the copying path uses.
+/// A producer is handed `&mut [u8]` already sliced to its buffer, so it has no
+/// offset to get wrong.
+#[test]
+fn a_reserved_batch_reads_back_identically_to_a_copied_one() {
+    let fx = Fixture::new(8 << 20);
+    let pool = Pool::create(&fx.segment, &PoolConfig::power_of_two(1024, 1 << 18, 8)).unwrap();
+    let alloc = PoolAllocator::new(&pool, &fx.segment);
+    let registry = SchemaRegistry::new();
+
+    // A single Arrow buffer must fit one chunk, so this sits just under the
+    // largest class, with a length that is not a round number.
+    let payload: Vec<u8> = (0..(200 * 1024 + 37)).map(|i| (i % 251) as u8).collect();
+
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("label", DataType::Utf8, false),
+        Field::new("data", DataType::Binary, false),
+    ]));
+    let label = "application/octet-stream";
+
+    // The copying path, as the reference.
+    let copied = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![label])),
+            Arc::new(arrow_array::BinaryArray::from(vec![payload.as_slice()])),
+        ],
+    )
+    .unwrap();
+    let copied_descs = write_batch_chunks(&alloc, &registry, &copied).unwrap();
+
+    // The reserve path: a template of the same shape carrying a one-byte
+    // payload, with the data-values buffer's length overridden to the real one.
+    let template = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![label])),
+            Arc::new(arrow_array::BinaryArray::from(vec![&b"x"[..]])),
+        ],
+    )
+    .unwrap();
+
+    // Find which buffer is the data column's values: the one whose template
+    // length is 1. Asserted rather than assumed, so a layout change fails here
+    // instead of corrupting silently.
+    let reserved =
+        shm_arrow::reserve_batch_like(&alloc, &registry, &template, &[(3, payload.len())])
+            .expect("reserve");
+
+    // SAFETY: the chunks were just allocated by this call and are not published.
+    let mut slices = unsafe { reserved.buffers(&alloc) };
+    assert_eq!(
+        slices.len(),
+        4,
+        "expected utf8 offsets+values, binary offsets+values"
+    );
+    assert_eq!(slices[3].len(), payload.len(), "override did not take");
+
+    // Fill exactly as the copying path would have: offsets then bytes.
+    slices[0].copy_from_slice(&[0u8, 0, 0, 0, label.len() as u8, 0, 0, 0]);
+    slices[1].copy_from_slice(label.as_bytes());
+    let end = (payload.len() as i32).to_le_bytes();
+    slices[2][..4].copy_from_slice(&[0, 0, 0, 0]);
+    slices[2][4..8].copy_from_slice(&end);
+    slices[3].copy_from_slice(&payload);
+    drop(slices);
+
+    let reserved_descs = reserved.chunks().to_vec();
+
+    // Both must read back as the same batch.
+    let read = |descs: &[ChunkDesc]| {
+        let ctrls: Vec<&ChunkCtrl> = descs.iter().map(|d| pool.ctrl(d).unwrap()).collect();
+        let pin = Arc::new(PinGuard::new(fx.segment.clone()));
+        read_batch_chunks(pin, descs, &ctrls, &registry).unwrap()
+    };
+    let a = read(&copied_descs);
+    let b = read(&reserved_descs);
+
+    assert_eq!(a.num_rows(), b.num_rows());
+    assert_eq!(a.schema(), b.schema());
+    let got = b
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .unwrap();
+    assert_eq!(got.value(0).len(), payload.len(), "short payload");
+    assert!(got.value(0) == payload.as_slice(), "payload differs");
+    let got_label = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(got_label.value(0), label);
+    assert_eq!(a, b, "a reserved batch is not identical to a copied one");
+}

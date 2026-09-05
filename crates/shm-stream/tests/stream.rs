@@ -105,7 +105,8 @@ fn replay_and_reclaim(pool: &Pool, journal: &BorrowJournal, actor_id: u32) -> Ve
             shm_core::JournalRecord::ChunkPin(d) => d,
             shm_core::JournalRecord::ArtifactPin { .. }
             | shm_core::JournalRecord::WriteLease { .. }
-            | shm_core::JournalRecord::StagedManifest { .. } => continue,
+            | shm_core::JournalRecord::StagedManifest { .. }
+            | shm_core::JournalRecord::PayloadSegment { .. } => continue,
         };
         let ctrl = match pool.ctrl(&desc) {
             Ok(c) => c,

@@ -47,4 +47,4 @@ pub use read::{read_batch, read_batch_chunks, read_batch_layout, PinGuard, Segme
 pub use schema::{
     deserialize_schema, schema_content_hash, serialize_schema, SchemaRegistry, RAW_SCHEMA_ID,
 };
-pub use write::{serialized_len, write_batch, write_batch_chunks};
+pub use write::{reserve_batch_like, serialized_len, write_batch, write_batch_chunks, Reserved};

@@ -54,6 +54,10 @@ pub mod tags {
     pub const RESOLVE_KEY: u8 = 13;
     /// [`Request::OpenStore`] (ADR-0007 G3).
     pub const OPEN_STORE: u8 = 14;
+    /// [`Request::CreatePayloadSegment`].
+    pub const CREATE_PAYLOAD_SEGMENT: u8 = 15;
+    /// [`Request::ReleasePayloadSegment`].
+    pub const RELEASE_PAYLOAD_SEGMENT: u8 = 16;
 
     /// [`Response::Registered`].
     pub const REGISTERED: u8 = 128;
@@ -77,6 +81,8 @@ pub mod tags {
     pub const KEY_RESOLVED: u8 = 137;
     /// [`Response::StoreGranted`] (ADR-0007 G3).
     pub const STORE_GRANTED: u8 = 138;
+    /// [`Response::PayloadSegmentGranted`].
+    pub const PAYLOAD_SEGMENT_GRANTED: u8 = 139;
 }
 
 /// A message sent by an actor to the coordinator.
@@ -115,6 +121,30 @@ pub enum Request {
     },
     /// Graceful goodbye; the coordinator drops the actor without reclamation.
     Bye,
+    /// Create a **dedicated segment** for one large payload and receive its fd.
+    /// Expects [`Response::PayloadSegmentGranted`].
+    ///
+    /// The shared data segment is carved into fixed size classes, so a value
+    /// larger than the biggest class cannot live there contiguously. This is
+    /// the same answer a process allocator gives: small allocations come from
+    /// size-class bins, large ones get their own mapping (glibc's
+    /// `M_MMAP_THRESHOLD`, jemalloc's huge extents). A segment per large object
+    /// is contiguous by construction and cannot fragment the shared arena,
+    /// because it is never carved out of it — it is returned whole.
+    ///
+    /// The coordinator owns it, so a segment outlives the requesting actor's
+    /// crash and is unlinked by the same reclamation that handles everything
+    /// else.
+    CreatePayloadSegment {
+        /// Bytes the payload needs. The granted segment is at least this large.
+        bytes: u64,
+    },
+    /// Release a segment granted by [`Request::CreatePayloadSegment`].
+    /// Fire-and-forget.
+    ReleasePayloadSegment {
+        /// The segment id to drop.
+        seg_id: u32,
+    },
     /// Open (creating on first reference) the named artifact and receive its
     /// head + data segment fds. Expects [`Response::ArtifactGranted`].
     OpenArtifact {
@@ -183,6 +213,14 @@ pub enum Response {
     },
     /// Generic success for a fire-and-forget-style request that still replies.
     Ack,
+    /// A dedicated payload segment was created; carries **one** fd, the
+    /// segment's.
+    PayloadSegmentGranted {
+        /// The segment's id, for `Segment::from_raw_fd` validation.
+        seg_id: u32,
+        /// Its usable length in bytes.
+        len: u64,
+    },
     /// The request was rejected; carries a human-readable reason.
     Error {
         /// Why the request failed.
@@ -333,6 +371,16 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes(slice.try_into().unwrap()))
     }
 
+    fn u64(&mut self) -> Result<u64> {
+        let end = self.pos + 8;
+        let slice = self
+            .buf
+            .get(self.pos..end)
+            .ok_or(Error::Protocol("short read: u64"))?;
+        self.pos = end;
+        Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+    }
+
     fn string(&mut self) -> Result<String> {
         let end = self.pos + 2;
         let lenb = self
@@ -411,6 +459,14 @@ impl Request {
                 put_desc(&mut buf, desc);
             }
             Request::Bye => buf.push(tags::BYE),
+            Request::CreatePayloadSegment { bytes } => {
+                buf.push(tags::CREATE_PAYLOAD_SEGMENT);
+                buf.extend_from_slice(&bytes.to_le_bytes());
+            }
+            Request::ReleasePayloadSegment { seg_id } => {
+                buf.push(tags::RELEASE_PAYLOAD_SEGMENT);
+                buf.extend_from_slice(&seg_id.to_le_bytes());
+            }
             Request::OpenArtifact { name } => {
                 buf.push(tags::OPEN_ARTIFACT);
                 put_str(&mut buf, name);
@@ -449,6 +505,8 @@ impl Request {
             tags::PUBLISHED => Request::Published { desc: r.desc()? },
             tags::PINNED => Request::Pinned { desc: r.desc()? },
             tags::BYE => Request::Bye,
+            tags::CREATE_PAYLOAD_SEGMENT => Request::CreatePayloadSegment { bytes: r.u64()? },
+            tags::RELEASE_PAYLOAD_SEGMENT => Request::ReleasePayloadSegment { seg_id: r.u32()? },
             tags::OPEN_ARTIFACT => Request::OpenArtifact { name: r.string()? },
             tags::OPEN_TASK_QUEUE => Request::OpenTaskQueue,
             tags::INTERN_SCHEMA => Request::InternSchema {
@@ -493,6 +551,11 @@ impl Response {
                 put_u32(&mut buf, *region_len);
             }
             Response::Ack => buf.push(tags::ACK),
+            Response::PayloadSegmentGranted { seg_id, len } => {
+                buf.push(tags::PAYLOAD_SEGMENT_GRANTED);
+                buf.extend_from_slice(&seg_id.to_le_bytes());
+                buf.extend_from_slice(&len.to_le_bytes());
+            }
             Response::Error { message } => {
                 buf.push(tags::ERROR);
                 put_str(&mut buf, message);
@@ -567,6 +630,10 @@ impl Response {
                 region_len: r.u32()?,
             },
             tags::ACK => Response::Ack,
+            tags::PAYLOAD_SEGMENT_GRANTED => Response::PayloadSegmentGranted {
+                seg_id: r.u32()?,
+                len: r.u64()?,
+            },
             tags::ERROR => Response::Error {
                 message: r.string()?,
             },

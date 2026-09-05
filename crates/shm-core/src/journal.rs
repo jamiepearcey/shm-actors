@@ -84,6 +84,19 @@ pub const ENTRY_WRITE_LEASE: u32 = 3;
 /// iff no live pin slot endorses that manifest, which is what an install
 /// leaves behind.
 pub const ENTRY_STAGED_MANIFEST: u32 = 4;
+/// Entry-kind tag: a **dedicated payload segment** the owner holds, payload =
+/// its `segment_id`.
+///
+/// A large object lives in a segment of its own rather than in the shared
+/// pool's size classes, so nothing in the pool describes it and `reclaim_one`
+/// would never see it. Journalling it puts it under the same crash ledger as
+/// every other borrow: if the owner dies, replay tells the coordinator to
+/// unlink it, instead of the segment surviving until shutdown.
+///
+/// Additive: the slot format is unchanged and
+/// [`to_record`](JournalEntry::to_record) already returns `None` for an unknown
+/// kind, so [`JOURNAL_MAGIC`] does not move.
+pub const ENTRY_PAYLOAD_SEGMENT: u32 = 5;
 
 /// One fixed-size, POD journal slot: a `kind` tag plus a 24-byte payload.
 ///
@@ -169,6 +182,18 @@ impl JournalEntry {
         }
     }
 
+    /// A held dedicated payload segment.
+    #[inline]
+    pub fn payload_segment(segment_id: u32) -> JournalEntry {
+        let mut w = [0u32; 6];
+        w[0] = segment_id;
+        JournalEntry {
+            kind: ENTRY_PAYLOAD_SEGMENT,
+            _pad: 0,
+            w,
+        }
+    }
+
     /// Build an exclusive write-lease entry for `{artifact_id, incarnation, fence}`
     /// (item K).
     #[inline]
@@ -225,6 +250,9 @@ impl JournalEntry {
                 incarnation: self.w[2],
                 fence: self.w[1],
             }),
+            ENTRY_PAYLOAD_SEGMENT => Some(JournalRecord::PayloadSegment {
+                segment_id: self.w[0],
+            }),
             ENTRY_STAGED_MANIFEST => Some(JournalRecord::StagedManifest {
                 artifact_id: self.w[0],
                 incarnation: self.w[1],
@@ -275,6 +303,12 @@ pub enum JournalRecord {
         incarnation: u32,
         /// The fence generation the writer acquired the lease under.
         fence: u32,
+    },
+    /// A held **dedicated payload segment**: the id of a segment created for one
+    /// large object. Replay unlinks it.
+    PayloadSegment {
+        /// The segment id to release.
+        segment_id: u32,
     },
     /// A staged, not-yet-installed manifest (ADR-0014 §3): the committer died
     /// between staging and the install CAS. Replay tears the version down via
