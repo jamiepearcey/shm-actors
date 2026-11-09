@@ -33,17 +33,20 @@ use shm_runtime::Node;
 use std::sync::Arc;
 
 fn unique_seg_base() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed) as u64;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64;
     let pid = std::process::id() as u64;
-    // Disjoint band per test binary, and draws quantised to a stride wider
-    // than the ~10k segment ids one coordinator spans. The old form was
-    // `BASE + hash % 2_000_000` with bases only 200k apart, so two binaries
-    // running in parallel regularly drew within one coordinator's range of
-    // each other and the loser died with EEXIST on bind.
-    120971520 + ((((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 256) as u32) * 16384
+    // Every coordinator owns `base .. base + 2 MiB`: dedicated payload segment
+    // ids start at `base + 1 MiB` and are never reused, so two bands must be at
+    // least that far apart. This binary owns 32 draws; the per-call counter
+    // and the pid/clock hash together pick one, so neither two tests in this
+    // binary nor two binaries can overlap.
+    234217728 + (((n + ((pid.wrapping_mul(2_654_435_761)) ^ nanos)) % 32) as u32) * 2097152
 }
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {

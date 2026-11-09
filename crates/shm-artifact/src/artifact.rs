@@ -45,7 +45,7 @@
 
 use std::panic::RefUnwindSafe;
 use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use arrow_array::RecordBatch;
 use arrow_select::concat::concat_batches;
@@ -163,6 +163,114 @@ impl Commit {
     }
 }
 
+/// Resolves the `segment_id` a [`ChunkDesc`] carries to the mapping that holds
+/// that chunk.
+///
+/// The artifact's own data segment answers for every chunk carved out of its
+/// shared pool. An object larger than that pool's biggest size class instead
+/// lives in a **dedicated** segment of its own — contiguous, and unable to
+/// fragment the shared arena because it was never carved from it — so its
+/// descriptors name that segment rather than the store's. An owner that maps
+/// such segments supplies one of these, and every control-word lookup and
+/// every reconstructed Arrow buffer is then resolved against the segment the
+/// descriptor actually names.
+///
+/// Without a map an artifact is exactly what it always was: single-segment.
+/// The artifact's own data segment is answered by the artifact itself and need
+/// not be resolvable here.
+pub trait SegmentMap: Send + Sync + RefUnwindSafe {
+    /// The mapping for `segment_id`, or `None` if this owner does not hold it.
+    ///
+    /// A `None` is a hard failure at the call site (`WrongSegment`), never a
+    /// fallback to the store segment: [`Pool::locate`] addresses purely by
+    /// offset, so answering the wrong mapping would resolve a real, unrelated
+    /// control block.
+    fn segment(&self, segment_id: u32) -> Option<Arc<Segment>>;
+}
+
+/// The empty [`SegmentMap`]: every chunk lives in the artifact's own data
+/// segment. The default for an artifact that was never given one.
+pub struct NoForeignSegments;
+
+impl SegmentMap for NoForeignSegments {
+    fn segment(&self, _segment_id: u32) -> Option<Arc<Segment>> {
+        None
+    }
+}
+
+/// The segments one operation resolves descriptors against: the artifact's own
+/// data segment plus the [`SegmentMap`] that resolves dedicated ones.
+///
+/// Every `pool.ctrl(desc)` / `pool.free(desc)` in this module goes through
+/// [`Segs::with_pool`], so a descriptor is always addressed by the pool of the
+/// segment it names. Manifest **bytes** are still read from
+/// [`store`](Segs::store): a `VersionManifest` chunk is always allocated from
+/// the artifact's own pool (only bulk data is ever large enough to earn a
+/// segment of its own), and a manifest read against the wrong segment fails
+/// its magic/identity check rather than misresolving.
+#[derive(Clone, Copy)]
+struct Segs<'a> {
+    data_seg: &'a Arc<Segment>,
+    map: &'a dyn SegmentMap,
+}
+
+impl<'a> Segs<'a> {
+    /// The artifact's own data segment — where every manifest chunk lives.
+    #[inline]
+    fn store(self) -> &'a Segment {
+        self.data_seg
+    }
+
+    /// The mapping a descriptor's `segment_id` names.
+    fn segment(self, segment_id: u32) -> Result<Arc<Segment>> {
+        if segment_id == self.data_seg.id() {
+            return Ok(self.data_seg.clone());
+        }
+        self.map
+            .segment(segment_id)
+            .ok_or(Error::Core(shm_core::Error::WrongSegment {
+                desc: segment_id,
+                pool: self.data_seg.id(),
+            }))
+    }
+
+    /// Run `f` against the pool laid into the segment `segment_id` names.
+    ///
+    /// [`Pool::attach`] is a header read, so attaching per call is cheap and
+    /// keeps the pool's borrow of its segment strictly scoped.
+    fn with_pool<T>(self, segment_id: u32, f: impl FnOnce(&Pool<'_>) -> Result<T>) -> Result<T> {
+        let seg = self.segment(segment_id)?;
+        let pool = Pool::attach(&seg)?;
+        f(&pool)
+    }
+}
+
+/// Resolve every **dedicated** segment `chunks` name, deduplicated.
+///
+/// Used at pin time: a pin holds the returned handles for its whole life, so a
+/// version's chunks stay resolvable (and mapped) for as long as any Arrow
+/// buffer built over them can be read.
+fn resolve_foreign(
+    data_seg: &Segment,
+    map: &dyn SegmentMap,
+    chunks: &[ChunkDesc],
+) -> Result<Vec<Arc<Segment>>> {
+    let mut out: Vec<Arc<Segment>> = Vec::new();
+    for d in chunks {
+        if d.segment_id == data_seg.id() || out.iter().any(|s| s.id() == d.segment_id) {
+            continue;
+        }
+        let seg = map
+            .segment(d.segment_id)
+            .ok_or(Error::Core(shm_core::Error::WrongSegment {
+                desc: d.segment_id,
+                pool: data_seg.id(),
+            }))?;
+        out.push(seg);
+    }
+    Ok(out)
+}
+
 /// A named, versioned, shared-memory object with RCU/MVCC concurrency.
 ///
 /// An `Artifact` spans two segments:
@@ -190,6 +298,11 @@ pub struct Artifact {
     /// keyed-store layout ([`create_at`](Self::create_at)/[`attach_at`](Self::attach_at),
     /// ADR-0007 G3) that packs many heads into one shared management segment.
     head_off: usize,
+    /// Resolves the dedicated segments this artifact's versions may name (a
+    /// large object lives in one of its own). [`NoForeignSegments`] — the
+    /// single-segment default — unless [`with_segments`](Artifact::with_segments)
+    /// installed one.
+    segments: Arc<dyn SegmentMap>,
     watch: Option<Box<dyn Fn(VersionEvent) + Send + Sync>>,
 }
 
@@ -228,6 +341,7 @@ impl Artifact {
             head_seg,
             data_seg,
             head_off: 0,
+            segments: Arc::new(NoForeignSegments),
             watch: None,
         })
     }
@@ -260,6 +374,7 @@ impl Artifact {
             head_seg,
             data_seg,
             head_off: 0,
+            segments: Arc::new(NoForeignSegments),
             watch: None,
         })
     }
@@ -332,6 +447,7 @@ impl Artifact {
             head_seg,
             data_seg,
             head_off,
+            segments: Arc::new(NoForeignSegments),
             watch: None,
         })
     }
@@ -370,6 +486,7 @@ impl Artifact {
             head_seg,
             data_seg,
             head_off,
+            segments: Arc::new(NoForeignSegments),
             watch: None,
         })
     }
@@ -407,6 +524,28 @@ impl Artifact {
     {
         self.watch = Some(Box::new(sink));
         self
+    }
+
+    /// Install the [`SegmentMap`] that resolves the **dedicated** segments this
+    /// artifact's versions may name.
+    ///
+    /// An object too large for the shared pool's biggest size class is written
+    /// into a segment of its own; the descriptors a version then lists carry
+    /// that segment's id. Without a map such a descriptor is refused
+    /// ([`shm_core::Error::WrongSegment`]) rather than misresolved against the
+    /// store segment — the same refusal [`Pool::ctrl`] makes one level down.
+    pub fn with_segments(mut self, segments: Arc<dyn SegmentMap>) -> Artifact {
+        self.segments = segments;
+        self
+    }
+
+    /// The segments this artifact resolves descriptors against.
+    #[inline]
+    fn segs(&self) -> Segs<'_> {
+        Segs {
+            data_seg: &self.data_seg,
+            map: &*self.segments,
+        }
     }
 
     /// The artifact's interned name id.
@@ -565,7 +704,7 @@ impl Artifact {
             if slot.state.load(Acquire) == SLOT_LIVE {
                 let v = slot.version.load(Acquire);
                 if v != NO_VERSION {
-                    if let Err(e) = try_retire_version(head, &self.data_seg, v) {
+                    if let Err(e) = try_retire_version(head, self.segs(), v) {
                         result = Err(e);
                         break;
                     }
@@ -902,6 +1041,10 @@ impl Artifact {
         }
 
         let head = self.head();
+        let segs = self.segs();
+        // The artifact's own pool: manifests are always allocated here. Every
+        // *data* chunk is addressed through `segs` instead, because a staged
+        // chunk may live in a dedicated segment of its own.
         let pool = Pool::attach(&self.data_seg)?;
 
         // 0. Fenced-lease guard (item K). If this committer's lease was fenced
@@ -917,7 +1060,7 @@ impl Artifact {
         if let Some(token) = lease_fence {
             if !head.lease_held_by(owner, token) {
                 for d in staged {
-                    free_loaned(&pool, d);
+                    free_loaned(segs, d);
                 }
                 return Err(Error::Fenced);
             }
@@ -929,14 +1072,14 @@ impl Artifact {
         //    drop the remaining still-LOANED loans.
         let mut published: Vec<ChunkDesc> = Vec::with_capacity(staged.len());
         for (i, desc) in staged.iter().enumerate() {
-            match publish_staged(&pool, desc) {
+            match publish_staged(segs, desc) {
                 Ok(()) => published.push(*desc),
                 Err(e) => {
                     for c in &published {
-                        release_chunk(&pool, c);
+                        release_chunk(segs, c);
                     }
                     for d in &staged[i..] {
-                        free_loaned(&pool, d);
+                        free_loaned(segs, d);
                     }
                     return Err(e);
                 }
@@ -956,7 +1099,7 @@ impl Artifact {
                 Ok(prior) => prior,
                 _ => {
                     // Prior version moved or is unreadable: treat as a conflict.
-                    self.rollback_staged(&pool, &published, None, &[], None, None);
+                    self.rollback_staged(&published, None, &[], None, None);
                     return Err(Error::Conflict {
                         expected: expect,
                         actual: head.current.load(SeqCst),
@@ -964,7 +1107,7 @@ impl Artifact {
                 }
             };
             if prior.schema_id != schema_id {
-                self.rollback_staged(&pool, &published, None, &[], None, None);
+                self.rollback_staged(&published, None, &[], None, None);
                 return Err(Error::Unsupported(
                     "Append schema differs from the prior version",
                 ));
@@ -979,10 +1122,27 @@ impl Artifact {
             //    next occupant's `try_loan` reset the refcount, so there is no
             //    reference of ours to release (see `rollback_staged`).
             let mdesc = manifest_chunk_desc(mref, 0);
-            let ctrl = match pool.ctrl(&mdesc) {
+            let mseg = match segs.segment(mdesc.segment_id) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.rollback_staged(&published, None, &[], None, None);
+                    return Err(e);
+                }
+            };
+            // Attach where the prior manifest actually lives (its own pool in
+            // practice: manifests are always allocated from the artifact's).
+            // A failure here must still return every published chunk.
+            let mpool = match Pool::attach(&mseg) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.rollback_staged(&published, None, &[], None, None);
+                    return Err(Error::from(e));
+                }
+            };
+            let ctrl = match mpool.ctrl(&mdesc) {
                 Ok(c) => c,
                 Err(e) => {
-                    self.rollback_staged(&pool, &published, None, &[], None, None);
+                    self.rollback_staged(&published, None, &[], None, None);
                     return Err(Error::from(e));
                 }
             };
@@ -991,7 +1151,7 @@ impl Artifact {
             // across our bump, i.e. the reference we hold is genuine.
             let generation = ctrl.generation();
             if ctrl.borrow_shared().is_err() {
-                self.rollback_staged(&pool, &published, None, &[], None, None);
+                self.rollback_staged(&published, None, &[], None, None);
                 return Err(Error::Conflict {
                     expected: expect,
                     actual: head.current.load(SeqCst),
@@ -1011,9 +1171,9 @@ impl Artifact {
                 // ambiguous split-word case, where `try_loan` already wiped
                 // the bump and releasing would steal the next occupant's ref.
                 if generation_ok {
-                    release_manifest_ref(&pool, &self.data_seg, mref, Some(generation));
+                    release_manifest_ref(segs, mref, Some(generation));
                 }
-                self.rollback_staged(&pool, &published, None, &[], None, None);
+                self.rollback_staged(&published, None, &[], None, None);
                 return Err(Error::Conflict {
                     expected: expect,
                     actual: head.current.load(SeqCst),
@@ -1043,24 +1203,24 @@ impl Artifact {
                 {
                     Ok(prior) => prior,
                     _ => {
-                        self.rollback_staged(&pool, &published, None, &[], None, None);
+                        self.rollback_staged(&published, None, &[], None, None);
                         return Err(conflict(head));
                     }
                 };
                 if prior.schema_id != schema_id {
-                    self.rollback_staged(&pool, &published, None, &[], None, None);
+                    self.rollback_staged(&published, None, &[], None, None);
                     return Err(Error::Unsupported(
                         "Window schema differs from the prior version",
                     ));
                 }
-                match collect_window(&pool, &self.data_seg, &prior, keep_batches) {
+                match collect_window(segs, &prior, keep_batches) {
                     Ok(w) => {
                         kept = w.chunks;
                         kept_spans = w.spans;
                         window = Some((w.base, w.members));
                     }
                     Err(_) => {
-                        self.rollback_staged(&pool, &published, None, &[], None, None);
+                        self.rollback_staged(&published, None, &[], None, None);
                         return Err(conflict(head));
                     }
                 }
@@ -1101,7 +1261,7 @@ impl Artifact {
         ) {
             Ok(d) => d,
             Err(e) => {
-                self.rollback_staged(&pool, &published, link.as_ref(), &kept, None, None);
+                self.rollback_staged(&published, link.as_ref(), &kept, None, None);
                 return Err(e);
             }
         };
@@ -1128,14 +1288,7 @@ impl Artifact {
         let slot_idx = match head.claim_slot(target, manifest_ref.to_bits()) {
             Some(i) => i,
             None => {
-                self.rollback_staged(
-                    &pool,
-                    &published,
-                    link.as_ref(),
-                    &kept,
-                    Some(&manifest_desc),
-                    None,
-                );
+                self.rollback_staged(&published, link.as_ref(), &kept, Some(&manifest_desc), None);
                 drop_rec();
                 return Err(Error::Unsupported("live-version table full"));
             }
@@ -1151,14 +1304,7 @@ impl Artifact {
         // loom, `tests/loom_reclaim.rs`) needs.
         if !head.revalidate_incarnation(self.incarnation) {
             head.pins[slot_idx].store_free();
-            self.rollback_staged(
-                &pool,
-                &published,
-                link.as_ref(),
-                &kept,
-                Some(&manifest_desc),
-                None,
-            );
+            self.rollback_staged(&published, link.as_ref(), &kept, Some(&manifest_desc), None);
             drop_rec();
             return Err(Error::Stale);
         }
@@ -1184,7 +1330,7 @@ impl Artifact {
                 // The predecessor is now non-current; reclaim it if unpinned —
                 // the endorsed slot only (ADR-0013 review F3).
                 if expect != NO_VERSION {
-                    let _ = try_retire_version_at(head, &self.data_seg, expect, Some(prior_bits));
+                    let _ = try_retire_version_at(head, segs, expect, Some(prior_bits));
                 }
 
                 if let Some(sink) = &self.watch {
@@ -1199,7 +1345,6 @@ impl Artifact {
             Err(actual) => {
                 // Lost the race: undo everything staged.
                 self.rollback_staged(
-                    &pool,
                     &published,
                     link.as_ref(),
                     &kept,
@@ -1234,7 +1379,6 @@ impl Artifact {
     /// that was never ours.
     fn rollback_staged(
         &self,
-        pool: &Pool<'_>,
         published: &[ChunkDesc],
         link: Option<&ManifestLink>,
         kept: &[ChunkDesc],
@@ -1252,27 +1396,26 @@ impl Artifact {
                 slot.state.store(crate::head::SLOT_FREE, Release);
             }
         }
+        let segs = self.segs();
         if let Some(m) = manifest_desc {
             // Our own manifest lists `published` and the link, which are
             // released explicitly below — so this is a plain release, never the
             // cascade.
-            release_chunk(pool, m);
+            release_chunk(segs, m);
         }
         if let Some(l) = link {
-            let mdesc = manifest_chunk_desc(l.mref, 0);
-            let live = pool
-                .ctrl(&mdesc)
-                .map(|c| c.generation() == l.generation)
+            let live = manifest_generation(segs, l.mref)
+                .map(|g| g == l.generation)
                 .unwrap_or(false);
             if live {
-                release_manifest_ref(pool, &self.data_seg, l.mref, Some(l.generation));
+                release_manifest_ref(segs, l.mref, Some(l.generation));
             }
         }
         for c in kept {
-            release_chunk(pool, c);
+            release_chunk(segs, c);
         }
         for c in published {
-            release_chunk(pool, c);
+            release_chunk(segs, c);
         }
     }
 
@@ -1368,7 +1511,7 @@ impl Artifact {
             // the reclaimer's `FREEING`-store-then-pins-scan. (Both loads live in
             // `PinSlot::accept_pin`, the loom-checked reader half — ADR-0004 L.)
             if !slot.accept_pin(v) {
-                undo_pin(head, &self.data_seg, idx);
+                undo_pin(head, self.segs(), idx);
                 backoff(&mut spins);
                 continue;
             }
@@ -1383,7 +1526,7 @@ impl Artifact {
             // A stale pin is not retryable — the entry this handle names is
             // gone — so undo and report rather than spinning.
             if !head.is_incarnation(self.incarnation) {
-                undo_pin(head, &self.data_seg, idx);
+                undo_pin(head, self.segs(), idx);
                 return Err(Error::Stale);
             }
 
@@ -1395,7 +1538,7 @@ impl Artifact {
             // artifact's version `v` (ADR-0003a manifest self-validation).
             let head_md = head.manifest_desc.load(Acquire);
             if slot.manifest.load(Acquire) != head_md {
-                undo_pin(head, &self.data_seg, idx);
+                undo_pin(head, self.segs(), idx);
                 backoff(&mut spins);
                 continue;
             }
@@ -1403,9 +1546,28 @@ impl Artifact {
             let manifest = match read_manifest_checked(&self.data_seg, mref, self.name_id, v) {
                 Ok(m) => m,
                 _ => {
-                    undo_pin(head, &self.data_seg, idx);
+                    undo_pin(head, self.segs(), idx);
                     backoff(&mut spins);
                     continue;
+                }
+            };
+
+            // (4b) Resolve, **now**, every dedicated segment this version's own
+            // chunks name, and hand the handles to the pin. The pin then owns
+            // the mappings for its whole life, so a chunk in a segment of its
+            // own stays addressable for as long as any Arrow buffer built over
+            // it can be read — even if the map, or the artifact handle, is
+            // dropped. Ordering (ADR: the object outlives its creator): the
+            // version pin is already published, so the manifest's `+1` on each
+            // chunk is held and the chunk cannot reach `FREE`, so the
+            // coordinator's sweep cannot unlink the segment underneath us.
+            // A segment this reader has not mapped is refused here, not
+            // misresolved against the store segment.
+            let foreign = match resolve_foreign(&self.data_seg, &*self.segments, &manifest.chunks) {
+                Ok(f) => f,
+                Err(e) => {
+                    undo_pin(head, self.segs(), idx);
+                    return Err(e);
                 }
             };
 
@@ -1421,7 +1583,7 @@ impl Artifact {
                             slot: slot_idx,
                         }),
                         Err(e) => {
-                            undo_pin(head, &self.data_seg, idx);
+                            undo_pin(head, self.segs(), idx);
                             return Err(e.into());
                         }
                     }
@@ -1433,6 +1595,8 @@ impl Artifact {
                 inner: Arc::new(PinState {
                     head_seg: self.head_seg.clone(),
                     data_seg: self.data_seg.clone(),
+                    segments: self.segments.clone(),
+                    foreign: RwLock::new(foreign),
                     head_off: self.head_off,
                     version: v,
                     slot_idx: idx,
@@ -1531,14 +1695,17 @@ impl Artifact {
                 return Ok(false);
             }
         }
-        let pool = Pool::attach(&self.data_seg)?;
+        let segs = self.segs();
         let mref = PackedRef(manifest);
         let desc = manifest_chunk_desc(mref, generation);
-        match pool.ctrl(&desc) {
-            Ok(ctrl) if ctrl.validate(&desc).is_ok() && ctrl.state() == PUBLISHED => {}
-            _ => return Ok(false), // already rolled back (and possibly reused)
+        let staged = segs.with_pool(desc.segment_id, |pool| {
+            Ok(matches!(pool.ctrl(&desc), Ok(ctrl)
+                if ctrl.validate(&desc).is_ok() && ctrl.state() == PUBLISHED))
+        })?;
+        if !staged {
+            return Ok(false); // already rolled back (and possibly reused)
         }
-        release_manifest_ref(&pool, &self.data_seg, mref, Some(generation));
+        release_manifest_ref(segs, mref, Some(generation));
         Ok(true)
     }
 
@@ -1559,7 +1726,7 @@ impl Artifact {
             return Ok(false);
         };
         if prev == 1 && head.current.load(SeqCst) != version {
-            try_retire_version(head, &self.data_seg, version)?;
+            try_retire_version(head, self.segs(), version)?;
         }
         Ok(true)
     }
@@ -1638,12 +1805,14 @@ where
 ///
 /// This is the tail of [`stage_chunk`] for a chunk that was written and loaned
 /// earlier rather than in the same call.
-fn publish_staged(pool: &Pool<'_>, desc: &ChunkDesc) -> Result<()> {
-    let ctrl = pool.ctrl(desc)?;
-    ctrl.publish()?; // LOANED -> PUBLISHED
-    ctrl.borrow_shared()?; // refcount 0 -> 1 : this version's reference
-    ctrl.owner_release(); // owner -> NONE; refcount 1 so no reclaim
-    Ok(())
+fn publish_staged(segs: Segs<'_>, desc: &ChunkDesc) -> Result<()> {
+    segs.with_pool(desc.segment_id, |pool| {
+        let ctrl = pool.ctrl(desc)?;
+        ctrl.publish()?; // LOANED -> PUBLISHED
+        ctrl.borrow_shared()?; // refcount 0 -> 1 : this version's reference
+        ctrl.owner_release(); // owner -> NONE; refcount 1 so no reclaim
+        Ok(())
+    })
 }
 
 /// Loan every chunk of a freshly written batch (`FREE -> LOANED`, owned by
@@ -1677,12 +1846,15 @@ fn loan_all(
 
 /// Free a staged chunk still in the `LOANED` state (a commit failed before it
 /// was published): recycle its control word to `FREE` and return it to the pool.
-fn free_loaned(pool: &Pool<'_>, desc: &ChunkDesc) {
-    if let Ok(ctrl) = pool.ctrl(desc) {
-        if ctrl.drop_loan().is_ok() {
-            let _ = pool.free(desc);
+fn free_loaned(segs: Segs<'_>, desc: &ChunkDesc) {
+    let _ = segs.with_pool(desc.segment_id, |pool| {
+        if let Ok(ctrl) = pool.ctrl(desc) {
+            if ctrl.drop_loan().is_ok() {
+                let _ = pool.free(desc);
+            }
         }
-    }
+        Ok(())
+    });
 }
 
 /// Release one reference on a chunk; if that was the last reference the chunk
@@ -1722,12 +1894,7 @@ struct WindowSet {
 /// member's version when partial, one less when whole — except a whole
 /// plain (`Replace`) root, whose base is its own version: a reader that
 /// missed the `Replace` must resynchronise, not append.
-fn collect_window(
-    pool: &Pool<'_>,
-    data_seg: &Segment,
-    prior: &Manifest,
-    keep_batches: u32,
-) -> Result<WindowSet> {
+fn collect_window(segs: Segs<'_>, prior: &Manifest, keep_batches: u32) -> Result<WindowSet> {
     let mut remaining = keep_batches as usize;
     let members = if remaining == 0 {
         Vec::new()
@@ -1735,11 +1902,10 @@ fn collect_window(
         walk_chain_newest_first(
             prior,
             |link| {
-                let ctrl = pool.ctrl(&manifest_chunk_desc(link.mref, 0))?;
-                if ctrl.generation() != link.generation {
+                if manifest_generation(segs, link.mref)? != link.generation {
                     return Err(Error::VersionGone);
                 }
-                read_manifest_checked(data_seg, link.mref, prior.artifact_id, link.version)
+                read_manifest_checked(segs.store(), link.mref, prior.artifact_id, link.version)
             },
             |m| {
                 remaining = remaining.saturating_sub(m.batch_spans.len());
@@ -1774,20 +1940,21 @@ fn collect_window(
         }
         let tail_chunks = &m.chunks[m.chunks.len() - chunk_take..];
         for desc in tail_chunks {
-            let held = pool.ctrl(desc).map_err(Error::from).and_then(|ctrl| {
+            let held = segs.with_pool(desc.segment_id, |pool| {
+                let ctrl = pool.ctrl(desc)?;
                 ctrl.validate(desc)?;
                 ctrl.borrow_shared()?;
                 if ctrl.validate(desc).is_err() {
                     // Our +1 sits on whatever now occupies the chunk: give it
                     // back to that occupant, freeing it if we were its last.
-                    release_chunk_owned(pool, desc);
+                    release_chunk_owned(segs, desc);
                     return Err(Error::VersionGone);
                 }
                 Ok(())
             });
             if let Err(e) = held {
                 for c in &chunks {
-                    release_chunk(pool, c);
+                    release_chunk(segs, c);
                 }
                 return Err(e);
             }
@@ -1876,27 +2043,42 @@ fn collect_window(
     })
 }
 
-fn release_chunk(pool: &Pool<'_>, desc: &ChunkDesc) -> bool {
-    if let Ok(ctrl) = pool.ctrl(desc) {
-        // Generation-checked: a descriptor whose chunk was freed and
-        // re-published to someone else since it was written must NOT
-        // decrement the new occupant's count (ADR-0013 review F2/F5). Every
-        // caller's descriptor carries the generation it was staged/linked at.
-        if ctrl.validate(desc).is_ok() && ctrl.state() == PUBLISHED {
-            // `release_shared` decrements the refcount and reclaims iff it hit 0
-            // (owner already released at stage time).
-            if ctrl.release_shared() {
-                let _ = pool.free(desc);
-                return true;
+fn release_chunk(segs: Segs<'_>, desc: &ChunkDesc) -> bool {
+    segs.with_pool(desc.segment_id, |pool| {
+        if let Ok(ctrl) = pool.ctrl(desc) {
+            // Generation-checked: a descriptor whose chunk was freed and
+            // re-published to someone else since it was written must NOT
+            // decrement the new occupant's count (ADR-0013 review F2/F5). Every
+            // caller's descriptor carries the generation it was staged/linked at.
+            // A dedicated segment recycles its one chunk exactly like a pool
+            // class does, so the generation is the same guard there.
+            if ctrl.validate(desc).is_ok() && ctrl.state() == PUBLISHED {
+                // `release_shared` decrements the refcount and reclaims iff it
+                // hit 0 (owner already released at stage time).
+                if ctrl.release_shared() {
+                    let _ = pool.free(desc);
+                    return Ok(true);
+                }
             }
         }
-    }
-    false
+        Ok(false)
+    })
+    .unwrap_or(false)
 }
 
 /// The [`ChunkDesc`] that locates a manifest chunk from its [`PackedRef`].
 /// `len`/`generation` are irrelevant to `ctrl`/`free`, which locate the chunk by
 /// `offset`.
+/// The generation the chunk a manifest [`PackedRef`] names currently carries.
+///
+/// Every chain hop compares this against the generation its link recorded: a
+/// manifest chunk freed and republished since the link was taken carries a new
+/// generation, so the walk refuses it instead of parsing a stranger's bytes.
+fn manifest_generation(segs: Segs<'_>, mref: PackedRef) -> Result<u32> {
+    let desc = manifest_chunk_desc(mref, 0);
+    segs.with_pool(desc.segment_id, |pool| Ok(pool.ctrl(&desc)?.generation()))
+}
+
 #[inline]
 fn manifest_chunk_desc(mref: PackedRef, generation: u32) -> ChunkDesc {
     ChunkDesc {
@@ -1935,19 +2117,14 @@ fn manifest_chunk_desc(mref: PackedRef, generation: u32) -> ChunkDesc {
 /// version ref) and the chunk cannot have moved. Every subsequent hop uses the
 /// link generation the manifest recorded, so a stale link can never decrement
 /// a recycled chunk's next occupant.
-fn release_manifest_ref(
-    pool: &Pool<'_>,
-    data_seg: &Segment,
-    mref: PackedRef,
-    generation: Option<u32>,
-) {
+fn release_manifest_ref(segs: Segs<'_>, mref: PackedRef, generation: Option<u32>) {
     let mut mref = mref;
     let mut generation = generation;
     loop {
-        let parsed = read_manifest(data_seg, mref).ok();
+        let parsed = read_manifest(segs.store(), mref).ok();
         let released = match generation {
-            Some(g) => release_chunk(pool, &manifest_chunk_desc(mref, g)),
-            None => release_chunk_owned(pool, &manifest_chunk_desc(mref, 0)),
+            Some(g) => release_chunk(segs, &manifest_chunk_desc(mref, g)),
+            None => release_chunk_owned(segs, &manifest_chunk_desc(mref, 0)),
         };
         if !released {
             return;
@@ -1955,8 +2132,13 @@ fn release_manifest_ref(
         let Some(m) = parsed else {
             return;
         };
+        // The cascade is per-descriptor: a version's data chunks may live in
+        // the shared pool, in one dedicated segment each, or in a mix, and each
+        // is returned to the pool of the segment it names — exactly once,
+        // because only the releaser whose `release_shared` observed the last
+        // reference gets here.
         for c in &m.chunks {
-            release_chunk(pool, c);
+            release_chunk(segs, c);
         }
         match m.prev {
             Some(link) => {
@@ -1972,25 +2154,28 @@ fn release_manifest_ref(
 /// generation of (the retire's first hop: the version reference, held since
 /// commit). Unvalidated by construction; never use it for a reference that
 /// might have been taken across a recycle.
-fn release_chunk_owned(pool: &Pool<'_>, desc: &ChunkDesc) -> bool {
-    if let Ok(ctrl) = pool.ctrl(desc) {
-        if ctrl.state() == PUBLISHED && ctrl.release_shared() {
-            let _ = pool.free(desc);
-            return true;
+fn release_chunk_owned(segs: Segs<'_>, desc: &ChunkDesc) -> bool {
+    segs.with_pool(desc.segment_id, |pool| {
+        if let Ok(ctrl) = pool.ctrl(desc) {
+            if ctrl.state() == PUBLISHED && ctrl.release_shared() {
+                let _ = pool.free(desc);
+                return Ok(true);
+            }
         }
-    }
-    false
+        Ok(false)
+    })
+    .unwrap_or(false)
 }
 
 /// Undo a speculative pin bump on slot `idx`, helping reclaim whatever version
 /// the slot tracks if this released its last pin while it is non-current.
-fn undo_pin(head: &ArtifactHead, data_seg: &Segment, idx: usize) {
+fn undo_pin(head: &ArtifactHead, segs: Segs<'_>, idx: usize) {
     let slot = &head.pins[idx];
     let prev = slot.unpin();
     if prev == 1 {
         let sv = slot.version.load(Acquire);
         if sv != 0 && head.current.load(SeqCst) != sv {
-            let _ = try_retire_version(head, data_seg, sv);
+            let _ = try_retire_version(head, segs, sv);
         }
     }
 }
@@ -2030,8 +2215,8 @@ fn undo_pin(head: &ArtifactHead, data_seg: &Segment, idx: usize) {
 /// manifests listing it (`1` in practice). Because `current` is monotonic and
 /// never revisits `version`, once `current != version` it stays so — the
 /// reclaimability precondition is stable.
-fn try_retire_version(head: &ArtifactHead, data_seg: &Segment, version: u64) -> Result<()> {
-    try_retire_version_at(head, data_seg, version, None)
+fn try_retire_version(head: &ArtifactHead, segs: Segs<'_>, version: u64) -> Result<()> {
+    try_retire_version_at(head, segs, version, None)
 }
 
 /// [`try_retire_version`] targeting the **endorsed** slot when the caller
@@ -2039,7 +2224,7 @@ fn try_retire_version(head: &ArtifactHead, data_seg: &Segment, version: u64) -> 
 /// `None`, the first live slot tracking `version` (ADR-0013 review F3).
 fn try_retire_version_at(
     head: &ArtifactHead,
-    data_seg: &Segment,
+    segs: Segs<'_>,
     version: u64,
     manifest_bits: Option<u64>,
 ) -> Result<()> {
@@ -2084,13 +2269,15 @@ fn try_retire_version_at(
             continue;
         }
 
-        let pool = Pool::attach(data_seg)?;
-
         // Release this version's one reference — its manifest chunk — and, if
         // that was the manifest's last reference, cascade through its own data
-        // chunks and down the chain (ADR-0013).
+        // chunks and down the chain (ADR-0013). Each chunk is returned to the
+        // pool of the segment it names, so a version whose data lives in a
+        // dedicated segment cascades back into that segment's pool — which is
+        // what drives its control word to `FREE`, and thus what lets the
+        // coordinator's sweep unlink it.
         let mref = PackedRef(slot.manifest.load(Acquire));
-        release_manifest_ref(&pool, data_seg, mref, None);
+        release_manifest_ref(segs, mref, None);
 
         // Return the slot to the free pool (FREEING -> FREE).
         slot.store_free();
@@ -2312,6 +2499,19 @@ pub struct Delta {
 struct PinState {
     head_seg: Arc<Segment>,
     data_seg: Arc<Segment>,
+    /// Resolves the dedicated segments the pinned version's chunks may name —
+    /// the artifact's map, cloned at pin time.
+    segments: Arc<dyn SegmentMap>,
+    /// The dedicated segments this pin has resolved: the ones the pinned
+    /// version's own manifest named (resolved eagerly at pin time) plus any a
+    /// chain walk reached later.
+    ///
+    /// **A pin keeps its segments resolvable for the pin's whole life.** Each
+    /// handle stays here until the last `Arc<PinState>` — including every one
+    /// moved into a zero-copy Arrow buffer — drops, so a base pointer this pin
+    /// ever handed out cannot be unmapped while a buffer over it lives.
+    /// Entries are only ever added, never removed.
+    foreign: RwLock<Vec<Arc<Segment>>>,
     /// Byte offset of the [`ArtifactHead`] within `head_seg` (see
     /// [`Artifact::head_off`]); `0` for the standard layout.
     head_off: usize,
@@ -2332,9 +2532,64 @@ struct JournalPin {
     slot: usize,
 }
 
+impl PinState {
+    /// The segments this pin resolves descriptors against.
+    #[inline]
+    fn segs(&self) -> Segs<'_> {
+        Segs {
+            data_seg: &self.data_seg,
+            map: &*self.segments,
+        }
+    }
+
+    /// The mapping `segment_id` names, resolving (and **retaining**) it on
+    /// first use. The retention is the guarantee: once this pin has answered
+    /// for a segment it holds that segment mapped until the pin is gone.
+    fn segment_of(&self, segment_id: u32) -> Result<Arc<Segment>> {
+        if segment_id == self.data_seg.id() {
+            return Ok(self.data_seg.clone());
+        }
+        if let Some(seg) = self
+            .foreign
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|s| s.id() == segment_id)
+        {
+            return Ok(seg.clone());
+        }
+        let seg = self.segments.segment(segment_id).ok_or(Error::Core(
+            shm_core::Error::WrongSegment {
+                desc: segment_id,
+                pool: self.data_seg.id(),
+            },
+        ))?;
+        let mut held = self.foreign.write().unwrap_or_else(PoisonError::into_inner);
+        // Another thread may have resolved it while we were not holding the
+        // lock; keep exactly one handle per segment.
+        match held.iter().find(|s| s.id() == segment_id) {
+            Some(existing) => Ok(existing.clone()),
+            None => {
+                held.push(seg.clone());
+                Ok(seg)
+            }
+        }
+    }
+}
+
 impl SegmentBase for PinState {
     fn base_ptr(&self) -> *const u8 {
         self.data_seg.base_ptr()
+    }
+
+    /// Resolve each descriptor against the segment it actually names, so a
+    /// batch spanning the shared pool and one or more dedicated segments
+    /// reconstructs against the right mapping instead of reading the store
+    /// segment at a foreign offset.
+    fn base_for(&self, segment_id: u32) -> Option<*const u8> {
+        self.segment_of(segment_id)
+            .ok()
+            .map(|s| s.base_ptr() as *const u8)
     }
 }
 
@@ -2361,7 +2616,7 @@ impl Drop for PinState {
         if prev == 1 {
             // Last pin gone: reclaim if this version is no longer current.
             if head.current.load(SeqCst) != self.version {
-                let _ = try_retire_version(head, &self.data_seg, self.version);
+                let _ = try_retire_version(head, self.segs(), self.version);
             }
         }
     }
@@ -2393,15 +2648,13 @@ impl VersionPin {
     /// the pinned version; each predecessor by its successor's link), so the
     /// walk never dereferences a freed chunk. Cost: O(chain length).
     pub fn chain(&self) -> Result<Vec<Manifest>> {
-        let seg = &self.inner.data_seg;
-        let pool = Pool::attach(seg)?;
+        let segs = self.inner.segs();
         let artifact_id = self.inner.manifest.artifact_id;
         walk_chain_with(&self.inner.manifest, |link| {
-            let ctrl = pool.ctrl(&manifest_chunk_desc(link.mref, 0))?;
-            if ctrl.generation() != link.generation {
+            if manifest_generation(segs, link.mref)? != link.generation {
                 return Err(Error::VersionGone);
             }
-            read_manifest_checked(seg, link.mref, artifact_id, link.version)
+            read_manifest_checked(segs.store(), link.mref, artifact_id, link.version)
         })
     }
 
@@ -2456,17 +2709,15 @@ impl VersionPin {
                 truncated: false,
             });
         }
-        let seg = &self.inner.data_seg;
-        let pool = Pool::attach(seg)?;
+        let segs = self.inner.segs();
         let artifact_id = head.artifact_id;
         let mut chain = walk_chain_newest_first(
             head,
             |link| {
-                let ctrl = pool.ctrl(&manifest_chunk_desc(link.mref, 0))?;
-                if ctrl.generation() != link.generation {
+                if manifest_generation(segs, link.mref)? != link.generation {
                     return Err(Error::VersionGone);
                 }
-                read_manifest_checked(seg, link.mref, artifact_id, link.version)
+                read_manifest_checked(segs.store(), link.mref, artifact_id, link.version)
             },
             |m| m.prev.is_none_or(|l| l.version <= since),
         )?;
@@ -2502,7 +2753,6 @@ impl VersionPin {
         skip_first: usize,
         registry: &SchemaRegistry,
     ) -> Result<Vec<RecordBatch>> {
-        let pool = Pool::attach(&self.inner.data_seg)?;
         let mut batches: Vec<RecordBatch> =
             Vec::with_capacity(chain.iter().map(|m| m.batch_spans.len()).sum());
         for (mi, manifest) in chain.iter().enumerate() {
@@ -2518,11 +2768,26 @@ impl VersionPin {
                     .get(idx..idx + span)
                     .ok_or(Error::Core(shm_core::Error::OutOfBounds))?;
                 idx += span;
-                let ctrls: Vec<&ChunkCtrl> = group
+                // One pool per chunk, over the segment that chunk names: a
+                // batch may span the shared pool and a dedicated segment, and
+                // a control word must never be read out of the wrong pool.
+                // Resolving through the pin also *retains* each mapping, so the
+                // buffers `read_batch_chunks` builds — which resolve their base
+                // pointers through this same pin — cannot outlive it.
+                let group_segs: Vec<Arc<Segment>> = group
                     .iter()
-                    .map(|d| pool.ctrl(d))
+                    .map(|d| self.inner.segment_of(d.segment_id))
+                    .collect::<Result<Vec<_>>>()?;
+                let pools: Vec<Pool<'_>> = group_segs
+                    .iter()
+                    .map(|s| Pool::attach(s))
                     .collect::<core::result::Result<Vec<_>, shm_core::Error>>(
                 )?;
+                let ctrls: Vec<&ChunkCtrl> = pools
+                    .iter()
+                    .zip(group.iter())
+                    .map(|(p, d)| p.ctrl(d))
+                    .collect::<core::result::Result<Vec<_>, shm_core::Error>>()?;
                 let batch = read_batch_chunks(self.inner.clone(), group, &ctrls, registry)?;
                 batches.push(batch);
             }

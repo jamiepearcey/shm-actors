@@ -29,7 +29,7 @@ use shm_runtime::demo::{
 };
 use shm_runtime::{Coordinator, Node, Result, RuntimeConfig};
 use shm_store::{RefKind, TypedRef};
-use shm_task::{now_nanos, Outcome};
+use shm_task::{now_nanos, Outcome, SpinBudget};
 
 const DATASET: &str = "dataset/X";
 const RESULT: &str = "result/X";
@@ -37,20 +37,18 @@ const RESULT: &str = "result/X";
 fn unique_seg_base() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed) as u64;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64;
     let pid = std::process::id() as u64;
-    // Within the band, the per-call counter owns the low 16 slots and the
-    // pid/clock hash picks one of 16 sub-blocks above them, so two tests in
-    // THIS binary can never draw overlapping ranges (they ran in parallel
-    // threads and the loser died `EEXIST` on bind) while separate runs stay
-    // apart. Everything stays inside this binary's 4 MiB-wide band.
-    104194304
-        + n * 16_384
-        + ((((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 16) as u32) * 16_384 * 16
+    // Every coordinator owns `base .. base + 2 MiB`: dedicated payload segment
+    // ids start at `base + 1 MiB` and are never reused, so two bands must be at
+    // least that far apart. This binary owns 32 draws; the per-call counter
+    // and the pid/clock hash together pick one, so neither two tests in this
+    // binary nor two binaries can overlap.
+    435544320 + (((n + ((pid.wrapping_mul(2_654_435_761)) ^ nanos)) % 32) as u32) * 2097152
 }
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -407,7 +405,7 @@ fn g1_crash_reclaim_multiprocess() {
     let outcome = front
         .task_queue()
         .unwrap()
-        .wait(handle)
+        .wait(handle, SpinBudget::PARK_NOW)
         .expect("wait outcome");
     let result_desc = match outcome {
         Outcome::Done(d) => d,

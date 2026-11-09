@@ -113,8 +113,12 @@ pub struct ClientReport {
     pub risk_replies: u64,
     /// Latency percentiles, nanoseconds.
     pub p50_ns: u64,
+    /// p95.
+    pub p95_ns: u64,
     /// p99.
     pub p99_ns: u64,
+    /// p99.9 — the percentile a spin budget is actually bought for.
+    pub p999_ns: u64,
     /// Max.
     pub max_ns: u64,
     /// Wall time of the whole run, nanoseconds.
@@ -155,7 +159,9 @@ impl ClientReport {
             redelivered: num("redelivered"),
             risk_replies: num("risk_replies"),
             p50_ns: num("p50_ns"),
+            p95_ns: num("p95_ns"),
             p99_ns: num("p99_ns"),
+            p999_ns: num("p999_ns"),
             max_ns: num("max_ns"),
             elapsed_ns: num("elapsed_ns"),
             throughput: m
@@ -180,14 +186,16 @@ impl ClientReport {
             .map(|(p, n, t)| format!("{p}:{n}:{t}"))
             .collect();
         format!(
-            "asks={}\nreplies={}\nerrors={}\nredelivered={}\nrisk_replies={}\np50_ns={}\np99_ns={}\nmax_ns={}\nelapsed_ns={}\nthroughput={:.1}\nversion_changes={}\nincarnations={}\n",
+            "asks={}\nreplies={}\nerrors={}\nredelivered={}\nrisk_replies={}\np50_ns={}\np95_ns={}\np99_ns={}\np999_ns={}\nmax_ns={}\nelapsed_ns={}\nthroughput={:.1}\nversion_changes={}\nincarnations={}\n",
             self.asks,
             self.replies,
             self.errors,
             self.redelivered,
             self.risk_replies,
             self.p50_ns,
+            self.p95_ns,
             self.p99_ns,
+            self.p999_ns,
             self.max_ns,
             self.elapsed_ns,
             self.throughput,
@@ -202,6 +210,8 @@ impl ClientReport {
 pub struct PricerOpts {
     /// Busy-poll the mailbox.
     pub spin: bool,
+    /// Bounded spin budget in nanoseconds, forwarded as `--spin-ns`.
+    pub spin_ns: Option<u64>,
     /// Bare mode: no envelope, no pin — `claim → complete(ZERO)`.
     pub bare: bool,
     /// Claim lease in ms (default 500).
@@ -217,6 +227,10 @@ impl PricerOpts {
         let mut a = vec!["pricer".to_string(), "--uds".to_string(), uds.to_string()];
         if self.spin {
             a.push("--spin".into());
+        }
+        if let Some(ns) = self.spin_ns {
+            a.push("--spin-ns".into());
+            a.push(ns.to_string());
         }
         if self.bare {
             a.push("--bare".into());
@@ -274,6 +288,8 @@ pub struct ClientOpts {
     pub clients: u32,
     /// Busy-poll for replies.
     pub spin: bool,
+    /// Bounded spin budget in nanoseconds, forwarded as `--spin-ns`.
+    pub spin_ns: Option<u64>,
     /// Bare mode (no envelope; pairs with a `--bare` pricer).
     pub bare: bool,
     /// Alternate asks between the `pricer` and `risk` actors (odd `seq` → risk).
@@ -291,6 +307,7 @@ impl ClientOpts {
             n,
             clients: 1,
             spin: false,
+            spin_ns: None,
             bare: false,
             mix: false,
             kill_after_reply: None,
@@ -315,6 +332,10 @@ pub fn run_client(exe: &str, uds: &str, dir: &Path, tag: &str, opts: &ClientOpts
     ];
     if opts.spin {
         args.push("--spin".into());
+    }
+    if let Some(ns) = opts.spin_ns {
+        args.push("--spin-ns".into());
+        args.push(ns.to_string());
     }
     if opts.bare {
         args.push("--bare".into());
@@ -356,6 +377,10 @@ pub fn run_client_killed(exe: &str, uds: &str, dir: &Path, tag: &str, opts: &Cli
     ];
     if opts.spin {
         args.push("--spin".into());
+    }
+    if let Some(ns) = opts.spin_ns {
+        args.push("--spin-ns".into());
+        args.push(ns.to_string());
     }
     let status = Command::new(exe)
         .args(&args)

@@ -21,7 +21,7 @@ use shm_core::{ChunkDesc, PackedRef, Segment};
 use shm_ring::DoorbellParker;
 use shm_runtime::{Node, TaskQueueHandle};
 use shm_store::KeyedStore;
-use shm_task::{now_nanos, Error as TaskError, Outcome, TaskHandle, TaskStatus};
+use shm_task::{now_nanos, Error as TaskError, Outcome, SpinBudget, TaskHandle, TaskStatus};
 
 use crate::chunk::{MessagePool, DEFAULT_REPLY_BODY};
 use crate::error::{Error, Result};
@@ -30,6 +30,30 @@ use crate::error::{Error, Result};
 /// that has not completed within it is presumed dead and its message is
 /// redelivered (at-least-once) by the coordinator's lease reap.
 pub const DEFAULT_LEASE: Duration = Duration::from_millis(500);
+
+/// The default mailbox spin budget: busy-poll for 3 µs before parking.
+///
+/// Measured, not chosen by feel (`holon-demo spin-sweep`, Apple M4 Max, three
+/// runs of 50 000 asks per point). The floor for a spinning round trip is
+/// 1.2 µs, so the budget has to cover one for a waiter to catch its own answer:
+///
+/// | budget | ask p50 | p99 | asks/s | cores |
+/// |---|---|---|---|---|
+/// | park on first miss | 9.2–9.8 µs | 18.6–27.2 µs | 92–110 K | 1.0 |
+/// | 0.25–0.5 µs | 7.2–11.3 µs | 17.5–22.8 µs | 86–140 K | 1.1 |
+/// | 1–1.75 µs | 1.2–1.4 µs | 9.0–19.7 µs | 229–680 K | 1.3–2.0 |
+/// | **3 µs** | **1.2 µs** | **2.3–2.5 µs** | **662–688 K** | **2.06** |
+/// | never park | 1.2–1.3 µs | 2.2–2.5 µs | 634–690 K | 2.6–2.7 |
+///
+/// Below one round trip the spin buys nothing and burns cycles anyway — those
+/// budgets are strictly worse than parking. Between 1 and 2 µs the budget
+/// straddles the round trip, so jitter flips individual asks into a park and
+/// the tail is unstable. At 3 µs the p99 has settled and the remaining gain
+/// from spinning forever is p99.9 only, bought with another 0.6 of a core.
+///
+/// The cost is bounded and paid only on the way to idle: a worker with nothing
+/// to do spins this long once, then parks and costs nothing until the doorbell.
+pub const DEFAULT_SPIN_BUDGET: SpinBudget = SpinBudget::from_nanos(3_000);
 
 /// How far ahead of `now` an ask's submit deadline is set. Only bounds the
 /// pre-claim window: the claim re-stamps a fresh lease (see [`DEFAULT_LEASE`]).
@@ -176,15 +200,17 @@ impl<'a> Cx<'a> {
             .map_err(|e| holon_core::Error::Cell(e.to_string()))
     }
 
-    /// The largest payload one object may hold, read from the store pool rather
-    /// than assumed — see [`ObjectStore::max_object`].
+    /// The largest payload the **shared pool** can hold, read from the store
+    /// pool rather than assumed — see [`ObjectStore::max_object`].
     ///
-    /// A handler that asks before it encodes can refuse an oversized answer as
-    /// *data*, with the number in the message, instead of discovering the
-    /// ceiling as a store error after the work is done. This is the **object**
-    /// ceiling — a payload is split across as many segments as it needs and all
-    /// of them install as one version — not one chunk's worth; a handler that
-    /// wants the per-segment figure asks [`ObjectStore::max_payload`].
+    /// No longer a refusal threshold: a payload past it is not rejected, it is
+    /// written into a dedicated segment of its own. It is the line between the
+    /// two placements, so a handler that cares about the *cost* of its answer —
+    /// a coordinator round trip and an `mmap` per reader on the far side — can
+    /// ask before it encodes and stay under it. A payload below the line is
+    /// split across as many segments as it needs and all of them install as one
+    /// version; a handler that wants the per-segment figure asks
+    /// [`ObjectStore::max_payload`].
     pub fn max_object_bytes(&self) -> holon_core::Result<u64> {
         self.objects
             .max_object()
@@ -319,7 +345,7 @@ pub struct ActorSystem {
     /// Sorted by id.
     actors: Vec<(ActorId, Box<dyn Spawnable>)>,
     lease: Duration,
-    spin: bool,
+    spin: SpinBudget,
     stop: Option<Arc<AtomicBool>>,
 }
 
@@ -335,7 +361,7 @@ impl ActorSystem {
             node,
             actors: Vec::new(),
             lease: DEFAULT_LEASE,
-            spin: false,
+            spin: DEFAULT_SPIN_BUDGET,
             stop: None,
         })
     }
@@ -384,8 +410,25 @@ impl ActorSystem {
     }
 
     /// Busy-poll the mailbox instead of parking on the doorbell (the floor
-    /// measurement; burns a core).
+    /// measurement; burns a core). Sugar for the two endpoints of
+    /// [`set_spin_budget`](Self::set_spin_budget).
     pub fn set_spin(&mut self, spin: bool) {
+        self.spin = if spin {
+            SpinBudget::NEVER_PARK
+        } else {
+            SpinBudget::PARK_NOW
+        };
+    }
+
+    /// How long a worker busy-polls the mailbox before parking on the work
+    /// doorbell.
+    ///
+    /// The default is [`DEFAULT_SPIN_BUDGET`] (3 µs), which is where the
+    /// measured curve stops paying. Raise it toward
+    /// [`SpinBudget::NEVER_PARK`] to buy p99.9 with a core; drop it to
+    /// [`SpinBudget::PARK_NOW`] for an actor that is idle almost always and
+    /// whose latency nobody is watching.
+    pub fn set_spin_budget(&mut self, spin: SpinBudget) {
         self.spin = spin;
     }
 
@@ -421,10 +464,16 @@ impl ActorSystem {
         // keyed store. Every actor in this process shares one.
         let oside = ObjectSide::open(&mut node)?;
         let registry = node.registry().clone();
-        let store: KeyedStore<'_> = node.store()?;
+        // `open_store` then `opened_store`, not `store()`: the latter's `&mut`
+        // borrow would live as long as the handle and lock the node out of
+        // granting a dedicated segment for a large object, which the object
+        // store needs `&Node` for.
+        node.open_store()?;
+        let node_ref = &node;
+        let store: KeyedStore<'_> = node_ref.opened_store()?;
         let store_ref = &store;
         let topics = TopicLog::new(store_ref, &side, registry.clone());
-        let objects = ObjectStore::new(store_ref, &oside, registry);
+        let objects = ObjectStore::new(store_ref, &oside, registry, node_ref);
         let planes = Planes {
             store: store_ref,
             topics: &topics,
@@ -444,7 +493,7 @@ impl ActorSystem {
             // Idle workers re-check the stop flag every park cycle (the
             // parker's timeout bounds the wait), so a system stops without
             // needing one more message to arrive.
-            let claimed = if spin {
+            let claimed = if spin.never_parks() {
                 loop {
                     if let Some(t) = tq.claim(lease_nanos) {
                         break t;
@@ -457,7 +506,7 @@ impl ActorSystem {
             } else {
                 match tq
                     .queue()
-                    .claim_once_parked(worker_id, lease_nanos, &parker)
+                    .claim_once_parked(worker_id, lease_nanos, &parker, spin)
                 {
                     Some(t) => t,
                     None => continue,
@@ -631,7 +680,7 @@ pub struct ActorRef {
     to: ActorId,
     from: ActorId,
     corr: AtomicU64,
-    spin: bool,
+    spin: SpinBudget,
     /// Reply chunks of asks that were dropped before going terminal, with the
     /// journal slot that owns each. A handler may still write into them, so
     /// they are released only once the task is observed terminal
@@ -795,7 +844,7 @@ impl ActorRef {
             to,
             from,
             corr: AtomicU64::new(1),
-            spin: false,
+            spin: DEFAULT_SPIN_BUDGET,
             orphans: Mutex::new(Vec::new()),
         })
     }
@@ -836,6 +885,17 @@ impl ActorRef {
 
     /// Busy-poll for replies instead of parking on the done doorbell.
     pub fn set_spin(&mut self, spin: bool) {
+        self.spin = if spin {
+            SpinBudget::NEVER_PARK
+        } else {
+            SpinBudget::PARK_NOW
+        };
+    }
+
+    /// How long an `ask` busy-polls for its answer before parking on the done
+    /// doorbell. See [`ActorSystem::set_spin_budget`]; the asker and the
+    /// handler are independent halves of the round trip and either can park.
+    pub fn set_spin_budget(&mut self, spin: SpinBudget) {
         self.spin = spin;
     }
 
@@ -1174,7 +1234,7 @@ impl ActorRef {
     /// Block until `pending`'s task is terminal. A `StaleHandle` counts: the
     /// slot was reused, which only happens after it went terminal.
     fn await_terminal(&self, pending: &PendingAsk) -> core::result::Result<Outcome, TaskError> {
-        if self.spin {
+        if self.spin.never_parks() {
             loop {
                 match self.tq.queue().poll(pending.handle) {
                     Ok(TaskStatus::Done(_)) => break Ok(Outcome::Done(ChunkDesc::ZERO)),
@@ -1186,7 +1246,11 @@ impl ActorRef {
                 }
             }
         } else {
-            match self.tq.queue().wait(pending.handle, &self.done_parker) {
+            match self
+                .tq
+                .queue()
+                .wait(pending.handle, &self.done_parker, self.spin)
+            {
                 Err(TaskError::StaleHandle) => Ok(Outcome::Done(ChunkDesc::ZERO)),
                 other => other,
             }

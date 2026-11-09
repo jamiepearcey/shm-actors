@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use holon_actor::{ActorRef, ActorSystem};
+use holon_actor::{ActorRef, ActorSystem, SpinBudget};
 use holon_core::{ActorId, Payload};
 use shm_arrow::SchemaRegistry;
 use shm_core::ChunkDesc;
@@ -93,9 +93,10 @@ pub fn run(opts: &Opts) -> i32 {
         "client" => run_client_role(opts),
         "supervisor" => run_supervisor(opts),
         "bench" => run_bench(opts),
+        "spin-sweep" => run_spin_sweep(opts),
         other => {
             eprintln!(
-                "unknown role {other:?}; expected coordinator|curve-publish|pricer|client|supervisor|bench"
+                "unknown role {other:?}; expected coordinator|curve-publish|pricer|client|supervisor|bench|spin-sweep"
             );
             2
         }
@@ -182,10 +183,20 @@ fn start_parent_watch() {
     });
 }
 
+/// Resolve the two CLI knobs into one budget: `--spin-ns <n>` wins, then
+/// `--spin` (never park, the latency floor), else park on the first miss.
+fn spin_budget(spin: bool, spin_ns: Option<u64>) -> SpinBudget {
+    match (spin_ns, spin) {
+        (Some(ns), _) => SpinBudget::from_nanos(ns),
+        (None, true) => SpinBudget::NEVER_PARK,
+        (None, false) => SpinBudget::PARK_NOW,
+    }
+}
+
 fn run_pricer(opts: &Opts) -> i32 {
     let uds = opts.uds();
     let lease = Duration::from_millis(opts.num("lease-ms").unwrap_or(500));
-    let spin = opts.flag("--spin");
+    let spin = spin_budget(opts.flag("--spin"), opts.num::<u64>("spin-ns"));
     let result = opts.result();
     if opts.flag("--parent-watch") {
         start_parent_watch();
@@ -205,7 +216,7 @@ fn run_pricer(opts: &Opts) -> i32 {
         return 1;
     }
     sys.set_lease(lease);
-    sys.set_spin(spin);
+    sys.set_spin_budget(spin);
     let kill_after = opts.num::<u64>("kill-after");
     // Two actors, one mailbox: the envelope's `to` picks the host.
     let spawned = sys
@@ -230,7 +241,7 @@ fn run_pricer(opts: &Opts) -> i32 {
 /// Bare mode: the same mailbox loop with no envelope and no pin — `claim →
 /// complete(ZERO)`. The difference between this and the real pricer is the
 /// envelope-in-a-chunk detour plus the pin plus the handler.
-fn run_bare_pricer(uds: &str, lease: Duration, spin: bool, result: Option<&Path>) -> i32 {
+fn run_bare_pricer(uds: &str, lease: Duration, spin: SpinBudget, result: Option<&Path>) -> i32 {
     let mut node = match connect(uds, "pricer-bare") {
         Ok(n) => n,
         Err(e) => {
@@ -251,7 +262,7 @@ fn run_bare_pricer(uds: &str, lease: Duration, spin: bool, result: Option<&Path>
         append_line(p, &format!("READY {} {}", std::process::id(), unix_nanos()));
     }
     loop {
-        let claimed = if spin {
+        let claimed = if spin.never_parks() {
             loop {
                 if let Some(t) = tq.claim(lease_nanos) {
                     break t;
@@ -259,8 +270,14 @@ fn run_bare_pricer(uds: &str, lease: Duration, spin: bool, result: Option<&Path>
                 std::hint::spin_loop();
             }
         } else {
-            tq.queue()
-                .claim_blocking_with_lease(tq.worker_id(), lease_nanos, &parker)
+            loop {
+                if let Some(t) =
+                    tq.queue()
+                        .claim_once_parked(tq.worker_id(), lease_nanos, &parker, spin)
+                {
+                    break t;
+                }
+            }
         };
         let _ = claimed.complete(ChunkDesc::ZERO);
     }
@@ -289,7 +306,7 @@ fn client_thread(
     uds: &str,
     idx: u32,
     n: u64,
-    spin: bool,
+    spin: SpinBudget,
     bare: bool,
     mix: bool,
     kill_after_reply: Option<u64>,
@@ -319,7 +336,7 @@ fn client_thread(
             let h = tq.submit(req, deadline).map_err(|e| e.to_string())?;
             // A stale handle after a wait is terminal (the slot was reused, so
             // it completed first); bare mode carries no result, so it counts.
-            let outcome = if spin {
+            let outcome = if spin.never_parks() {
                 loop {
                     match tq.queue().poll(h) {
                         Ok(shm_task::TaskStatus::Done(d)) => break Outcome::Done(d),
@@ -331,7 +348,7 @@ fn client_thread(
                     }
                 }
             } else {
-                match tq.queue().wait(h, &parker) {
+                match tq.queue().wait(h, &parker, spin) {
                     Ok(o) => o,
                     Err(shm_task::Error::StaleHandle) => Outcome::Done(ChunkDesc::ZERO),
                     Err(e) => return Err(e.to_string()),
@@ -348,11 +365,11 @@ fn client_thread(
 
     let mut actor =
         ActorRef::new(&mut node, ActorId::named(PRICER_NAME)).map_err(|e| e.to_string())?;
-    actor.set_spin(spin);
+    actor.set_spin_budget(spin);
     // A second ref over the same node + mailbox, addressed to the other actor.
     let mut risk =
         ActorRef::new(&mut node, ActorId::named(RISK_NAME)).map_err(|e| e.to_string())?;
-    risk.set_spin(spin);
+    risk.set_spin_budget(spin);
     let mut last_version: Option<u64> = None;
     barrier.wait();
     for seq in 0..n {
@@ -444,7 +461,7 @@ fn run_client_role(opts: &Opts) -> i32 {
     let uds = opts.uds();
     let n: u64 = opts.num("n").unwrap_or(1000);
     let clients: u32 = opts.num("clients").unwrap_or(1).max(1);
-    let spin = opts.flag("--spin");
+    let spin = spin_budget(opts.flag("--spin"), opts.num::<u64>("spin-ns"));
     let bare = opts.flag("--bare");
     let mix = opts.flag("--mix");
     let kill_after_reply = opts.num::<u64>("kill-after-reply");
@@ -502,7 +519,9 @@ fn run_client_role(opts: &Opts) -> i32 {
         redelivered: reports.iter().map(|r| r.redelivered).sum(),
         risk_replies: reports.iter().map(|r| r.risk_replies).sum(),
         p50_ns: percentile(&samples, 0.50),
+        p95_ns: percentile(&samples, 0.95),
         p99_ns: percentile(&samples, 0.99),
+        p999_ns: percentile(&samples, 0.999),
         max_ns: samples.last().copied().unwrap_or(0),
         elapsed_ns: elapsed.as_nanos() as u64,
         throughput: n as f64 / elapsed.as_secs_f64(),
@@ -513,7 +532,13 @@ fn run_client_role(opts: &Opts) -> i32 {
         "client: {} asks over {} client(s){}{}{}: p50={:.1}us p99={:.1}us max={:.1}us  {:.0} asks/s  errors={} redelivered={} risk_replies={} version_changes={} incarnations={}",
         report.asks,
         clients,
-        if spin { " [spin]" } else { "" },
+        if spin.never_parks() {
+            " [spin]".to_string()
+        } else if spin.parks_immediately() {
+            String::new()
+        } else {
+            format!(" [spin {:.1}us]", spin.as_nanos() as f64 / 1e3)
+        },
         if bare { " [bare]" } else { "" },
         if mix { " [mix pricer+risk]" } else { "" },
         report.p50_ns as f64 / 1e3,
@@ -547,6 +572,7 @@ fn run_supervisor(opts: &Opts) -> i32 {
     let kill_after = opts.num::<u64>("kill-after");
     let lease_ms = opts.num::<u64>("lease-ms");
     let spin = opts.flag("--spin");
+    let spin_ns = opts.num::<u64>("spin-ns");
     let exe = std::env::current_exe().expect("current exe");
     // SAFETY: installing a signal handler that only stores to an atomic.
     unsafe {
@@ -570,6 +596,10 @@ fn run_supervisor(opts: &Opts) -> i32 {
         ];
         if spin {
             args.push("--spin".into());
+        }
+        if let Some(ns) = spin_ns {
+            args.push("--spin-ns".into());
+            args.push(ns.to_string());
         }
         if let Some(l) = lease_ms {
             args.push("--lease-ms".into());
@@ -631,6 +661,131 @@ fn run_supervisor(opts: &Opts) -> i32 {
 
 fn fmt_us(ns: u64) -> String {
     format!("{:.1} µs", ns as f64 / 1e3)
+}
+
+/// CPU seconds burnt by every child this process has already reaped
+/// (`RUSAGE_CHILDREN`, user + system). Sampled either side of a sweep point it
+/// gives that point's total CPU — pricer *and* client — which is the price of
+/// the latency, and the half of the trade a latency chart alone hides.
+fn children_cpu_seconds() -> f64 {
+    // SAFETY: one zeroed `rusage` written by the kernel; no borrow escapes.
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) != 0 {
+            return 0.0;
+        }
+        let s = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+        s(ru.ru_utime) + s(ru.ru_stime)
+    }
+}
+
+/// The spin/park operating curve: one 1-client / 1-pricer run per budget, with
+/// the *same* budget on both halves of the round trip.
+///
+/// Spin and park were the two endpoints of one axis; this walks the axis. The
+/// interesting column is not p50 — it is where the p99.9 falls off and what the
+/// core-seconds column costs to get there.
+fn run_spin_sweep(opts: &Opts) -> i32 {
+    let n: u64 = opts.num("n").unwrap_or(50_000);
+    let runs: u32 = opts.num("runs").unwrap_or(2);
+    let lease_ms: u64 = 500;
+    let exe = std::env::current_exe().expect("current exe");
+    let exe = exe.to_str().unwrap().to_string();
+    let dir = std::env::temp_dir().join(format!("holon-sweep-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("sweep dir");
+    let uds = dir.join("coord.sock");
+    let uds_s = uds.to_str().unwrap().to_string();
+
+    // PARK_NOW and NEVER_PARK are the endpoints the substrate already had; the
+    // rest is the axis between them. 10 µs brackets the measured parked round
+    // trip, so a budget past it should stop buying anything.
+    let points: Vec<(&str, Option<u64>, bool)> = vec![
+        ("park now", None, false),
+        ("0.25 µs", Some(250), false),
+        ("0.5 µs", Some(500), false),
+        ("1 µs", Some(1_000), false),
+        ("1.25 µs", Some(1_250), false),
+        ("1.5 µs", Some(1_500), false),
+        ("1.75 µs", Some(1_750), false),
+        ("2 µs", Some(2_000), false),
+        ("3 µs", Some(3_000), false),
+        ("5 µs", Some(5_000), false),
+        ("10 µs", Some(10_000), false),
+        ("20 µs", Some(20_000), false),
+        ("50 µs", Some(50_000), false),
+        ("never park", None, true),
+    ];
+
+    println!("holon-demo spin-sweep — MEASURED, macOS poll(2) doorbell");
+    println!(
+        "build: {}   n={n} asks per point, {runs} run(s), 1 client / 1 pricer, same budget both halves",
+        if cfg!(debug_assertions) { "DEBUG (use --release)" } else { "release" }
+    );
+
+    let mut config = RuntimeConfig::with_seg_base(unique_seg_base());
+    config.lease_deadline = Duration::from_millis(lease_ms);
+    let mut coord = Coordinator::bind(&uds, config).expect("bind coordinator");
+    coord.start().expect("start coordinator");
+    publish_curve(&exe, &uds_s, 0.0);
+
+    for run in 1..=runs {
+        println!("\n== run {run}/{runs} ==");
+        println!(
+            "{:<11} {:>8} {:>8} {:>8} {:>9} {:>10} {:>9} {:>7}",
+            "budget", "p50", "p95", "p99", "p99.9", "asks/s", "core·s", "cores"
+        );
+        for (label, ns, never) in &points {
+            let cpu0 = children_cpu_seconds();
+            let report = {
+                let _p = spawn_pricer(
+                    &exe,
+                    &uds_s,
+                    &dir,
+                    "sweep",
+                    &PricerOpts {
+                        spin: *never,
+                        spin_ns: *ns,
+                        ..PricerOpts::default()
+                    },
+                );
+                run_client(
+                    &exe,
+                    &uds_s,
+                    &dir,
+                    "sweep",
+                    &ClientOpts {
+                        spin: *never,
+                        spin_ns: *ns,
+                        ..ClientOpts::parked(n)
+                    },
+                )
+            };
+            // The pricer is SIGKILLed by the Reaper above and reaped in its
+            // Drop, so both children are accounted for by the time we sample.
+            let cpu = children_cpu_seconds() - cpu0;
+            let wall = report.elapsed_ns as f64 / 1e9;
+            println!(
+                "{:<11} {:>8} {:>8} {:>8} {:>9} {:>10.0} {:>9.2} {:>7.2}",
+                label,
+                fmt_us(report.p50_ns),
+                fmt_us(report.p95_ns),
+                fmt_us(report.p99_ns),
+                fmt_us(report.p999_ns),
+                report.throughput,
+                cpu,
+                if wall > 0.0 { cpu / wall } else { 0.0 },
+            );
+            if report.errors > 0 || report.lost() > 0 {
+                println!(
+                    "   !! errors={} lost={} at budget {label}",
+                    report.errors,
+                    report.lost()
+                );
+            }
+        }
+    }
+    println!("\ncore·s = CPU seconds burnt by pricer + client for the whole point; cores = that over wall time.");
+    0
 }
 
 fn run_bench(opts: &Opts) -> i32 {

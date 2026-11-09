@@ -13,7 +13,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 
 use shm_arrow::SchemaRegistry;
-use shm_artifact::{Artifact, Commit, Delta, VersionPin, WindowPolicy};
+use shm_artifact::{
+    Artifact, Commit, Delta, NoForeignSegments, SegmentMap, VersionPin, WindowPolicy,
+};
 use shm_core::{BorrowJournal, Segment};
 
 use crate::catalog::{Catalog, RefKind};
@@ -50,6 +52,9 @@ pub struct KeyedStore<'a> {
     registry: Arc<SchemaRegistry>,
     owner: u32,
     resolver: &'a dyn KeyResolver,
+    /// The dedicated segments this handle can resolve (see
+    /// [`with_segments`](KeyedStore::with_segments)).
+    segments: Arc<dyn SegmentMap>,
 }
 
 impl<'a> KeyedStore<'a> {
@@ -81,7 +86,31 @@ impl<'a> KeyedStore<'a> {
             registry,
             owner,
             resolver,
+            segments: Arc::new(NoForeignSegments),
         }
+    }
+
+    /// Install the [`SegmentMap`] every entry of this store resolves
+    /// **dedicated** segments through.
+    ///
+    /// An object too large for the shared pool's biggest size class is written
+    /// into a segment of its own, and the descriptors its version lists name
+    /// that segment rather than this store's data segment. Without a map such a
+    /// descriptor is refused ([`shm_core::Error::WrongSegment`]) rather than
+    /// misresolved — which is right, but it also means a handle that may
+    /// **retire** such a version needs the map just as much as one that reads
+    /// it: a retire without it fails closed and leaves the chunk published.
+    /// So this belongs on the store, not on the reader, and the runtime installs
+    /// its node's map on every handle it hands out.
+    pub fn with_segments(mut self, segments: Arc<dyn SegmentMap>) -> KeyedStore<'a> {
+        self.segments = segments;
+        self
+    }
+
+    /// The dedicated segments this handle resolves descriptors against.
+    #[inline]
+    pub fn segments(&self) -> &Arc<dyn SegmentMap> {
+        &self.segments
     }
 
     /// The store's shared **data** segment (one pool backing every entry's
@@ -133,7 +162,8 @@ impl<'a> KeyedStore<'a> {
             self.head_seg.clone(),
             slot.head_off() as usize,
             self.data_seg.clone(),
-        )?;
+        )?
+        .with_segments(self.segments.clone());
         Ok(Entry {
             artifact,
             key_id: slot.key_id(),
@@ -174,7 +204,8 @@ impl<'a> KeyedStore<'a> {
             self.head_seg.clone(),
             head_off as usize,
             self.data_seg.clone(),
-        )?;
+        )?
+        .with_segments(self.segments.clone());
         // Publish the slot LIVE (recomputes the same artifact_id/head_off).
         cat.publish_slot(idx, key_id, kind);
         Ok(Entry {
@@ -256,7 +287,9 @@ impl<'a> KeyedStore<'a> {
             self.head_seg.clone(),
             slot.head_off() as usize,
             self.data_seg.clone(),
-        ) {
+        )
+        .map(|a| a.with_segments(self.segments.clone()))
+        {
             Ok(artifact) => match artifact.evict_all() {
                 Ok(()) | Err(shm_artifact::Error::Stale) => {}
                 Err(e) => return Err(e.into()),
@@ -277,13 +310,24 @@ impl<'a> KeyedStore<'a> {
     /// straggler handle (the sweep re-runs the teardown before it judges
     /// quiescence, so those converge too).
     pub fn reclaim_tombstones(&self) -> Result<usize> {
-        sweep_tombstones(&self.catalog_seg, &self.head_seg, &self.data_seg)
+        sweep_tombstones(
+            &self.catalog_seg,
+            &self.head_seg,
+            &self.data_seg,
+            &self.segments,
+        )
     }
 
     /// Try to reclaim the one slot at `idx` (already tombstoned).
     fn try_reclaim_slot(&self, cat: &Catalog<'_>, idx: u32) {
         cat.try_reclaim(idx, |artifact_id, head_off| {
-            entry_is_finished(&self.head_seg, &self.data_seg, artifact_id, head_off)
+            entry_is_finished(
+                &self.head_seg,
+                &self.data_seg,
+                &self.segments,
+                artifact_id,
+                head_off,
+            )
         });
     }
 
@@ -566,10 +610,12 @@ pub struct RetainedRef {
 /// Segment-level (like [`sweep_tombstones`]) because the **coordinator** runs
 /// the reap backstop from its monitor tick with the store's segments and no
 /// actor journal.
+#[allow(clippy::too_many_arguments)]
 pub fn release_task_binding(
     catalog_seg: &Arc<Segment>,
     head_seg: &Arc<Segment>,
     data_seg: &Arc<Segment>,
+    segments: &Arc<dyn SegmentMap>,
     artifact_id: u32,
     incarnation: u32,
     version: u64,
@@ -588,7 +634,10 @@ pub fn release_task_binding(
         head_off,
         data_seg.clone(),
     ) {
-        Ok(artifact) => artifact.release_leaked_pin(version).unwrap_or(false),
+        Ok(artifact) => artifact
+            .with_segments(segments.clone())
+            .release_leaked_pin(version)
+            .unwrap_or(false),
         Err(_) => false, // stale incarnation (or nothing live): drop the binding
     }
 }
@@ -604,10 +653,11 @@ pub fn sweep_tombstones(
     catalog_seg: &Arc<Segment>,
     head_seg: &Arc<Segment>,
     data_seg: &Arc<Segment>,
+    segments: &Arc<dyn SegmentMap>,
 ) -> Result<usize> {
     let cat = Catalog::attach(catalog_seg)?;
     Ok(cat.reclaim_tombstones(|artifact_id, head_off| {
-        entry_is_finished(head_seg, data_seg, artifact_id, head_off)
+        entry_is_finished(head_seg, data_seg, segments, artifact_id, head_off)
     }))
 }
 
@@ -634,6 +684,7 @@ pub fn sweep_tombstones(
 fn entry_is_finished(
     head_seg: &Arc<Segment>,
     data_seg: &Arc<Segment>,
+    segments: &Arc<dyn SegmentMap>,
     artifact_id: u32,
     head_off: u32,
 ) -> bool {
@@ -643,7 +694,7 @@ fn entry_is_finished(
         head_off as usize,
         data_seg.clone(),
     ) {
-        Ok(a) => a,
+        Ok(a) => a.with_segments(segments.clone()),
         // Nothing attachable here (e.g. the previous occupant was reclaimed and
         // no new one commissioned). Leave it for the next pass rather than
         // guessing.

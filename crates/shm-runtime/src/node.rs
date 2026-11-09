@@ -23,7 +23,7 @@ use shm_core::{BorrowJournal, ChunkDesc, JournalEntry, Pool, Segment};
 use shm_ring::{DoorbellNotifier, DoorbellParker, Msg, Publisher, Ring, Subscriber};
 use shm_store::{read_typed_ref, write_typed_ref, KeyResolver, KeyedStore, TypedRef};
 use shm_stream::{Commit, Coordination, StreamWriter};
-use shm_task::{now_nanos, ClaimedTask, Outcome, TaskHandle, TaskQueue, TaskStatus};
+use shm_task::{now_nanos, ClaimedTask, Outcome, SpinBudget, TaskHandle, TaskQueue, TaskStatus};
 
 use crate::error::{Error, Result};
 use crate::protocol::{Request, Response};
@@ -85,6 +85,58 @@ struct KeyCache {
     by_id: HashMap<u32, Vec<u8>>,
 }
 
+/// A dedicated payload segment this node has mapped.
+struct MappedPayloadSegment {
+    segment: Arc<Segment>,
+    /// The borrow-journal slot holding the segment's **staging** entry, and
+    /// `None` once [`install_payload_segment`](Node::install_payload_segment)
+    /// has closed that window — from then on the object's chunk, not this
+    /// node's liveness, is what keeps the segment alive.
+    staging_slot: Option<usize>,
+}
+
+/// Every dedicated payload segment this node holds, by id — and the
+/// [`SegmentMap`] every artifact handle this node hands out resolves foreign
+/// descriptors through.
+///
+/// A version whose data is too large for the shared pool's biggest size class
+/// names a segment of its own, and `shm-artifact` refuses such a descriptor
+/// unless a map answers for it (it never falls back to the store segment,
+/// because [`Pool::locate`](shm_core::Pool) addresses by offset alone and would
+/// hit a real, unrelated control block). This *is* the node's answer: a segment
+/// enters it when the node creates one ([`create_payload_segment`](Node::create_payload_segment))
+/// or maps one ([`map_payload_segment`](Node::map_payload_segment)), and every
+/// [`KeyedStore`] the node builds carries it, so a store entry can commit,
+/// read, retire and evict a large object without any further wiring.
+///
+/// Held behind an `Arc` rather than inline in [`Node`] precisely so it can be
+/// handed to an artifact, whose `Arc<dyn SegmentMap>` outlives any borrow.
+#[derive(Default)]
+pub struct NodeSegments {
+    map: Mutex<HashMap<u32, MappedPayloadSegment>>,
+}
+
+impl NodeSegments {
+    fn get(&self, seg_id: u32) -> Option<Arc<Segment>> {
+        self.map
+            .lock()
+            .expect("payload segments poisoned")
+            .get(&seg_id)
+            .map(|e| e.segment.clone())
+    }
+}
+
+impl shm_artifact::SegmentMap for NodeSegments {
+    fn segment(&self, segment_id: u32) -> Option<Arc<Segment>> {
+        self.get(segment_id)
+    }
+}
+
+// `Segment` owns raw pointers into its mapping, so the auto-impl does not
+// apply; every access here is through a mutex over `Arc<Segment>` handles whose
+// contents are only ever read through atomics or immutable bytes.
+impl std::panic::RefUnwindSafe for NodeSegments {}
+
 /// An actor's handle onto a running coordinator's substrate.
 pub struct Node {
     name: String,
@@ -106,7 +158,7 @@ pub struct Node {
     /// shared data segment is one mapping, and each large object is another.
     /// Held so a reader can resolve `ChunkDesc::segment_id` without asking the
     /// coordinator again.
-    payload_segments: Mutex<HashMap<u32, (Arc<Segment>, usize)>>,
+    payload_segments: Arc<NodeSegments>,
     /// Guarded send side (shared with the heartbeat thread).
     send: Arc<Mutex<UnixStream>>,
     /// Read side (responses only; main thread).
@@ -182,7 +234,7 @@ impl Node {
             task_queue: None,
             store: None,
             keys: Mutex::new(KeyCache::default()),
-            payload_segments: Mutex::new(HashMap::new()),
+            payload_segments: Arc::new(NodeSegments::default()),
             send,
             read_stream,
             heartbeat: None,
@@ -331,6 +383,33 @@ impl Node {
         Ok(())
     }
 
+    /// The keyed store, borrowing the node **shared**.
+    ///
+    /// [`store`](Node::store) takes `&mut self` because it maps the store on
+    /// first use, and that mutable borrow then lives as long as the returned
+    /// handle — which makes it impossible to also hold `&Node` for anything
+    /// else, such as granting a dedicated segment for a large object. Call
+    /// [`open_store`](Node::open_store) once, then this.
+    ///
+    /// Fails if the store has not been opened yet, rather than opening it, so
+    /// the shared borrow means what it says.
+    pub fn opened_store(&self) -> Result<KeyedStore<'_>> {
+        let m = self
+            .store
+            .as_ref()
+            .ok_or(Error::Protocol("store not opened; call open_store first"))?;
+        Ok(KeyedStore::new(
+            m.catalog_seg.clone(),
+            m.head_seg.clone(),
+            m.data_seg.clone(),
+            self.journal_seg.clone(),
+            self.registry.clone(),
+            self.actor_id,
+            self,
+        )
+        .with_segments(self.payload_segments.clone()))
+    }
+
     /// A handle onto the built-in keyed store (ADR-0007 G3), mapping it on first
     /// use. Use it to [`create`](shm_store::KeyedStore::create) /
     /// [`open`](shm_store::KeyedStore::open) / [`evict`](shm_store::KeyedStore::evict)
@@ -353,7 +432,8 @@ impl Node {
             this.registry.clone(),
             this.actor_id,
             this,
-        ))
+        )
+        .with_segments(this.payload_segments.clone()))
     }
 
     // ---- v0.5 G1: typed-ref envelope dispatch + resolve (ADR-0007) ----
@@ -720,7 +800,12 @@ impl Node {
     /// The segment is coordinator-owned and outlives this node, so an object
     /// survives its writer. Release it with
     /// [`release_payload_segment`](Node::release_payload_segment).
-    pub fn create_payload_segment(&mut self, bytes: u64) -> Result<Arc<Segment>> {
+    /// Takes `&self`, not `&mut self`, on purpose: a [`KeyedStore`] borrows the
+    /// node for its key resolver, so anything needing `&mut` cannot be called
+    /// while a store is alive — which is exactly when an object store wants a
+    /// segment. The control socket is already shared behind a mutex and
+    /// `request` is `&self`, so nothing here needs exclusive access.
+    pub fn create_payload_segment(&self, bytes: u64) -> Result<Arc<Segment>> {
         let (resp, mut fds) = self.request(&Request::CreatePayloadSegment { bytes })?;
         let seg_id = match resp {
             Response::PayloadSegmentGranted { seg_id, .. } => seg_id,
@@ -744,34 +829,164 @@ impl Node {
         let journal = BorrowJournal::attach(&self.journal_seg)?;
         let slot = journal.record_entry(JournalEntry::payload_segment(seg_id))?;
         self.payload_segments
+            .map
             .lock()
             .expect("payload segments poisoned")
-            .insert(seg_id, (seg.clone(), slot));
+            .insert(
+                seg_id,
+                MappedPayloadSegment {
+                    segment: seg.clone(),
+                    staging_slot: Some(slot),
+                },
+            );
         Ok(seg)
+    }
+
+    /// Close a dedicated segment's **staging window**: the version naming its
+    /// object is installed, so the segment's lifetime now follows that object
+    /// rather than this node's liveness.
+    ///
+    /// The exact mirror of releasing a staged manifest's journal entry after
+    /// its install CAS, and for the same reason. Between `create` and `install`
+    /// nothing but this node knows the segment exists, so the borrow journal is
+    /// what stops a crash from leaking it. After the install, readers pin the
+    /// *version* and the version's manifest holds the `+1` on the object's
+    /// chunk — so reclaiming the segment on this node's death would tear an
+    /// installed object out from under them. From here the coordinator's sweep
+    /// unlinks it, and only once the chunk is back to `FREE`.
+    ///
+    /// The coordinator is told **first**, then the journal entry is dropped:
+    /// dying in between leaves an entry whose replay reclaims only a hold this
+    /// node actually had, which an installed object does not have. The other
+    /// order would leave a segment nothing at all is accountable for.
+    ///
+    /// Rejected if the segment holds no live chunk — installing a quiescent
+    /// segment would invite the next sweep to unlink it under the writer.
+    pub fn install_payload_segment(&self, seg_id: u32) -> Result<()> {
+        let (resp, _fds) = self.request(&Request::InstallPayloadSegment { seg_id })?;
+        match resp {
+            Response::Ack => {}
+            Response::Error { message } => return Err(Error::Rejected(message)),
+            _ => return Err(Error::Protocol("expected Ack")),
+        }
+        let slot = {
+            let mut map = self
+                .payload_segments
+                .map
+                .lock()
+                .expect("payload segments poisoned");
+            map.get_mut(&seg_id).and_then(|e| e.staging_slot.take())
+        };
+        if let Some(slot) = slot {
+            let journal = BorrowJournal::attach(&self.journal_seg)?;
+            let _ = journal.release(slot);
+        }
+        Ok(())
+    }
+
+    /// Map an **installed** dedicated segment this node did not create, so a
+    /// descriptor naming it can be resolved here.
+    ///
+    /// The read side of the large-object path. A version's manifest names its
+    /// chunks by `(segment_id, offset)`, and a descriptor naming a segment this
+    /// process has not mapped is *refused* — never resolved against a different
+    /// segment that happens to contain that offset. So a reader in another
+    /// process cannot read a large object at all until it has called this.
+    ///
+    /// Idempotent: a segment this node already holds (created or mapped) is
+    /// returned without a round-trip.
+    ///
+    /// **Not journaled**, and that is the difference from
+    /// [`create_payload_segment`](Node::create_payload_segment). A creator's
+    /// journal entry covers the staging window because in that window the
+    /// creator is the only thing that knows the segment exists. A reader owns
+    /// nothing: it holds a *pin on the version*, and the version's manifest
+    /// holds the `+1` on the object's chunk. Journaling a reader's mapping
+    /// would invite replay to reason about a lifetime the reader never had.
+    ///
+    /// Fails cleanly rather than granting a stale mapping when the id is
+    /// unknown — including an id whose segment has already been unlinked, since
+    /// payload segment ids are never reused — or when the segment is still
+    /// staged by its creator, whose crash could unlink it out from under this
+    /// reader at any instant.
+    ///
+    /// Call it in the order the pin path establishes: pin the version, read its
+    /// manifest, *then* map the segments the manifest names. The manifest's
+    /// reference is held by then, so the chunk cannot reach `FREE` and the
+    /// coordinator's sweep cannot unlink the segment underneath the mapping.
+    pub fn map_payload_segment(&self, seg_id: u32) -> Result<Arc<Segment>> {
+        if let Some(seg) = self.mapped_payload_segment(seg_id) {
+            return Ok(seg);
+        }
+        let (resp, mut fds) = self.request(&Request::MapPayloadSegment { seg_id })?;
+        match resp {
+            Response::PayloadSegmentGranted {
+                seg_id: granted, ..
+            } if granted == seg_id => {}
+            Response::PayloadSegmentGranted { .. } => {
+                return Err(Error::Protocol("payload segment grant named another id"))
+            }
+            Response::Error { message } => return Err(Error::Rejected(message)),
+            _ => return Err(Error::Protocol("expected PayloadSegmentGranted")),
+        }
+        if fds.len() != 1 {
+            return Err(Error::MissingFds {
+                expected: 1,
+                received: fds.len(),
+            });
+        }
+        let fd = fds.pop().unwrap();
+        // SAFETY: a freshly-received SCM_RIGHTS fd for the segment the
+        // coordinator resolved from `seg_id`; ownership transfers to the
+        // mapping, which re-checks the id against the segment header.
+        let seg = Arc::new(unsafe { Segment::from_raw_fd(into_raw(fd), seg_id)? });
+        let mut map = self
+            .payload_segments
+            .map
+            .lock()
+            .expect("payload segments poisoned");
+        // A concurrent caller may have mapped it while we were on the socket;
+        // converge on one mapping per id so `mapped_payload_segment` is stable.
+        let entry = map.entry(seg_id).or_insert(MappedPayloadSegment {
+            segment: seg,
+            staging_slot: None,
+        });
+        Ok(entry.segment.clone())
     }
 
     /// A dedicated payload segment this node has already mapped.
     ///
     /// How a `ChunkDesc` pointing outside the shared data segment is resolved.
     pub fn mapped_payload_segment(&self, seg_id: u32) -> Option<Arc<Segment>> {
-        self.payload_segments
-            .lock()
-            .expect("payload segments poisoned")
-            .get(&seg_id)
-            .map(|(seg, _)| seg.clone())
+        self.payload_segments.get(seg_id)
+    }
+
+    /// The [`SegmentMap`](shm_artifact::SegmentMap) over every dedicated segment
+    /// this node holds.
+    ///
+    /// Installed on every [`KeyedStore`] this node hands out, so an artifact
+    /// entry resolves a descriptor naming a dedicated segment against that
+    /// segment — for a commit, a pin, a retire and an evict alike — instead of
+    /// refusing it. Exposed so a layer that builds its own store handle (or its
+    /// own artifact) can install the same map rather than inventing a second
+    /// registry of the segments this node has already mapped.
+    #[inline]
+    pub fn segment_map(&self) -> Arc<dyn shm_artifact::SegmentMap> {
+        self.payload_segments.clone()
     }
 
     /// Drop this node's mapping and ask the coordinator to unlink the segment.
     ///
     /// Existing mappings held by other processes stay valid; the name simply
     /// stops resolving, exactly as [`Segment::unlink`] describes.
-    pub fn release_payload_segment(&mut self, seg_id: u32) -> Result<()> {
+    pub fn release_payload_segment(&self, seg_id: u32) -> Result<()> {
         let slot = self
             .payload_segments
+            .map
             .lock()
             .expect("payload segments poisoned")
             .remove(&seg_id)
-            .map(|(_, slot)| slot);
+            .and_then(|e| e.staging_slot);
         // Cross the journal entry off first: if this process dies between the
         // two, replay finds nothing to release and the coordinator's own
         // release is still authoritative. The other order would risk a double
@@ -1192,10 +1407,12 @@ impl TaskQueueHandle {
     }
 
     /// Block (parked on the done doorbell) until the task reaches a terminal
-    /// [`Outcome`].
-    pub fn wait(&self, handle: TaskHandle) -> Result<Outcome> {
+    /// [`Outcome`], busy-polling for `spin` first.
+    ///
+    /// Pass [`SpinBudget::PARK_NOW`] to give the core back on the first miss.
+    pub fn wait(&self, handle: TaskHandle, spin: SpinBudget) -> Result<Outcome> {
         let parker = DoorbellParker::new(self.done_read.try_clone()?);
-        Ok(self.queue.wait(handle, &parker)?)
+        Ok(self.queue.wait(handle, &parker, spin)?)
     }
 }
 

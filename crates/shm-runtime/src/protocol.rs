@@ -58,6 +58,10 @@ pub mod tags {
     pub const CREATE_PAYLOAD_SEGMENT: u8 = 15;
     /// [`Request::ReleasePayloadSegment`].
     pub const RELEASE_PAYLOAD_SEGMENT: u8 = 16;
+    /// [`Request::InstallPayloadSegment`].
+    pub const INSTALL_PAYLOAD_SEGMENT: u8 = 17;
+    /// [`Request::MapPayloadSegment`].
+    pub const MAP_PAYLOAD_SEGMENT: u8 = 18;
 
     /// [`Response::Registered`].
     pub const REGISTERED: u8 = 128;
@@ -143,6 +147,59 @@ pub enum Request {
     /// Fire-and-forget.
     ReleasePayloadSegment {
         /// The segment id to drop.
+        seg_id: u32,
+    },
+    /// Close a dedicated segment's **staging window**: the version naming its
+    /// object has been installed, so the segment's lifetime now follows that
+    /// object's chunk rather than this actor's liveness. Expects
+    /// [`Response::Ack`].
+    ///
+    /// The mirror of releasing a staged manifest's journal entry after its
+    /// install CAS. Before the install the creator is the only thing that knows
+    /// about the segment, so its borrow journal is what keeps it from leaking;
+    /// after it, readers pin the *version* and the manifest holds the `+1` on
+    /// the chunk, so tying the segment to the creator would unlink an object
+    /// out from under them. Once installed, only the coordinator's sweep
+    /// unlinks it, and only from `FREE`.
+    ///
+    /// Rejected while the segment is still quiescent (no pool, or every chunk
+    /// `FREE`): nothing would then hold the object, and the next sweep would
+    /// unlink it under the writer.
+    InstallPayloadSegment {
+        /// The segment id whose staging window closes.
+        seg_id: u32,
+    },
+    /// Map an **already installed** dedicated segment this actor did not
+    /// create, receiving its fd. Expects [`Response::PayloadSegmentGranted`].
+    ///
+    /// The read side of the large-object path. A version's manifest names
+    /// chunks by `(segment_id, offset)`, and a descriptor naming a segment the
+    /// reader has not mapped is *refused*, never resolved against some other
+    /// segment — so without this a second process could see that a large object
+    /// exists and still be unable to read a byte of it. The coordinator kept
+    /// the segment mapped precisely so its fd stays grantable to later readers.
+    ///
+    /// Two ids are refused, and both refusals are the point:
+    ///
+    /// - **Unknown or already unlinked.** A segment leaves the coordinator's
+    ///   table exactly when it is unlinked, and payload segment ids are never
+    ///   reused, so "not in the table" can only mean the object is gone. There
+    ///   is no fd to grant and none is invented.
+    /// - **Still staged.** Before its
+    ///   [install](Request::InstallPayloadSegment) the segment's lifetime is
+    ///   tied to its creator's liveness: journal replay may unlink it and
+    ///   recycle its chunk at any instant, and a reader holds nothing that
+    ///   would stop it. Nothing outside the creator can legitimately know a
+    ///   staged segment exists yet — a reader learns of one by pinning the
+    ///   version that names it, which cannot happen before the install.
+    ///
+    /// Ordering is what makes a granted mapping safe: a reader pins the version
+    /// first, *then* reads its manifest, *then* maps the segments the manifest
+    /// names. By the time this request is sent, the manifest's `+1` already
+    /// holds the object's chunk, so it cannot reach `FREE`, so the
+    /// coordinator's sweep cannot unlink the segment underneath the reader.
+    MapPayloadSegment {
+        /// The segment id to map.
         seg_id: u32,
     },
     /// Open (creating on first reference) the named artifact and receive its
@@ -467,6 +524,14 @@ impl Request {
                 buf.push(tags::RELEASE_PAYLOAD_SEGMENT);
                 buf.extend_from_slice(&seg_id.to_le_bytes());
             }
+            Request::InstallPayloadSegment { seg_id } => {
+                buf.push(tags::INSTALL_PAYLOAD_SEGMENT);
+                buf.extend_from_slice(&seg_id.to_le_bytes());
+            }
+            Request::MapPayloadSegment { seg_id } => {
+                buf.push(tags::MAP_PAYLOAD_SEGMENT);
+                buf.extend_from_slice(&seg_id.to_le_bytes());
+            }
             Request::OpenArtifact { name } => {
                 buf.push(tags::OPEN_ARTIFACT);
                 put_str(&mut buf, name);
@@ -507,6 +572,8 @@ impl Request {
             tags::BYE => Request::Bye,
             tags::CREATE_PAYLOAD_SEGMENT => Request::CreatePayloadSegment { bytes: r.u64()? },
             tags::RELEASE_PAYLOAD_SEGMENT => Request::ReleasePayloadSegment { seg_id: r.u32()? },
+            tags::INSTALL_PAYLOAD_SEGMENT => Request::InstallPayloadSegment { seg_id: r.u32()? },
+            tags::MAP_PAYLOAD_SEGMENT => Request::MapPayloadSegment { seg_id: r.u32()? },
             tags::OPEN_ARTIFACT => Request::OpenArtifact { name: r.string()? },
             tags::OPEN_TASK_QUEUE => Request::OpenTaskQueue,
             tags::INTERN_SCHEMA => Request::InternSchema {
@@ -704,6 +771,12 @@ mod tests {
                 desc: sample_desc(),
             },
             Request::Bye,
+            Request::CreatePayloadSegment {
+                bytes: (48 << 20) + 12_345,
+            },
+            Request::ReleasePayloadSegment { seg_id: 4242 },
+            Request::InstallPayloadSegment { seg_id: 4242 },
+            Request::MapPayloadSegment { seg_id: 4242 },
             Request::OpenArtifact {
                 name: "cache".into(),
             },

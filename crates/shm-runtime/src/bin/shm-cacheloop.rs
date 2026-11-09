@@ -59,7 +59,7 @@ use shm_runtime::demo::{
 };
 use shm_runtime::{Coordinator, Node, RuntimeConfig};
 use shm_stream::{Commit, Coordination};
-use shm_task::{now_nanos, Outcome};
+use shm_task::{now_nanos, Outcome, SpinBudget};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -369,7 +369,7 @@ fn run_watcher(opts: &Opts) -> i32 {
     );
     println!("watcher submitted task {handle:?}");
 
-    match queue.wait(handle) {
+    match queue.wait(handle, SpinBudget::PARK_NOW) {
         Ok(Outcome::Done(r)) => {
             write_result(
                 opts,

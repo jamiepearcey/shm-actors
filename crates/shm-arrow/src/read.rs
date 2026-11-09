@@ -26,6 +26,20 @@ pub trait SegmentBase {
     /// Base pointer of the mapped segment the descriptor's `offset` is relative
     /// to. Must stay valid for as long as `self` is alive.
     fn base_ptr(&self) -> *const u8;
+
+    /// Base pointer for the segment a specific descriptor names.
+    ///
+    /// A batch's chunks may live in more than one segment: a large object gets
+    /// a segment of its own rather than sitting in the shared pool's size
+    /// classes, so its descriptors carry a different `segment_id`. An owner that
+    /// maps several segments overrides this to resolve each one.
+    ///
+    /// The default answers [`base_ptr`](Self::base_ptr) for every id, which is
+    /// exactly the single-segment behaviour every existing owner has — so this
+    /// is additive and no implementor has to change.
+    fn base_for(&self, _segment_id: u32) -> Option<*const u8> {
+        Some(self.base_ptr())
+    }
 }
 
 /// An example pin guard: the owner moved into every reconstructed buffer.
@@ -127,14 +141,18 @@ where
         ctrl.validate(desc)?;
     }
 
-    // Per-chunk base pointers within the (single) mapped segment.
-    let base_ptr = owner.base_ptr();
-    // SAFETY: each `desc` was minted for this segment; `offset` is in-bounds of
-    // the mapping the caller pinned via `owner`.
-    let bases: Vec<*const u8> = chunks
-        .iter()
-        .map(|d| unsafe { base_ptr.add(d.offset as usize) })
-        .collect();
+    // Per-chunk base pointers, resolved per segment: a batch may span a shared
+    // pool segment and an object's own. An owner that maps only one answers the
+    // same base for every id, which is the previous behaviour exactly.
+    // SAFETY: each `desc` was minted for the segment it names; `offset` is
+    // in-bounds of the mapping the caller pinned via `owner`.
+    let mut bases: Vec<*const u8> = Vec::with_capacity(chunks.len());
+    for d in chunks {
+        let base = owner.base_for(d.segment_id).ok_or(Error::Layout(
+            "descriptor names a segment the reader has not mapped",
+        ))?;
+        bases.push(unsafe { base.add(d.offset as usize) });
+    }
     let primary = bases[0];
 
     // 2/4. Parse + validate the header and the node/buffer tables purely over

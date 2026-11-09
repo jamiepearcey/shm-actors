@@ -12,6 +12,7 @@ shm-ring = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 tempfile = { workspace = true }
 
 # loom (ADR-0004 stage L): pulled in ONLY under `--cfg loom` (see shm-core).

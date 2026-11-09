@@ -339,11 +339,15 @@ impl Shard {
         let side = TopicSide::open(&mut node)?;
         let oside = ObjectSide::open(&mut node)?;
         let registry = node.registry().clone();
-        let store = node.store()?;
+        // Shared, not `&mut`: the object store needs `&Node` alongside the
+        // store handle so it can have a dedicated segment granted for an object
+        // the shared pool cannot hold.
+        let node_ref = &node;
+        let store = node_ref.opened_store()?;
         let topics = TopicLog::new(&store, &side, registry.clone());
         // Topics and objects are two shapes over the *same* keyed store: one
         // entry that appends within a window, one entry that replaces.
-        let objects = ObjectStore::new(&store, &oside, registry);
+        let objects = ObjectStore::new(&store, &oside, registry, node_ref);
         let mut ctx = ShardCtx {
             aref: &aref,
             topics: &topics,

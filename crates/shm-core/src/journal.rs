@@ -84,14 +84,22 @@ pub const ENTRY_WRITE_LEASE: u32 = 3;
 /// iff no live pin slot endorses that manifest, which is what an install
 /// leaves behind.
 pub const ENTRY_STAGED_MANIFEST: u32 = 4;
-/// Entry-kind tag: a **dedicated payload segment** the owner holds, payload =
-/// its `segment_id`.
+/// Entry-kind tag: a **dedicated payload segment** in its *staging window*,
+/// payload = its `segment_id`.
 ///
 /// A large object lives in a segment of its own rather than in the shared
 /// pool's size classes, so nothing in the pool describes it and `reclaim_one`
 /// would never see it. Journalling it puts it under the same crash ledger as
-/// every other borrow: if the owner dies, replay tells the coordinator to
-/// unlink it, instead of the segment surviving until shutdown.
+/// every other borrow: a creator that dies before its object is installed has
+/// the segment reclaimed by replay instead of leaking it until shutdown.
+///
+/// Like [`ENTRY_STAGED_MANIFEST`], this covers a **window**, not a lifetime.
+/// The creator releases it once a version naming the object is installed —
+/// after that the version's manifest holds the object's chunk and readers pin
+/// the *version*, never the segment, so tying the segment to the creator would
+/// unlink an installed object out from under its readers. Replay of a leaked
+/// entry therefore reclaims the creator's own hold on the object's chunk and
+/// unlinks only if that leaves the chunk `FREE`; it is never a blind unlink.
 ///
 /// Additive: the slot format is unchanged and
 /// [`to_record`](JournalEntry::to_record) already returns `None` for an unknown
@@ -304,10 +312,13 @@ pub enum JournalRecord {
         /// The fence generation the writer acquired the lease under.
         fence: u32,
     },
-    /// A held **dedicated payload segment**: the id of a segment created for one
-    /// large object. Replay unlinks it.
+    /// A **dedicated payload segment** still inside its staging window: the id
+    /// of a segment created for one large object whose version was never
+    /// installed. Replay releases the dead creator's hold on the object's chunk
+    /// and unlinks the segment iff that leaves it `FREE` — see
+    /// [`ENTRY_PAYLOAD_SEGMENT`].
     PayloadSegment {
-        /// The segment id to release.
+        /// The segment whose staging window the dead creator held.
         segment_id: u32,
     },
     /// A staged, not-yet-installed manifest (ADR-0014 §3): the committer died

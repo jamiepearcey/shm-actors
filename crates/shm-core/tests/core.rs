@@ -630,3 +630,46 @@ fn journal_release_is_an_election() {
     assert_eq!(idx, vec![s2]);
     seg.unlink().ok();
 }
+
+/// A descriptor from another segment must be refused, not aliased.
+///
+/// Chunk addressing is by offset alone, so before the segment check a foreign
+/// descriptor whose offset happened to fall inside one of this pool's class
+/// regions resolved to a real, unrelated `ChunkCtrl` — and publishing or
+/// releasing through it would mutate someone else's chunk. An out-of-range
+/// offset errors either way, which is what made the hazard look absent: the
+/// dangerous case is precisely the one that used to succeed.
+#[test]
+fn a_descriptor_from_another_segment_cannot_alias_a_real_chunk() {
+    let cfg = PoolConfig::power_of_two(256, 4096, 8);
+
+    let a = fresh(1 << 20);
+    let pool_a = Pool::create(&a, &cfg).unwrap();
+
+    let b = fresh(1 << 20);
+    let pool_b = Pool::create(&b, &cfg).unwrap();
+
+    // A perfectly valid descriptor in B, whose offset is equally valid in A —
+    // the pools have identical shape, so this is the aliasing case, not an
+    // out-of-range one.
+    let in_b = pool_b.alloc(256).unwrap();
+    assert!(pool_b.ctrl(&in_b).is_ok(), "sanity: valid in its own pool");
+
+    assert!(
+        matches!(
+            pool_a.ctrl(&in_b),
+            Err(shm_core::Error::WrongSegment { .. })
+        ),
+        "a foreign descriptor resolved against the wrong pool"
+    );
+    assert!(
+        matches!(
+            pool_a.free(&in_b),
+            Err(shm_core::Error::WrongSegment { .. })
+        ),
+        "a foreign descriptor was freed into the wrong pool"
+    );
+
+    let _ = a.unlink();
+    let _ = b.unlink();
+}

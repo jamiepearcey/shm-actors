@@ -41,3 +41,7 @@ path = "src/bin/shm-store-skeleton.rs"
 [[bin]]
 name = "shm-g1-skeleton"
 path = "src/bin/shm-g1-skeleton.rs"
+
+[[bin]]
+name = "shm-payload-skeleton"
+path = "src/bin/shm-payload-skeleton.rs"

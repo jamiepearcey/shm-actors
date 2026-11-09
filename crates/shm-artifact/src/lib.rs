@@ -24,6 +24,17 @@
 //! - [`VersionPin`] — a reader's frozen-version guard;
 //!   [`as_arrow`](VersionPin::as_arrow) reconstructs the batch zero-copy with the
 //!   pin as the Arrow buffer keep-alive.
+//! - [`SegmentMap`] — the seam that resolves the `segment_id` a
+//!   [`ChunkDesc`](shm_core::ChunkDesc) carries. An object larger than the
+//!   shared pool's biggest size class lives in a **dedicated** segment of its
+//!   own (contiguous, and unable to fragment the shared arena because it is
+//!   never carved from it), so its descriptors name that segment; every
+//!   control-word lookup and every reconstructed Arrow buffer is resolved
+//!   against the segment the descriptor actually names, and a
+//!   [`VersionPin`] retains the mappings it resolved for the pin's whole life.
+//!   Without one ([`NoForeignSegments`], the default) an artifact is
+//!   single-segment exactly as before, and a foreign descriptor is refused
+//!   rather than misresolved.
 //! - [`VersionEvent`] — the commit notification delivered to an injected watch
 //!   sink; a [`to_desc`](VersionEvent::to_desc)/[`from_desc`](VersionEvent::from_desc)
 //!   codec lets it ride an [`shm-ring`](shm_ring) `__artifacts` topic. See
@@ -78,7 +89,9 @@ pub mod event;
 pub mod head;
 pub mod manifest;
 
-pub use artifact::{Artifact, Commit, Committer, Delta, VersionPin, WindowPolicy};
+pub use artifact::{
+    Artifact, Commit, Committer, Delta, NoForeignSegments, SegmentMap, VersionPin, WindowPolicy,
+};
 pub use error::{Error, Result};
 pub use event::{CommitKind, VersionEvent, ARTIFACTS_TOPIC, EVENT_MAGIC};
 pub use head::{ArtifactHead, PinSlot, FIRST_INCARNATION, MAX_LIVE_VERSIONS, NO_INCARNATION};

@@ -202,6 +202,14 @@ struct Layout {
     total_bytes: usize,
 }
 
+/// Bytes of segment payload a pool with this shape needs.
+///
+/// So a caller sizing a segment *for* a pool does not have to guess and then
+/// discover `LayoutOverflow` at creation. Mirrors `shm_ring::required_bytes`.
+pub fn required_bytes(config: &PoolConfig) -> usize {
+    compute_layout(config).total_bytes
+}
+
 fn compute_layout(config: &PoolConfig) -> Layout {
     let num_classes = config.classes.len();
     let mut total_chunks: u32 = 0;
@@ -375,9 +383,33 @@ impl<'s> Pool<'s> {
 
     /// The control word for the chunk a descriptor points at.
     pub fn ctrl(&self, desc: &ChunkDesc) -> Result<&ChunkCtrl> {
+        self.check_segment(desc)?;
         let (_, _, global) = self.locate(desc.offset)?;
         // SAFETY: `global < total_chunks`; the control array has that many.
         Ok(unsafe { &*self.ctrls.add(global) })
+    }
+
+    /// Refuse a descriptor that names a different segment.
+    ///
+    /// `locate` addresses purely by offset, so without this a descriptor from
+    /// **another** segment whose offset happens to fall inside one of this
+    /// pool's class regions resolves to a real, unrelated [`ChunkCtrl`] — and a
+    /// publish or a release would then mutate someone else's chunk. An
+    /// out-of-range offset errors, which makes the hazard look absent until an
+    /// offset lands in range; a segment mismatch is the check that actually
+    /// closes it.
+    ///
+    /// Now that a large object can live in a segment of its own, foreign
+    /// descriptors are expressible, so this is load-bearing rather than
+    /// defensive.
+    fn check_segment(&self, desc: &ChunkDesc) -> Result<()> {
+        if desc.segment_id != self.segment.id() {
+            return Err(Error::WrongSegment {
+                desc: desc.segment_id,
+                pool: self.segment.id(),
+            });
+        }
+        Ok(())
     }
 
     /// The control word for a global chunk index (used by the coordinator).
@@ -466,12 +498,52 @@ impl<'s> Pool<'s> {
         })
     }
 
+    /// The descriptor of the chunk at global control index `global`.
+    ///
+    /// The inverse of the `offset → (class, local, global)` walk
+    /// [`locate`](Self::locate) performs, for a holder that has a chunk's
+    /// *control* index and needs its address. The coordinator's dedicated
+    /// payload segments are what want it: a segment holding one large object is
+    /// reached by **segment**, not by descriptor, so reclaiming the object means
+    /// walking the pool's chunks and asking each one for its own descriptor.
+    ///
+    /// Like [`desc_at`](Self::desc_at) the generation comes from the live
+    /// control word rather than from a caller's copy, so the descriptor
+    /// describes the chunk as it is right now.
+    pub fn desc_by_index(&self, global: usize) -> Result<ChunkDesc> {
+        if global >= self.total_chunks {
+            return Err(Error::OutOfBounds);
+        }
+        for i in 0..self.num_classes {
+            let class = self.class(i);
+            let base = class.base_index as usize;
+            if global < base + class.chunk_count as usize {
+                let local = (global - base) as u32;
+                let offset = HEADER_SIZE
+                    + class.data_offset as usize
+                    + local as usize * class.chunk_size as usize;
+                // SAFETY: `global < total_chunks`; the control array has that many.
+                let generation = unsafe { (*self.ctrls.add(global)).generation() };
+                return Ok(ChunkDesc {
+                    segment_id: self.segment.id(),
+                    generation,
+                    offset: offset as u32,
+                    len: class.chunk_size,
+                    schema_id: 0,
+                    _pad: 0,
+                });
+            }
+        }
+        Err(Error::OutOfBounds)
+    }
+
     /// Return a chunk to its size class's free list.
     ///
     /// The caller is responsible for ensuring the chunk's [`ChunkCtrl`] has
     /// already been recycled to `FREE` (which bumps the generation); `free` only
     /// restores free-list membership.
     pub fn free(&self, desc: &ChunkDesc) -> Result<()> {
+        self.check_segment(desc)?;
         let (class_idx, local, _global) = self.locate(desc.offset)?;
         let class = self.class(class_idx);
 

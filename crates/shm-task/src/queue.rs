@@ -73,6 +73,68 @@ use shm_ring::{NoopNotifier, Notifier, Parker};
 
 use crate::error::{Error, Result};
 
+/// Spin iterations between clock reads inside [`TaskQueue::spin_for`].
+const SPIN_CLOCK_STRIDE: u32 = 64;
+
+/// How long a waiter busy-polls before it gives its core back and parks on a
+/// doorbell.
+///
+/// The two endpoints were the only settings this substrate had: park on the
+/// first miss, or never park at all. Both are extremes of one axis. A parked
+/// wake costs microseconds — a scheduler round trip, not a copy — so any
+/// message that arrives inside the budget is answered on the busy-poll path and
+/// never pays it; a queue that then goes quiet still gives the core back.
+///
+/// Pick the budget from the workload's inter-arrival time, not from taste: a
+/// budget below it buys nothing but burnt cycles, and a budget far above it
+/// burns a core to no benefit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SpinBudget(u64);
+
+impl SpinBudget {
+    /// Park on the first miss — no spin. The low-CPU extreme.
+    pub const PARK_NOW: SpinBudget = SpinBudget(0);
+    /// Never park. Burns a core for the latency floor; the caller keeps
+    /// responsibility for its own exit condition.
+    pub const NEVER_PARK: SpinBudget = SpinBudget(u64::MAX);
+
+    /// A budget of `ns` nanoseconds.
+    pub const fn from_nanos(ns: u64) -> SpinBudget {
+        SpinBudget(ns)
+    }
+
+    /// A budget of `micros` microseconds.
+    pub const fn from_micros(micros: u64) -> SpinBudget {
+        SpinBudget(micros.saturating_mul(1_000))
+    }
+
+    /// The budget in nanoseconds.
+    pub const fn as_nanos(self) -> u64 {
+        self.0
+    }
+
+    /// The budget as a [`Duration`](std::time::Duration).
+    pub fn as_duration(self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.0)
+    }
+
+    /// `true` for [`PARK_NOW`](SpinBudget::PARK_NOW): skip the spin entirely.
+    pub const fn parks_immediately(self) -> bool {
+        self.0 == 0
+    }
+
+    /// `true` for [`NEVER_PARK`](SpinBudget::NEVER_PARK).
+    pub const fn never_parks(self) -> bool {
+        self.0 == u64::MAX
+    }
+}
+
+impl Default for SpinBudget {
+    fn default() -> SpinBudget {
+        SpinBudget::PARK_NOW
+    }
+}
+
 /// Task-queue magic: little-endian bytes of `b"SHMTASK4"`.
 ///
 /// Bumped from `SHMTASK3` by ADR-0012: the header grew from one cache line to
@@ -1456,6 +1518,32 @@ impl TaskQueue {
         }
     }
 
+    /// Busy-poll `probe` until it yields, or until `budget` is spent.
+    ///
+    /// `None` means the budget lapsed with nothing to show for it — the caller
+    /// then registers as a waiter and parks. The clock is read once every
+    /// [`SPIN_CLOCK_STRIDE`] iterations because on a hot path
+    /// `Instant::now()` is itself an appreciable fraction of the thing being
+    /// waited for.
+    #[inline]
+    fn spin_for<T>(budget: SpinBudget, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+        if budget.parks_immediately() {
+            return None;
+        }
+        let deadline = std::time::Instant::now() + budget.as_duration();
+        let mut i: u32 = 0;
+        loop {
+            if let Some(v) = probe() {
+                return Some(v);
+            }
+            i = i.wrapping_add(1);
+            if i.is_multiple_of(SPIN_CLOCK_STRIDE) && std::time::Instant::now() >= deadline {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     /// Claim a task, parking on the work doorbell while none is queued, stamping
     /// a fresh lease deadline `lease_nanos` into the future at the moment of the
     /// successful claim.
@@ -1478,7 +1566,9 @@ impl TaskQueue {
             {
                 return task;
             }
-            if let Some(task) = self.claim_once_parked(worker_id, lease_nanos, parker) {
+            if let Some(task) =
+                self.claim_once_parked(worker_id, lease_nanos, parker, SpinBudget::PARK_NOW)
+            {
                 return task;
             }
         }
@@ -1495,10 +1585,19 @@ impl TaskQueue {
         worker_id: u32,
         lease_nanos: u64,
         parker: &P,
+        spin: SpinBudget,
     ) -> Option<ClaimedTask<'_>> {
         if let Some(task) =
             self.claim_with_lease(worker_id, crate::now_nanos().wrapping_add(lease_nanos))
         {
+            return Some(task);
+        }
+        // Spin *before* registering: a claim landed inside the budget costs no
+        // waiter RMW here and no doorbell ring on the submitter's side, so a
+        // busy queue never touches the notification machinery at all.
+        if let Some(task) = Self::spin_for(spin, || {
+            self.claim_with_lease(worker_id, crate::now_nanos().wrapping_add(lease_nanos))
+        }) {
             return Some(task);
         }
         self.header().waiters_work.fetch_add(1, Ordering::AcqRel);
@@ -1560,13 +1659,39 @@ impl TaskQueue {
     /// Registers as a parked requester (so workers know to ring the doorbell),
     /// re-checks, then parks; loops until [`TaskStatus`] is terminal. Returns
     /// [`Error::StaleHandle`] if the slot is reused out from under the handle.
-    pub fn wait<P: Parker>(&self, handle: TaskHandle, parker: &P) -> Result<Outcome> {
+    pub fn wait<P: Parker>(
+        &self,
+        handle: TaskHandle,
+        parker: &P,
+        spin: SpinBudget,
+    ) -> Result<Outcome> {
         loop {
             match self.poll(handle)? {
                 TaskStatus::Done(r) => return Ok(Outcome::Done(r)),
                 TaskStatus::Failed => return Ok(Outcome::Failed),
                 TaskStatus::Cancelled => return Ok(Outcome::Cancelled),
                 TaskStatus::Queued | TaskStatus::Claimed => {}
+            }
+            // Spin before registering: an answer that lands inside the budget
+            // is seen here, and `complete` rings no doorbell because it sees no
+            // waiter. The error is deliberately deferred to the re-poll below.
+            if let Some(outcome) = Self::spin_for(spin, || match self.poll(handle) {
+                Ok(TaskStatus::Done(r)) => Some(Outcome::Done(r)),
+                Ok(TaskStatus::Failed) => Some(Outcome::Failed),
+                Ok(TaskStatus::Cancelled) => Some(Outcome::Cancelled),
+                Ok(TaskStatus::Queued | TaskStatus::Claimed) => None,
+                Err(_) => Some(Outcome::Failed),
+            }) {
+                // Re-poll rather than trust the spin's error collapse: a
+                // StaleHandle must still surface as an error, not as Failed.
+                match self.poll(handle)? {
+                    TaskStatus::Done(r) => return Ok(Outcome::Done(r)),
+                    TaskStatus::Failed => return Ok(Outcome::Failed),
+                    TaskStatus::Cancelled => return Ok(Outcome::Cancelled),
+                    TaskStatus::Queued | TaskStatus::Claimed => {
+                        let _ = outcome;
+                    }
+                }
             }
             self.header().waiters_done.fetch_add(1, Ordering::AcqRel);
             // Re-check after registering to close the lost-wakeup window.

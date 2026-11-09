@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use shm_core::{doorbell_pair, ChunkDesc};
 use shm_ring::{DoorbellNotifier, DoorbellParker};
-use shm_task::{now_nanos, required_bytes, Outcome, TaskQueue, TaskStatus};
+use shm_task::{now_nanos, required_bytes, Outcome, SpinBudget, TaskQueue, TaskStatus};
 
 /// An 8-byte-aligned heap region standing in for a shm segment payload.
 struct Region {
@@ -297,9 +297,97 @@ fn requester_wait_blocks_until_done() {
     // Requester blocks on the done doorbell until a worker finishes the task.
     let req_q = queue.clone();
     let parker = DoorbellParker::new(db.read.try_clone().expect("dup read"));
-    let requester = thread::spawn(move || req_q.wait(h, &parker).expect("wait"));
+    let requester =
+        thread::spawn(move || req_q.wait(h, &parker, SpinBudget::PARK_NOW).expect("wait"));
 
     // Worker runs a bit later, then completes (rings the done doorbell).
+    thread::sleep(Duration::from_millis(60));
+    let task = queue.claim(1).expect("claim");
+    task.complete(result_for(request(3), 1)).expect("complete");
+
+    match requester.join().unwrap() {
+        Outcome::Done(r) => assert_eq!(r.schema_id, 3),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    drop(db);
+}
+
+/// `true` if the doorbell's read end has a wake byte pending — i.e. somebody
+/// rang it. A non-blocking `poll(2)` with a zero timeout, so it never waits.
+fn doorbell_is_rung(db: &shm_core::DoorbellPair) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: db.read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialised pollfd, count 1, zero timeout — poll returns
+    // immediately and writes only into `pfd.revents`.
+    unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
+}
+
+#[test]
+fn requester_spin_budget_catches_a_fast_answer_without_parking() {
+    let region = Region::for_capacity(8);
+    let db = doorbell_pair().expect("pair");
+    let write_fd = db.write.as_raw_fd();
+    // SAFETY: region outlives the queue and both threads (joined below).
+    let queue = unsafe { TaskQueue::init(region.base(), region.len(), 8) }
+        .expect("init")
+        .with_done_notifier(DoorbellNotifier::new(write_fd));
+
+    let h = queue.submit(request(3), future()).expect("submit");
+
+    // The worker answers well inside a 200 ms budget, so the requester must
+    // return from the spin — never registering as a waiter, never parking.
+    let worker_q = queue.clone();
+    let worker = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        let task = worker_q.claim(1).expect("claim");
+        task.complete(result_for(request(3), 1)).expect("complete");
+    });
+
+    let parker = DoorbellParker::new(db.read.try_clone().expect("dup read"));
+    let outcome = queue
+        .wait(h, &parker, SpinBudget::from_micros(200_000))
+        .expect("wait");
+    worker.join().unwrap();
+
+    match outcome {
+        Outcome::Done(r) => assert_eq!(r.schema_id, 3),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    // The doorbell fd stays empty: a spinning requester registers no waiter, so
+    // `complete` had nobody to notify and never wrote the wake byte.
+    assert!(
+        !doorbell_is_rung(&db),
+        "a spun-for answer must not ring the done doorbell"
+    );
+    drop(db);
+}
+
+#[test]
+fn requester_parks_after_the_spin_budget_lapses() {
+    let region = Region::for_capacity(8);
+    let db = doorbell_pair().expect("pair");
+    let write_fd = db.write.as_raw_fd();
+    // SAFETY: region outlives the queue and both threads (joined below).
+    let queue = unsafe { TaskQueue::init(region.base(), region.len(), 8) }
+        .expect("init")
+        .with_done_notifier(DoorbellNotifier::new(write_fd));
+
+    let h = queue.submit(request(3), future()).expect("submit");
+
+    // A 1 ms budget cannot cover a 60 ms answer: the requester must fall
+    // through to the doorbell and still get the right outcome.
+    let req_q = queue.clone();
+    let parker = DoorbellParker::new(db.read.try_clone().expect("dup read"));
+    let requester = thread::spawn(move || {
+        req_q
+            .wait(h, &parker, SpinBudget::from_micros(1_000))
+            .expect("wait")
+    });
+
     thread::sleep(Duration::from_millis(60));
     let task = queue.claim(1).expect("claim");
     task.complete(result_for(request(3), 1)).expect("complete");

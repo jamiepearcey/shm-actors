@@ -52,19 +52,18 @@ use shm_task::now_nanos;
 fn unique_seg_base() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed) as u64;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64;
     let pid = std::process::id() as u64;
-    // Own band, disjoint from every other test binary's, with the per-call
-    // sequence and the random slot both quantised to a stride wider than one
-    // coordinator's segment span. The old 700_000 base overlapped four other
-    // binaries' windows.
-    133_554_432
-        + n * 16_384 * 256
-        + ((((pid.wrapping_mul(2_654_435_761)) ^ nanos) % 256) as u32) * 16_384
+    // Every coordinator owns `base .. base + 2 MiB`: dedicated payload segment
+    // ids start at `base + 1 MiB` and are never reused, so two bands must be at
+    // least that far apart. This binary owns 32 draws; the per-call counter
+    // and the pid/clock hash together pick one, so neither two tests in this
+    // binary nor two binaries can overlap.
+    301326592 + (((n + ((pid.wrapping_mul(2_654_435_761)) ^ nanos)) % 32) as u32) * 2097152
 }
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {

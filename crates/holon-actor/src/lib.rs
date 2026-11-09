@@ -75,6 +75,8 @@ pub mod system;
 pub use chunk::{MessagePool, DEFAULT_REPLY_BODY};
 pub use error::{Error, Result};
 pub use holon_core::MAX_REPLY_BODY;
+pub use shm_task::SpinBudget;
 pub use system::{
     Actor, ActorRef, ActorSystem, CellRef, Cx, PendingAsk, Pinned, ReplyRef, DEFAULT_LEASE,
+    DEFAULT_SPIN_BUDGET,
 };

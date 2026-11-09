@@ -35,6 +35,7 @@ pub mod error;
 pub mod queue;
 
 pub use error::{Error, Result};
+pub use queue::SpinBudget;
 pub use queue::{
     lease_capacity, lease_table_offset, required_bytes, slots_offset, ClaimedTask, LeaseBinding,
     LeaseSlot, Outcome, ReapReport, TaskHandle, TaskQueue, TaskQueueHeader, TaskSlot, TaskStatus,

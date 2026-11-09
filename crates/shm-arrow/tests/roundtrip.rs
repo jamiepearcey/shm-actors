@@ -591,3 +591,92 @@ fn a_reserved_batch_reads_back_identically_to_a_copied_one() {
     assert_eq!(got_label.value(0), label);
     assert_eq!(a, b, "a reserved batch is not identical to a copied one");
 }
+
+/// An owner that maps more than one segment: a shared pool and an object's own.
+struct TwoSegments {
+    primary: Arc<Segment>,
+    extra: Arc<Segment>,
+}
+
+impl shm_arrow::SegmentBase for TwoSegments {
+    fn base_ptr(&self) -> *const u8 {
+        self.primary.base_ptr()
+    }
+
+    fn base_for(&self, segment_id: u32) -> Option<*const u8> {
+        if segment_id == self.primary.id() {
+            Some(self.primary.base_ptr())
+        } else if segment_id == self.extra.id() {
+            Some(self.extra.base_ptr())
+        } else {
+            None
+        }
+    }
+}
+
+/// A batch whose chunks live in two different segments reads back correctly.
+///
+/// The property the large-object path needs: a value too big for the shared
+/// pool's size classes gets a segment of its own, so its descriptors carry a
+/// different `segment_id` than the rest of the batch. Before `base_for` the
+/// reader resolved every chunk against one base, so this was not expressible.
+#[test]
+fn a_batch_can_span_two_segments() {
+    let fx = Fixture::new(4 << 20);
+    let pool = Pool::create(&fx.segment, &PoolConfig::power_of_two(1024, 1 << 18, 8)).unwrap();
+    let alloc = PoolAllocator::new(&pool, &fx.segment);
+    let registry = SchemaRegistry::new();
+
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let values: Vec<i64> = (0..4096).collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(values.clone())) as ArrayRef],
+    )
+    .unwrap();
+    let descs = write_batch_chunks(&alloc, &registry, &batch).unwrap();
+
+    // A second, entirely separate segment — as a dedicated payload segment is.
+    let second = Arc::new(Segment::create(next_segment_id(), 1 << 20).unwrap());
+    let _ = second.unlink();
+
+    // The owner maps both. Resolution is by id, so the batch reads correctly
+    // even though the reader now holds two mappings.
+    let owner = Arc::new(TwoSegments {
+        primary: fx.segment.clone(),
+        extra: second.clone(),
+    });
+    let ctrls: Vec<&ChunkCtrl> = descs.iter().map(|d| pool.ctrl(d).unwrap()).collect();
+    let out = read_batch_chunks(owner, &descs, &ctrls, &registry).unwrap();
+    let got = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(
+        got.values(),
+        &values[..],
+        "payload differs across two mappings"
+    );
+
+    // And a descriptor naming a segment the reader has NOT mapped is refused,
+    // rather than resolved against the wrong base.
+    struct OnlyPrimary(Arc<Segment>);
+    impl shm_arrow::SegmentBase for OnlyPrimary {
+        fn base_ptr(&self) -> *const u8 {
+            self.0.base_ptr()
+        }
+        fn base_for(&self, segment_id: u32) -> Option<*const u8> {
+            (segment_id == self.0.id()).then(|| self.0.base_ptr() as *const u8)
+        }
+    }
+    let mut foreign = descs.clone();
+    foreign[0].segment_id = second.id();
+    let ctrls: Vec<&ChunkCtrl> = descs.iter().map(|d| pool.ctrl(d).unwrap()).collect();
+    let err = read_batch_chunks(
+        Arc::new(OnlyPrimary(fx.segment.clone())),
+        &foreign,
+        &ctrls,
+        &registry,
+    );
+    assert!(
+        matches!(err, Err(shm_arrow::Error::Layout(_))),
+        "an unmapped segment must be refused, got {err:?}"
+    );
+}

@@ -96,17 +96,27 @@ pub const STORE_ID_OFFSET: u32 = 8192;
 
 /// First id for a **dedicated payload segment** (one large object each).
 ///
-/// Sits above the store's ids and below the next coordinator's base, so a
-/// coordinator's whole id span stays bounded — which is what lets parallel
-/// coordinators stride safely.
-pub const PAYLOAD_ID_OFFSET: u32 = 12_288;
+/// Sits above every other id this coordinator issues, with a wide band after it
+/// because payload ids are **never reused** — see [`MAX_PAYLOAD_SEGMENTS`].
+pub const PAYLOAD_ID_OFFSET: u32 = 1 << 20;
 
-/// How many dedicated payload segments one coordinator may have live.
+/// Ids reserved for dedicated payload segments, and therefore the number one
+/// coordinator may create over its whole lifetime.
 ///
-/// Bounded on purpose: ids must not run into the next coordinator's base, and
-/// an unbounded count would also mean an unbounded number of mappings per
-/// reader. Ids are recycled on release.
-pub const MAX_PAYLOAD_SEGMENTS: u32 = 2048;
+/// **Ids are not recycled**, and that is a correctness property rather than
+/// tidiness. A segment carries no incarnation counter (`Segment::generation` is
+/// a constant) and a fresh pool starts its chunk generations at zero, so a
+/// stale `ChunkDesc` naming a released id would pass the generation check
+/// against whatever object was granted that id next — the exact ABA the chunk
+/// generation exists to prevent, reopened one level up. A never-reused id
+/// instead fails to resolve, which readers already refuse.
+///
+/// Live segments are bounded separately by [`MAX_LIVE_PAYLOAD_SEGMENTS`],
+/// because each one costs a mapping in every reader.
+pub const MAX_PAYLOAD_SEGMENTS: u32 = 1 << 20;
+
+/// How many dedicated payload segments may be live at once.
+pub const MAX_LIVE_PAYLOAD_SEGMENTS: usize = 2048;
 
 /// First lineage `artifact_id` the keyed store issues (ADR-0007 G3). Kept far
 /// above the coordinator's per-name artifact id space (which starts at 1) so a

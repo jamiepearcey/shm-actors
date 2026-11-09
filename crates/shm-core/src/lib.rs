@@ -35,6 +35,7 @@ pub mod platform;
 pub mod platform_linux;
 pub mod pod;
 pub mod pool;
+pub mod quota;
 pub mod segment;
 pub mod substrate;
 
@@ -67,6 +68,6 @@ pub type NativePlatform = platform_linux::LinuxPlatform;
 #[cfg(not(target_os = "linux"))]
 pub type NativePlatform = platform::PosixPlatform;
 pub use pod::SharedPod;
-pub use pool::{Pool, PoolConfig, SizeClass};
+pub use pool::{required_bytes, Pool, PoolConfig, SizeClass};
 pub use segment::{Segment, SegmentHeader, LAYOUT_VERSION, SEGMENT_MAGIC};
 pub use substrate::{ShmU32, ShmU64};

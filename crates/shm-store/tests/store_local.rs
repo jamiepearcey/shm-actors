@@ -11,7 +11,7 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use shm_arrow::SchemaRegistry;
-use shm_artifact::{ArtifactHead, Commit, WindowPolicy};
+use shm_artifact::{ArtifactHead, Commit, NoForeignSegments, SegmentMap, WindowPolicy};
 use shm_core::{segment::HEADER_SIZE, BorrowJournal, Pool, PoolConfig, Segment};
 use shm_store::{
     Catalog, Error, KeyResolver, KeyedStore, RefKind, SLOT_FREE, SLOT_LIVE, SLOT_TOMBSTONE,
@@ -573,6 +573,7 @@ fn retained_binding_ties_pin_to_entry_and_task_not_actor() {
         &h.catalog,
         &h.head,
         &h.data,
+        &no_segments(),
         binding.artifact_id,
         binding.incarnation + 1,
         binding.version,
@@ -584,6 +585,7 @@ fn retained_binding_ties_pin_to_entry_and_task_not_actor() {
         &h.catalog,
         &h.head,
         &h.data,
+        &no_segments(),
         binding.artifact_id,
         binding.incarnation,
         binding.version,
@@ -594,6 +596,7 @@ fn retained_binding_ties_pin_to_entry_and_task_not_actor() {
         &h.catalog,
         &h.head,
         &h.data,
+        &no_segments(),
         binding.artifact_id,
         binding.incarnation,
         binding.version,
@@ -617,6 +620,7 @@ fn retained_binding_ties_pin_to_entry_and_task_not_actor() {
         &h.catalog,
         &h.head,
         &h.data,
+        &no_segments(),
         held.artifact_id,
         held.incarnation,
         held.version,
@@ -691,4 +695,10 @@ fn entry_append_windowed_stays_bounded_and_read_since_follows_it() {
     store.reclaim_tombstones().unwrap();
     assert_eq!(h.free_total(), baseline, "zero leak after evict");
     h.unlink();
+}
+
+/// The single-segment answer: these entries' chunks all live in the store's own
+/// data pool, so nothing foreign has to resolve.
+fn no_segments() -> Arc<dyn SegmentMap> {
+    Arc::new(NoForeignSegments)
 }

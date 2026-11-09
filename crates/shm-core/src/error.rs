@@ -26,6 +26,27 @@ pub enum Error {
     #[error("pool exhausted: no free chunk for the requested size class")]
     PoolExhausted,
 
+    /// A holder asked for more chunks than its [`PoolQuota`](crate::quota::PoolQuota)
+    /// allows, or a reservation would over-subscribe the pool.
+    ///
+    /// Deliberately distinct from [`Self::PoolExhausted`]: this one is about the
+    /// caller, and the arena still has chunks for everybody else. Collapsing the
+    /// two would lose the only signal that says whose fault a shortage is.
+    #[error("quota exceeded: this holder's chunk reservation is fully used")]
+    QuotaExceeded,
+
+    /// A descriptor was resolved against a pool in a different segment.
+    ///
+    /// Chunk addressing is by offset alone, so this is what stops a foreign
+    /// descriptor aliasing a real control block in the wrong pool.
+    #[error("descriptor names segment {desc} but this pool is over segment {pool}")]
+    WrongSegment {
+        /// The segment the descriptor names.
+        desc: u32,
+        /// The segment this pool is laid in.
+        pool: u32,
+    },
+
     /// A per-actor borrow journal had no free slot (intentional backpressure).
     #[error("borrow journal full: pin table exhausted")]
     JournalFull,

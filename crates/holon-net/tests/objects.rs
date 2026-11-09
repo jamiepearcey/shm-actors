@@ -152,8 +152,9 @@ fn with_writer<R>(uds: &Path, f: impl FnOnce(&ObjectStore<'_>) -> R) -> R {
     node.open_store().expect("open store");
     let side = ObjectSide::open(&mut node).expect("object side");
     let registry = node.registry().clone();
-    let store = node.store().expect("store");
-    let objects = ObjectStore::new(&store, &side, registry);
+    node.open_store().expect("open store");
+    let store = node.opened_store().expect("store");
+    let objects = ObjectStore::new(&store, &side, registry, &node);
     f(&objects)
 }
 

@@ -18,6 +18,34 @@
 //! reader can never see a partially written object: it sees version `n`, then
 //! version `n+1`, and nothing between.
 //!
+//! # Large objects
+//!
+//! Cutting only works while the shared pool has chunks to cut from. An object
+//! **larger than [`ObjectStore::pooled_ceiling`]** is therefore not cut at all:
+//! it is written into a coordinator-granted segment of its own, holding one
+//! [`Pool`] of one class of one chunk, and it reads back as a single contiguous
+//! buffer. That is the same split a process allocator makes at
+//! `M_MMAP_THRESHOLD`, and it has the same two payoffs — the object is
+//! contiguous by construction, and it cannot fragment the shared arena because
+//! it was never carved from it.
+//!
+//! The threshold is deliberately **not a tunable**. The dedicated path is taken
+//! exactly when the pool cannot hold the object, because below that pooled is
+//! strictly cheaper: no coordinator round trip, no `mmap` per reader, and no
+//! segment to unlink afterwards.
+//!
+//! Lifetime follows the object, not the writer. The segment is *staged* while
+//! it is being filled — the writer's borrow-journal entry reclaims it if the
+//! writer dies — and [`Node::install_payload_segment`] closes that window once
+//! the version is installed. From then on the version's manifest holds the `+1`
+//! on the object's chunk, so a `put` that replaces the object releases the old
+//! segment without anyone unlinking it: the retire cascade drives the old chunk
+//! to `FREE`, and the coordinator's sweep reads that control word and unlinks.
+//! A reader in another process maps the segment on demand — its pin names the
+//! segment it is missing — *after* taking the version pin, so the manifest's
+//! reference already holds the chunk against `FREE` and the sweep cannot unlink
+//! underneath the mapping.
+//!
 //! Reading is [`ObjectStore::get`]: a journaled pin plus a zero-copy view of the
 //! payload straight out of the shared data segment. The pin travels inside the
 //! returned [`ObjectRead`], so a version stays readable for exactly as long as
@@ -41,15 +69,18 @@
 //! - **`delete` is not notified.** The events ring carries version arrivals; a
 //!   deletion has no version to announce, and inventing one would give watchers
 //!   a sequence number that names nothing.
-//! - **A payload is not one contiguous slice.** [`ObjectRead`] hands back
-//!   segments, never a single `&[u8]`; see [`ObjectRead::segments`].
-//! - **The ceiling is the version manifest and the pool, not one size class.**
-//!   A version's manifest is itself one chunk listing 24 bytes per data chunk
-//!   plus 4 per batch, so a store pool whose largest class is `C` bytes holds
-//!   roughly `C/28` segments of just under `C` bytes each, bounded also by how
-//!   many `C`-sized chunks the pool was built with.
-//!   [`ObjectStore::max_object`] computes it; past it the substrate reports its
-//!   own `ChunkTooSmall` or pool exhaustion, rather than a limit invented here.
+//! - **A payload is not one contiguous slice — unless it earned a segment.**
+//!   A pooled object arrives as several buffers; only a dedicated one is
+//!   contiguous. Consumers walk [`ObjectRead::segments`] either way.
+//! - **The *pooled* ceiling is the version manifest and the pool, not one size
+//!   class.** A version's manifest is itself one chunk listing 24 bytes per data
+//!   chunk plus 4 per batch, so a store pool whose largest class is `C` bytes
+//!   holds roughly `C/28` segments of just under `C` bytes each, bounded also by
+//!   how many `C`-sized chunks the pool was built with.
+//!   [`ObjectStore::max_object`] computes it. Past it an object is not refused —
+//!   it goes to a segment of its own; what is refused is a single dedicated
+//!   object over 4 GiB serialized, which a chunk's `u32` length cannot address
+//!   ([`Error::TooLarge`]).
 
 #![deny(missing_docs)]
 
@@ -59,9 +90,11 @@ use std::sync::{Arc, Mutex};
 use arrow_array::{Array, BinaryArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use holon_topic::TOPIC_EVENTS;
-use shm_arrow::SchemaRegistry;
+use shm_arrow::{write_batch_chunks, PoolAllocator, SchemaRegistry};
 use shm_artifact::{Commit, CommitKind, VersionEvent, VersionPin};
-use shm_core::BorrowJournal;
+use shm_core::{
+    required_bytes, BorrowJournal, ChunkDesc, Pool, PoolConfig, Segment, SizeClass, LOANED,
+};
 use shm_runtime::{Node, TopicPublisher};
 use shm_store::{Entry, KeyedStore, RefKind};
 use shm_stream::{Coordination, StreamWriter};
@@ -79,12 +112,29 @@ pub const MAX_CONTENT_TYPE: usize = 128;
 /// Retries on a lost write-lease race before giving up.
 const PUT_RETRIES: u32 = 64;
 
+/// How many distinct dedicated segments one operation will fault in before it
+/// gives up and reports the refusal.
+///
+/// A version names at most one segment per batch, and a manifest holds far
+/// fewer than this, so exceeding it means something other than a cold mapping
+/// is wrong.
+const FAULT_IN_LIMIT: u32 = 64;
+
 /// Errors of the object store.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The store's pool has no size class big enough to hold one segment.
     #[error("no usable size class for an object segment")]
     NoUsableClass,
+    /// The payload is too large for **one chunk of its own segment**: a chunk
+    /// is addressed by a `u32` length, so a single dedicated object cannot
+    /// exceed 4 GiB serialized. Nothing was allocated.
+    #[error("object of {0} serialized bytes exceeds the 4 GiB dedicated-chunk limit")]
+    TooLarge(usize),
+    /// A descriptor named a dedicated segment this node could not map, and
+    /// retrying did not converge.
+    #[error("could not map dedicated segment {0}")]
+    Unmapped(u32),
     /// The producer handed to [`ObjectStore::write_with`] failed, or staging a
     /// segment did. Nothing was installed.
     #[error("streaming write failed: {0}")]
@@ -120,6 +170,9 @@ pub enum Error {
     /// The shared-memory substrate rejected the operation.
     #[error("core: {0}")]
     Core(#[from] shm_core::Error),
+    /// A batch could not be serialized into shared memory.
+    #[error("arrow: {0}")]
+    Arrow(#[from] shm_arrow::Error),
     /// The store rejected the operation.
     #[error("store: {0}")]
     Store(#[from] shm_store::Error),
@@ -420,21 +473,33 @@ pub struct ObjectStore<'a> {
     store: &'a KeyedStore<'a>,
     side: &'a ObjectSide,
     registry: Arc<SchemaRegistry>,
+    /// The node, for the **large-object** path only: an object the shared pool
+    /// cannot hold needs a segment granted, installed and (for a reader) mapped,
+    /// and only the coordinator can do any of that.
+    ///
+    /// Borrowed shared alongside the store, which is why the store must come
+    /// from [`Node::opened_store`] rather than `Node::store` — the latter's
+    /// `&mut` borrow would live as long as the handle and lock the node out of
+    /// granting anything.
+    node: &'a Node,
     entries: Mutex<HashMap<String, (Arc<Entry>, u32)>>,
 }
 
 impl<'a> ObjectStore<'a> {
-    /// Bind an object store to a keyed store and its node-independent side.
+    /// Bind an object store to a keyed store, its node-independent side, and the
+    /// node that grants dedicated segments for large objects.
     pub fn new(
         store: &'a KeyedStore<'a>,
         side: &'a ObjectSide,
         registry: Arc<SchemaRegistry>,
+        node: &'a Node,
     ) -> ObjectStore<'a> {
         registry.intern(&side.schema);
         ObjectStore {
             store,
             side,
             registry,
+            node,
             entries: Mutex::new(HashMap::new()),
         }
     }
@@ -465,9 +530,21 @@ impl<'a> ObjectStore<'a> {
         Ok(pool.max_chunk_size())
     }
 
-    /// **The largest payload one object may hold, in bytes.** Ask this before
-    /// encoding an answer: a caller that would exceed it can refuse with the
-    /// number in the message instead of doing the work first.
+    /// **The largest payload the shared pool can hold whatever content type is
+    /// declared, in bytes** — and so the point past which an object is
+    /// certainly given a dedicated segment of its own.
+    ///
+    /// It is no longer a ceiling on an *object*: a payload above it is not
+    /// refused, it is placed in a segment of its own. And it is deliberately
+    /// not a tunable — the dedicated path is taken precisely when the pool
+    /// cannot hold the object, because below that pooled is strictly cheaper:
+    /// no coordinator round trip, no `mmap` per reader, and no segment to
+    /// unlink afterwards.
+    ///
+    /// Worst-case in the content type (see below), so the number holds whatever
+    /// the caller ends up declaring; the *exact* switch-over point for one
+    /// declared content type is [`pooled_ceiling`](Self::pooled_ceiling), which
+    /// is this number or a little more.
     ///
     /// Derived, not assumed, from the two things that actually bound a
     /// segmented object:
@@ -485,19 +562,21 @@ impl<'a> ObjectStore<'a> {
     /// pool's largest class exhausted, which surfaces as a clean staging failure
     /// that installs nothing (see [`put`](Self::put)).
     pub fn max_object(&self) -> Result<u64> {
-        let pool =
-            shm_core::Pool::attach(self.store.data_segment()).map_err(shm_store::Error::from)?;
         let ct = " ".repeat(MAX_CONTENT_TYPE);
-        let (size, per_segment) = self.best_class(&ct)?;
-        let count = (0..pool.num_classes())
-            .filter_map(|i| pool.class_info(i))
-            .find(|(s, _)| *s == size)
-            .map(|(_, c)| c as usize)
-            .unwrap_or(0);
-        let usable = count
-            .saturating_sub(1)
-            .min(Self::segments_per_manifest(pool.max_chunk_size()));
-        Ok(usable as u64 * per_segment as u64)
+        self.pooled_ceiling(&ct)
+    }
+
+    /// The largest payload the shared pool can hold for **this** content type:
+    /// the exact byte at which [`put`](Self::put) stops cutting segments out of
+    /// the pool and asks for a segment of its own.
+    ///
+    /// It depends on the content type because every segment of a pooled object
+    /// repeats it — the content type is the object's, not the segment's — so a
+    /// longer one leaves less room for payload in each chunk. A caller that
+    /// wants one number for every content type asks
+    /// [`max_object`](Self::max_object) instead.
+    pub fn pooled_ceiling(&self, content_type: &str) -> Result<u64> {
+        Ok(self.pooled_shape(content_type)?.ceiling)
     }
 
     /// The largest `data` slice one segment can carry: the chunk cap less the
@@ -507,7 +586,7 @@ impl<'a> ObjectStore<'a> {
     /// an empty segment, so nothing here is a guess or a hardcoded fraction, and
     /// each segment lands in exactly one chunk.
     fn segment_size(&self, content_type: &str) -> Result<usize> {
-        Ok(self.best_class(content_type)?.1)
+        Ok(self.pooled_shape(content_type)?.per_segment)
     }
 
     /// The size class to cut segments from, and the payload one segment holds.
@@ -522,15 +601,14 @@ impl<'a> ObjectStore<'a> {
     ///
     /// Ties go to the larger chunk: fewer, bigger segments mean a shorter
     /// manifest and fewer descriptors to walk on every read.
-    fn best_class(&self, content_type: &str) -> Result<(u32, usize)> {
-        let pool =
-            shm_core::Pool::attach(self.store.data_segment()).map_err(shm_store::Error::from)?;
+    fn pooled_shape(&self, content_type: &str) -> Result<PooledShape> {
+        let pool = Pool::attach(self.store.data_segment()).map_err(shm_store::Error::from)?;
         let probe = encode_segment(&self.side.schema, content_type, &[]);
         let overhead =
             shm_arrow::serialized_len(&probe).expect("the object schema is serializable");
         let by_manifest = Self::segments_per_manifest(pool.max_chunk_size());
 
-        let mut best: Option<(u64, u32, usize)> = None;
+        let mut best: Option<PooledShape> = None;
         for i in 0..pool.num_classes() {
             let Some((size, count)) = pool.class_info(i) else {
                 continue;
@@ -543,13 +621,18 @@ impl<'a> ObjectStore<'a> {
             // class is the conservative reading and keeps the number honest for
             // a pool whose classes are unevenly stocked.
             let usable = (count as usize).saturating_sub(1).min(by_manifest);
-            let reach = usable as u64 * per_segment as u64;
-            if best.is_none_or(|(r, s, _)| reach > r || (reach == r && size > s)) {
-                best = Some((reach, size, per_segment));
+            let shape = PooledShape {
+                class: size,
+                per_segment,
+                ceiling: usable as u64 * per_segment as u64,
+            };
+            if best.is_none_or(|b| {
+                shape.ceiling > b.ceiling || (shape.ceiling == b.ceiling && shape.class > b.class)
+            }) {
+                best = Some(shape);
             }
         }
-        let (_, size, per_segment) = best.ok_or(Error::NoUsableClass)?;
-        Ok((size, per_segment.max(1)))
+        best.ok_or(Error::NoUsableClass)
     }
 
     /// How many segments' descriptors and spans fit one manifest chunk.
@@ -636,10 +719,16 @@ impl<'a> ObjectStore<'a> {
 
     /// Commit a new immutable version of `key`; returns its version number.
     ///
-    /// The payload is cut into segments that each fit one chunk, staged
-    /// invisibly, and installed as **one** version — one `Commit::Replace` CAS
-    /// over N batches — so a reader never observes half an object and the
-    /// previous version's chunks are released wholesale.
+    /// An object the shared pool can hold is cut into segments that each fit one
+    /// chunk, staged invisibly, and installed as **one** version — one
+    /// `Commit::Replace` CAS over N batches — so a reader never observes half an
+    /// object and the previous version's chunks are released wholesale.
+    ///
+    /// An object **larger than [`max_object`](Self::max_object)** is not cut at
+    /// all: it goes into a coordinator-granted segment of its own, holding one
+    /// pool of one class of one chunk, and reads back as a single contiguous
+    /// buffer. That split is not a tunable — it is taken exactly when the pool
+    /// cannot hold the object, since below that pooled costs strictly less.
     ///
     /// Concurrent writers serialize on the entry's write lease; a lost race is
     /// retried, bounded. The version is assigned by the commit, so it is exact
@@ -648,15 +737,7 @@ impl<'a> ObjectStore<'a> {
     pub fn put(&self, key: &str, content_type: &str, bytes: &[u8]) -> Result<u64> {
         check_content_type(content_type)?;
         let (entry, kid) = self.entry_or_create(key)?;
-        let seg = self.segment_size(content_type)?;
-        // An empty payload is one empty segment, not zero segments: a version
-        // with no batches would read back as a missing object.
-        let parts: Vec<&[u8]> = if bytes.is_empty() {
-            vec![&[]]
-        } else {
-            bytes.chunks(seg).collect()
-        };
-        let version = self.install(&entry, content_type, &parts)?;
+        let version = self.install(&entry, content_type, bytes)?;
         // Descriptor-only: the watcher learns a version exists, not what is in
         // it. A lapped ring costs a wake-up, not data.
         let _ =
@@ -666,77 +747,289 @@ impl<'a> ObjectStore<'a> {
         Ok(version)
     }
 
-    /// Stage every segment and install them as one version, retrying a lost
-    /// write lease a bounded number of times.
+    /// Place and install `bytes` as one version, retrying a lost write lease a
+    /// bounded number of times.
     ///
-    /// The transaction is `shm-stream`'s: each batch is serialized into fresh
-    /// chunks, loaned to this writer and recorded in its borrow journal *before*
-    /// it counts as staged, and the whole set is installed by a single
-    /// `Committer::commit_staged`. Every failure path — a chunk that will not
-    /// allocate, a fenced lease, a rejected install — unwinds the staging it had
-    /// already done (dropping loans, releasing journal slots, returning chunks
-    /// to the pool) and installs nothing, so the pool census returns to exactly
-    /// where it was and the object keeps the version it had.
-    fn install(&self, entry: &Entry, content_type: &str, parts: &[&[u8]]) -> Result<u64> {
-        self.install_coordinated(entry, content_type, parts, Coordination::Exclusive)
+    /// Every failure path — a chunk that will not allocate, a fenced lease, a
+    /// rejected install — unwinds the staging it had already done and installs
+    /// nothing, so the pool census (and the live-segment census) returns to
+    /// exactly where it was and the object keeps the version it had.
+    fn install(&self, entry: &Entry, content_type: &str, bytes: &[u8]) -> Result<u64> {
+        self.install_coordinated(entry, content_type, bytes, Coordination::Exclusive)
     }
 
     fn install_coordinated(
         &self,
         entry: &Entry,
         content_type: &str,
-        parts: &[&[u8]],
+        bytes: &[u8],
         coordination: Coordination,
     ) -> Result<u64> {
         let optimistic = matches!(coordination, Coordination::Optimistic { .. });
-        let journal = BorrowJournal::attach(self.store.journal_segment())?;
+        let shape = self.pooled_shape(content_type)?;
+        let dedicated = bytes.len() as u64 > shape.ceiling;
         let mut tries = 0u32;
         loop {
-            let mut writer = match StreamWriter::open(
-                entry.artifact(),
-                self.store.data_segment(),
-                &journal,
-                &self.registry,
-                self.store.owner(),
-                Commit::Replace,
-                coordination,
-            ) {
-                Ok(w) => w,
-                Err(e) if is_contention(&e, optimistic) => {
-                    if tries >= PUT_RETRIES {
-                        return Err(Error::Contended(tries));
-                    }
-                    tries += 1;
-                    std::thread::yield_now();
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
+            let attempt = if dedicated {
+                self.install_dedicated(entry, content_type, bytes, coordination)
+            } else {
+                self.install_pooled(entry, content_type, bytes, shape.per_segment, coordination)
             };
-            // One batch per segment, built as it is staged so only one segment
-            // is ever duplicated in this process's heap.
-            for part in parts {
-                let batch = encode_segment(&self.side.schema, content_type, part);
-                if let Err(e) = writer.append_batch(&batch) {
-                    // Frees every chunk staged so far and releases their journal
-                    // slots; nothing was ever visible to a reader.
-                    writer.abort();
-                    return Err(e.into());
-                }
-            }
-            match writer.commit() {
+            match attempt {
                 Ok(v) => return Ok(v),
-                // The install itself lost the lease (fenced/contended); the
-                // staged chunks were already returned to the pool by the commit.
-                Err(e) if is_contention(&e, optimistic) => {
+                Err(e) if is_contended(&e, optimistic) => {
                     if tries >= PUT_RETRIES {
                         return Err(Error::Contended(tries));
                     }
                     tries += 1;
                     std::thread::yield_now();
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
+    }
+
+    /// One attempt at the **pooled** path: cut the payload into segments that
+    /// each fit one chunk of the shared pool and install them as one version.
+    ///
+    /// The transaction is `shm-stream`'s: each batch is serialized into fresh
+    /// chunks, loaned to this writer and recorded in its borrow journal *before*
+    /// it counts as staged, and the whole set is installed by a single
+    /// `Committer::commit_staged`.
+    fn install_pooled(
+        &self,
+        entry: &Entry,
+        content_type: &str,
+        bytes: &[u8],
+        segment_size: usize,
+        coordination: Coordination,
+    ) -> Result<u64> {
+        // An empty payload is one empty segment, not zero segments: a version
+        // with no batches would read back as a missing object.
+        let parts: Vec<&[u8]> = if bytes.is_empty() {
+            vec![&[]]
+        } else {
+            bytes.chunks(segment_size).collect()
+        };
+        let journal = BorrowJournal::attach(self.store.journal_segment())?;
+        let mut writer = StreamWriter::open(
+            entry.artifact(),
+            self.store.data_segment(),
+            &journal,
+            &self.registry,
+            self.store.owner(),
+            Commit::Replace,
+            coordination,
+        )?;
+        // The version this commit supersedes may name a dedicated segment this
+        // node has never mapped, and the retire cascade has to return those
+        // chunks to *their own* pools. Done here rather than before the open so
+        // that under `Exclusive` the lease is already held: no other writer can
+        // slip a version naming a different segment in between.
+        if let Err(e) = self.map_current_segments(entry) {
+            writer.abort();
+            return Err(e);
+        }
+        // One batch per segment, built as it is staged so only one segment is
+        // ever duplicated in this process's heap.
+        for part in &parts {
+            let batch = encode_segment(&self.side.schema, content_type, part);
+            if let Err(e) = writer.append_batch(&batch) {
+                // Frees every chunk staged so far and releases their journal
+                // slots; nothing was ever visible to a reader.
+                writer.abort();
+                return Err(e.into());
+            }
+        }
+        Ok(writer.commit()?)
+    }
+
+    /// One attempt at the **dedicated** path: the whole payload as one batch in
+    /// one chunk of a segment granted for it alone.
+    ///
+    /// The same split a process allocator makes at `M_MMAP_THRESHOLD`. The
+    /// segment is contiguous by construction and cannot fragment the shared
+    /// arena, because it is never carved from it.
+    ///
+    /// The segment is **staged** for the whole write: until the version is
+    /// installed, the creator's `ENTRY_PAYLOAD_SEGMENT` journal entry is what
+    /// reclaims it, so a `kill -9` mid-write leaks nothing. Once the commit
+    /// lands, [`Node::install_payload_segment`] closes that window and the
+    /// object's chunk governs the segment's life instead — which is why a later
+    /// `put` releases this segment without anyone unlinking it explicitly: the
+    /// retire cascade drives the chunk to `FREE` and the coordinator's sweep
+    /// takes it from there.
+    ///
+    /// A failure of the install *after* a successful commit is reported, not
+    /// swallowed: the version is durable either way (replay of the creator's
+    /// journal entry finds the chunk held and un-stages the segment rather than
+    /// unlinking it), but until the coordinator is told, the segment's life is
+    /// still tied to this node's, and that is a degradation the caller should
+    /// hear about rather than discover later.
+    fn install_dedicated(
+        &self,
+        entry: &Entry,
+        content_type: &str,
+        bytes: &[u8],
+        coordination: Coordination,
+    ) -> Result<u64> {
+        let batch = encode_segment(&self.side.schema, content_type, bytes);
+        let need = shm_arrow::serialized_len(&batch).ok_or(Error::BadObject)?;
+        // A chunk is addressed by a `u32` length, so one dedicated object tops
+        // out at 4 GiB serialized. Refuse before asking for a segment.
+        let chunk = u32::try_from(need).map_err(|_| Error::TooLarge(need))?;
+        let cfg = one_chunk_pool(chunk);
+        let journal = BorrowJournal::attach(self.store.journal_segment())?;
+        let seg = self
+            .node
+            .create_payload_segment(required_bytes(&cfg) as u64)?;
+        let seg_id = seg.id();
+        match self.stage_and_commit(entry, &seg, &cfg, &batch, coordination, &journal) {
+            Ok(version) => {
+                // The version's manifest now holds the `+1` on the chunk, so the
+                // object outlives this process. Telling the coordinator is what
+                // stops replay from reclaiming a segment nothing is accountable
+                // for any more.
+                self.node.install_payload_segment(seg_id)?;
+                Ok(version)
+            }
+            Err(e) => {
+                // Still inside the staging window, so the explicit release is
+                // legal and unlinks immediately — no waiting for a sweep.
+                let _ = self.node.release_payload_segment(seg_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Lay the one-class, one-chunk pool inside `seg`, write `batch` into its
+    /// single chunk, and install it as the entry's next version.
+    ///
+    /// On any failure the chunk is returned to its own pool, so the segment is
+    /// quiescent by the time the caller releases it.
+    fn stage_and_commit(
+        &self,
+        entry: &Entry,
+        seg: &Segment,
+        cfg: &PoolConfig,
+        batch: &RecordBatch,
+        coordination: Coordination,
+        journal: &BorrowJournal<'_>,
+    ) -> Result<u64> {
+        let owner = self.store.owner();
+        let pool = Pool::create(seg, cfg)?;
+        let chunks = {
+            let alloc = PoolAllocator::new(&pool, seg);
+            write_batch_chunks(&alloc, &self.registry, batch)?
+        };
+        // The pool was sized from this batch's own `serialized_len`, so a
+        // continuation chunk means the sizing is wrong, not the payload.
+        if chunks.len() != 1 {
+            for d in &chunks {
+                let _ = pool.free(d);
+            }
+            return Err(Error::TooLarge(
+                shm_arrow::serialized_len(batch).unwrap_or(0),
+            ));
+        }
+        let desc = chunks[0];
+        pool.ctrl(&desc)?.try_loan(owner)?;
+
+        let result = self.commit_one_chunk(entry, desc, coordination, journal);
+        if result.is_err() {
+            // A commit that got as far as staging already returned the chunk to
+            // this pool; one that never took the lease, or that never got past
+            // the segment probe, did not. Free only a chunk still loaned to us,
+            // so neither case double-frees.
+            if let Ok(ctrl) = pool.ctrl(&desc) {
+                if ctrl.state() == LOANED && ctrl.drop_loan().is_ok() {
+                    let _ = pool.free(&desc);
+                }
+            }
+        }
+        result
+    }
+
+    /// Install one already-loaned chunk as the entry's next version.
+    ///
+    /// The predecessor's dedicated segments are mapped **after** the write lease
+    /// is taken, for the reason [`install_pooled`](Self::install_pooled) gives:
+    /// under `Exclusive` no other writer can install a version naming a segment
+    /// this node has not mapped between the probe and the commit. Under
+    /// `Optimistic` the install CAS is the same guarantee — a version that
+    /// landed after the probe moves `current`, so the commit conflicts and
+    /// installs nothing.
+    fn commit_one_chunk(
+        &self,
+        entry: &Entry,
+        desc: ChunkDesc,
+        coordination: Coordination,
+        journal: &BorrowJournal<'_>,
+    ) -> Result<u64> {
+        let owner = self.store.owner();
+        let staged = [desc];
+        let spans = [1u32];
+        let schema_id = desc.schema_id;
+        let installed = match coordination {
+            Coordination::Exclusive => {
+                let mut committer = entry
+                    .artifact()
+                    .open_exclusive_journaled(owner, journal)
+                    .map_err(|e| Error::Store(shm_store::Error::Artifact(e)))?;
+                self.map_current_segments(entry)?;
+                committer.commit_staged(Commit::Replace, &staged, &spans, schema_id)
+            }
+            Coordination::Optimistic { expect_version } => {
+                self.map_current_segments(entry)?;
+                entry.artifact().commit_staged_optimistic_journaled(
+                    owner,
+                    expect_version,
+                    Commit::Replace,
+                    &staged,
+                    &spans,
+                    schema_id,
+                    journal,
+                )
+            }
+        };
+        installed.map_err(|e| Error::Store(shm_store::Error::Artifact(e)))
+    }
+
+    /// Map every dedicated segment the entry's **current** version names.
+    ///
+    /// Descriptors are addressed by offset alone, so `shm-artifact` refuses one
+    /// naming an unmapped segment rather than resolving it against the store's
+    /// — which is what keeps a foreign descriptor from aliasing a real,
+    /// unrelated control block. The consequence is that a writer superseding a
+    /// large object, and an evictor tearing one down, need the mapping just as
+    /// much as a reader does: without it the retire fails closed and the chunk
+    /// stays published forever.
+    ///
+    /// The pin is the probe: it is the operation that resolves a version's
+    /// segments, and its refusal names the one that is missing. Each miss maps
+    /// exactly one segment, so the loop is bounded by how many the version
+    /// names.
+    fn map_current_segments(&self, entry: &Entry) -> Result<()> {
+        if entry.current_version() == 0 {
+            return Ok(());
+        }
+        let mut last = 0u32;
+        for _ in 0..FAULT_IN_LIMIT {
+            match entry.pin() {
+                // Dropped immediately: all this wanted was the resolution.
+                Ok(_pin) => return Ok(()),
+                Err(e) => match unmapped_segment(&Error::from(e)) {
+                    Some(seg_id) => {
+                        last = seg_id;
+                        self.node.map_payload_segment(seg_id)?;
+                    }
+                    // Not a mapping problem (nothing committed yet, a stale
+                    // handle): leave it to the operation itself to report.
+                    None => return Ok(()),
+                },
+            }
+        }
+        Err(Error::Unmapped(last))
     }
 
     /// Replace `key` only if its current version is still `expect`.
@@ -753,16 +1046,10 @@ impl<'a> ObjectStore<'a> {
     pub fn put_if(&self, key: &str, content_type: &str, bytes: &[u8], expect: u64) -> Result<u64> {
         check_content_type(content_type)?;
         let (entry, kid) = self.entry_or_create(key)?;
-        let seg = self.segment_size(content_type)?;
-        let parts: Vec<&[u8]> = if bytes.is_empty() {
-            vec![&[]]
-        } else {
-            bytes.chunks(seg).collect()
-        };
         let version = match self.install_coordinated(
             &entry,
             content_type,
-            &parts,
+            bytes,
             Coordination::Optimistic {
                 expect_version: expect,
             },
@@ -824,6 +1111,13 @@ impl<'a> ObjectStore<'a> {
             Commit::Replace,
             Coordination::Exclusive,
         )?;
+        // Under the lease, as in `install_pooled`: the version this stream will
+        // supersede may live in a dedicated segment this node has never mapped,
+        // and the retire cascade has to reach its pool.
+        if let Err(e) = self.map_current_segments(&entry) {
+            writer.abort();
+            return Err(e);
+        }
 
         let mut sink = SegmentSink {
             writer: &mut writer,
@@ -860,7 +1154,13 @@ impl<'a> ObjectStore<'a> {
         // Every batch of the pinned version, in commit order. A `Replace` root
         // has no predecessor, so this walks exactly one manifest: the object's
         // own segments and nothing else.
-        let (pin, delta) = entry.read_since(0)?;
+        //
+        // A version whose payload is in a dedicated segment can only be pinned
+        // once this node has mapped it, and the pin is what says which. The
+        // order is the safe one: the version pin is taken first, so the
+        // manifest's reference already holds the chunk against `FREE` and the
+        // coordinator's sweep cannot unlink the segment underneath the mapping.
+        let (pin, delta) = self.read_current(&entry)?;
         let version = pin.version();
         if let Version::IfCurrent(requested) = want {
             if requested != version {
@@ -888,6 +1188,33 @@ impl<'a> ObjectStore<'a> {
         })
     }
 
+    /// Pin the entry's current version and read its batches, mapping any
+    /// dedicated segment the version names on the way.
+    ///
+    /// A pin that names a segment this node has not mapped is *refused* — never
+    /// resolved against the store segment — so the refusal itself is the lookup:
+    /// it says which segment to ask the coordinator for. The speculative pin is
+    /// undone by the refusal, so retrying is not a leak.
+    fn read_current(&self, entry: &Entry) -> Result<(VersionPin, shm_artifact::Delta)> {
+        let mut last = 0u32;
+        for _ in 0..FAULT_IN_LIMIT {
+            match entry.read_since(0) {
+                Ok(read) => return Ok(read),
+                Err(e) => {
+                    let err = Error::from(e);
+                    match unmapped_segment(&err) {
+                        Some(seg_id) => {
+                            last = seg_id;
+                            self.node.map_payload_segment(seg_id)?;
+                        }
+                        None => return Err(err),
+                    }
+                }
+            }
+        }
+        Err(Error::Unmapped(last))
+    }
+
     /// Delete `key`: tombstone its catalog slot and tear down every version.
     /// Idempotent — deleting an absent object is a clean no-op.
     ///
@@ -899,6 +1226,13 @@ impl<'a> ObjectStore<'a> {
     /// deleting is an operator-scale action, not a per-request one.
     pub fn delete(&self, key: &str) -> Result<()> {
         check_object_key(key)?;
+        // The teardown must return the current version's chunks to their own
+        // pools, so map any dedicated segment it names before tombstoning.
+        // Without this the retire fails closed and the chunk — and so the whole
+        // segment — is never reclaimed.
+        if let Some((entry, _)) = self.entry_open(key)? {
+            self.map_current_segments(&entry)?;
+        }
         self.entries
             .lock()
             .expect("entry cache poisoned")
@@ -910,19 +1244,74 @@ impl<'a> ObjectStore<'a> {
     }
 }
 
-/// Whether a staging/commit failure is a lost race for the entry's write lease
-/// — the one class of failure a `put` retries.
-/// Is this worth retrying?
+/// How the shared pool would hold this object: which size class its segments
+/// are cut from, how much payload one segment carries, and the largest object
+/// the pool can hold that way.
+#[derive(Clone, Copy)]
+struct PooledShape {
+    /// The size class segments are cut from.
+    class: u32,
+    /// The `data` bytes one segment carries.
+    per_segment: usize,
+    /// The largest payload the pool can hold — the dedicated threshold.
+    ceiling: u64,
+}
+
+/// The pool a dedicated segment carries: one class, one chunk, sized to the
+/// object it was granted for.
+///
+/// A real [`Pool`] rather than a bespoke "the segment *is* the chunk" header,
+/// deliberately. The chunk control word is what a version's manifest holds its
+/// `+1` on, what the retire cascade drives to `FREE`, and what the coordinator
+/// reads to decide the segment may be unlinked. Reusing it means the size split
+/// changes *where* a chunk lives and nothing else — the state machine, the
+/// generations and the journal kinds are all unchanged.
+fn one_chunk_pool(chunk_size: u32) -> PoolConfig {
+    PoolConfig {
+        classes: vec![SizeClass {
+            chunk_size,
+            chunk_count: 1,
+        }],
+    }
+}
+
+/// The dedicated segment an error says this node has not mapped, if that is
+/// what the error says.
+///
+/// `WrongSegment` is `shm-artifact`'s refusal to resolve a descriptor naming a
+/// segment it has no mapping for — a hard failure by design, since chunk
+/// addressing is by offset alone and answering with the store segment would
+/// find a real, unrelated control block. It names the segment, which is exactly
+/// what a caller needs to go and map it.
+fn unmapped_segment(e: &Error) -> Option<u32> {
+    let artifact = match e {
+        Error::Store(shm_store::Error::Artifact(a)) => a,
+        Error::Stream(shm_stream::Error::Artifact(a)) => a,
+        Error::Core(shm_core::Error::WrongSegment { desc, .. }) => return Some(*desc),
+        _ => return None,
+    };
+    match artifact {
+        shm_artifact::Error::Core(shm_core::Error::WrongSegment { desc, .. }) => Some(*desc),
+        _ => None,
+    }
+}
+
+/// Is this failure worth retrying?
 ///
 /// A lost **write lease** is: another writer holds it and will let go. A lost
 /// **install CAS** is only contention when nobody asked for a precondition —
 /// under [`Coordination::Optimistic`] a `Conflict` IS the answer, and retrying
 /// it would turn a compare-and-set into a loop that eventually overwrites the
 /// value the caller was guarding against.
-fn is_contention(e: &shm_stream::Error, optimistic: bool) -> bool {
-    match e {
-        shm_stream::Error::Artifact(shm_artifact::Error::WriteLocked) => true,
-        shm_stream::Error::Artifact(shm_artifact::Error::Conflict { .. }) => !optimistic,
+fn is_contended(e: &Error, optimistic: bool) -> bool {
+    let artifact = match e {
+        Error::Stream(shm_stream::Error::Artifact(a)) => a,
+        Error::Store(shm_store::Error::Artifact(a)) => a,
+        _ => return false,
+    };
+    match artifact {
+        shm_artifact::Error::WriteLocked => true,
+        shm_artifact::Error::Conflict { .. } => !optimistic,
         _ => false,
     }
 }
@@ -1076,8 +1465,9 @@ mod tests {
         let mut node = connect(&uds, "writer");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         assert!(objects.head("ring/000").unwrap().is_none());
         let kid = objects.ensure("ring/000").unwrap();
@@ -1110,8 +1500,9 @@ mod tests {
         let mut node = connect(&uds, "writer");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         // A read of a key that was never written creates nothing.
         assert!(objects.head("missing").unwrap().is_none());
@@ -1208,8 +1599,9 @@ mod tests {
         let mut node = connect(&uds, "writer");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         assert_eq!(objects.put("blob", "text/plain", b"first").unwrap(), 1);
         let held = objects.get("blob", Version::Latest).unwrap();
@@ -1281,8 +1673,9 @@ mod tests {
         let mut node = connect(&uds, "reader");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         assert_eq!(objects.put("blob", "text/plain", b"first").unwrap(), 1);
         let held = objects.get("blob", Version::Latest).unwrap();
@@ -1296,8 +1689,9 @@ mod tests {
             let mut node = connect(&uds2, "writer");
             let side = ObjectSide::open(&mut node).unwrap();
             let registry = node.registry().clone();
-            let store = node.store().unwrap();
-            let objects = ObjectStore::new(&store, &side, registry);
+            node.open_store().unwrap();
+            let store = node.opened_store().unwrap();
+            let objects = ObjectStore::new(&store, &side, registry, &node);
             for v in 2..=ROUNDS + 1 {
                 let body = vec![b'y'; (v as usize % 97) + 1];
                 assert_eq!(
@@ -1346,8 +1740,9 @@ mod tests {
         let mut node = connect(&uds, "writer");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         // 150 times the largest size class, and deliberately not a multiple of
         // the segment size: the last segment is short, which is where an
@@ -1413,8 +1808,9 @@ mod tests {
         let mut node = connect(&uds, "writer");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         let cap = objects.max_object().unwrap();
         let seg = objects.max_payload().unwrap() as u64;
@@ -1439,7 +1835,6 @@ mod tests {
     #[test]
     fn a_failed_put_stages_nothing_and_leaves_the_census_at_baseline() {
         let cfg = config();
-        let pool_bytes = cfg.store_data_size;
 
         let dir = tempfile::tempdir().unwrap();
         let uds = dir.path().join("coord.sock");
@@ -1449,23 +1844,30 @@ mod tests {
         let mut node = connect(&uds, "writer");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         // A live object beside it, so the failing put has to unwind back to a
-        // non-trivial census rather than to an empty pool.
-        objects
-            .put("neighbour", "text/plain", b"untouched")
-            .unwrap();
+        // non-trivial census rather than to an empty pool — and one big enough
+        // to hold 64 chunks of the very size class the doomed put cuts from,
+        // which is what makes the pool run out partway through it.
+        //
+        // The trigger is exhaustion of the *shared pool*, not sheer size: a
+        // payload larger than `max_object` no longer fails at all, it gets a
+        // dedicated segment. So the doomed put asks for exactly the pooled
+        // ceiling — the largest thing that still has to come out of the pool —
+        // against a pool that no longer has room for it.
+        let ct = "application/octet-stream";
+        let seg = objects.segment_size(ct).unwrap();
+        objects.put("neighbour", ct, &vec![7u8; seg * 64]).unwrap();
         objects.ensure("doomed").unwrap();
         let before = coord.store_data_free_total().expect("census");
 
-        // Twice the entire data segment: staging runs out of chunks partway
-        // through, with hundreds of segments already loaned and journaled.
-        let huge = vec![9u8; pool_bytes * 2];
+        let huge = vec![9u8; objects.max_object().unwrap() as usize];
         let err = objects
-            .put("doomed", "application/octet-stream", &huge)
-            .expect_err("a payload twice the data segment cannot be staged");
+            .put("doomed", ct, &huge)
+            .expect_err("the pooled ceiling cannot be staged beside a 64-chunk neighbour");
         assert!(
             matches!(err, Error::Stream(_)),
             "expected a staging failure, got {err:?}"
@@ -1483,7 +1885,7 @@ mod tests {
             Err(Error::NotFound)
         ));
         let n = objects.get("neighbour", Version::Latest).unwrap();
-        assert_eq!(joined(&n).as_slice(), &b"untouched"[..]);
+        assert_eq!(joined(&n), vec![7u8; seg * 64]);
         drop(n);
         // And the entry still works: the next, sane put takes version 1.
         assert_eq!(objects.put("doomed", "text/plain", b"ok").unwrap(), 1);
@@ -1502,8 +1904,9 @@ mod tests {
         let mut node = connect(&uds, "writer");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         let keys = ["one", "two/deep", "three.bin"];
         for key in keys {
@@ -1564,8 +1967,9 @@ mod tests {
         let mut node = connect(&uds, "w");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         // Written in many small pushes, as an encoder would: the sink never sees
         // the payload as one buffer and neither does the producer.
@@ -1651,8 +2055,9 @@ mod tests {
         let mut node = connect(&uds, "w");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         let ceiling = objects.max_object().unwrap();
         let largest_class_reach = 3 * (8u64 << 20);
@@ -1687,8 +2092,9 @@ mod tests {
         let mut node = connect(&uds, "w");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry);
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry, &node);
 
         // Create-if-absent: version 0 means "nothing committed yet".
         assert_eq!(objects.put_if("cas", "text/plain", b"one", 0).unwrap(), 1);
@@ -1759,8 +2165,9 @@ mod tests {
         let mut node = connect(&uds, "probe");
         let side = ObjectSide::open(&mut node).unwrap();
         let registry = node.registry().clone();
-        let store = node.store().unwrap();
-        let objects = ObjectStore::new(&store, &side, registry.clone());
+        node.open_store().unwrap();
+        let store = node.opened_store().unwrap();
+        let objects = ObjectStore::new(&store, &side, registry.clone(), &node);
 
         let ct = "application/octet-stream";
         let seg = objects.segment_size(ct).unwrap();

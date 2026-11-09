@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use core::sync::atomic::Ordering;
 
-use shm_artifact::{Artifact, ArtifactHead};
+use shm_artifact::{Artifact, ArtifactHead, SegmentMap};
 use shm_core::{
     doorbell_pair, BorrowJournal, ChunkCtrl, ChunkDesc, DoorbellPair, JournalRecord, Pool, Segment,
     FREE, LOANED, PUBLISHED,
@@ -113,6 +113,30 @@ struct ArtifactEntry {
     data_seg: Arc<Segment>,
 }
 
+/// A coordinator-owned **dedicated payload segment**: one large object.
+///
+/// Its lifetime has two phases, and the split is the whole point:
+///
+/// 1. **Staging** (`staged`) — from `CreatePayloadSegment` until the creator's
+///    [`InstallPayloadSegment`](crate::protocol::Request::InstallPayloadSegment).
+///    Nothing but the creator knows the segment exists, so the creator's borrow
+///    journal is what keeps it from leaking, exactly as it is for a staged
+///    manifest. A creator that dies here has its segment reclaimed by journal
+///    replay.
+/// 2. **Installed** — a version naming the object is installed, its manifest
+///    holds the `+1` on the object's chunk, and readers pin the *version*.
+///    The creator is now irrelevant: the segment lives as long as the chunk is
+///    held and is unlinked by [`sweep_payload_segments`] once the retire
+///    cascade drives that chunk back to [`FREE`].
+struct PayloadSegmentEntry {
+    /// The mapping the coordinator retains, so the fd stays grantable.
+    segment: Arc<Segment>,
+    /// `true` while the creator's staging window is open. The sweep ignores a
+    /// staged segment: a freshly-laid pool has every chunk `FREE`, so sweeping
+    /// one would unlink the segment out from under the writer filling it.
+    staged: bool,
+}
+
 /// Mutable coordinator state, guarded by one mutex.
 struct CoordState {
     next_actor_id: u32,
@@ -144,11 +168,11 @@ struct CoordState {
     /// Coordinator-owned so a segment outlives the actor that asked for it —
     /// the object is the thing with the lifetime, not the writer. Kept mapped
     /// so the fd stays grantable to later readers.
-    payload_segments: HashMap<u32, Arc<Segment>>,
-    /// Payload segment slots handed out, and slots returned for reuse. Ids are
-    /// recycled because the range is bounded.
+    payload_segments: HashMap<u32, PayloadSegmentEntry>,
+    /// The next payload segment id to hand out. Monotonic: an id is never
+    /// reused, because a released id has no incarnation to distinguish it from
+    /// its successor and a stale descriptor would alias the new object.
     next_payload_slot: u32,
-    free_payload_slots: Vec<u32>,
     /// Master schema catalog (ADR-0003 item E): the process-independent
     /// [`shm_arrow::schema_content_hash`] → issued `schema_id`. The coordinator
     /// is the *authoritative* registry; nodes cache their learned mappings
@@ -303,7 +327,6 @@ impl Coordinator {
                 next_topic_index: 0,
                 payload_segments: HashMap::new(),
                 next_payload_slot: 0,
-                free_payload_slots: Vec::new(),
                 next_artifact_index: 0,
                 next_name_id: 1,
                 actors: HashMap::new(),
@@ -629,6 +652,13 @@ impl Coordinator {
         sweep_store_tombstones(&self.shared)
     }
 
+    /// Drive one dedicated-payload-segment sweep, returning how many installed
+    /// segments went quiescent and were unlinked. Exposes the exact path the
+    /// monitor runs, for deterministic same-process tests.
+    pub fn sweep_payload_segments(&self) -> usize {
+        sweep_payload_segments(&self.shared)
+    }
+
     /// The lifecycle state of every **appended** store catalog slot
     /// (`SLOT_FREE`/`SLOT_LIVE`/`SLOT_TOMBSTONE`/`SLOT_RECLAIMING`), in slot
     /// order. Observability for the ADR-0008 P0.1 reclamation census: a test
@@ -742,6 +772,12 @@ fn handle_connection(shared: Arc<CoordShared>, stream: UnixStream) -> Result<()>
             Request::CreatePayloadSegment { bytes } => {
                 grant_payload_segment(&shared, bytes, &stream)?;
             }
+            Request::InstallPayloadSegment { seg_id } => {
+                install_payload_segment(&shared, seg_id, &stream)?;
+            }
+            Request::MapPayloadSegment { seg_id } => {
+                map_payload_segment(&shared, seg_id, &stream)?;
+            }
             Request::ReleasePayloadSegment { seg_id } => {
                 release_payload_segment(&shared, seg_id);
             }
@@ -833,23 +869,234 @@ fn register_actor(shared: &Arc<CoordShared>, name: &str, stream: &UnixStream) ->
     Ok(actor_id)
 }
 
-/// Release a dedicated payload segment: unlink it and recycle its id.
+/// Honour an explicit [`Request::ReleasePayloadSegment`]: the creator is
+/// abandoning a segment it never installed.
 ///
-/// One place, called both by an explicit
-/// [`Request::ReleasePayloadSegment`] and by journal replay after the owner
-/// died, so a crashed writer's segment is reclaimed by the same ledger that
-/// reclaims every other borrow rather than surviving until shutdown.
+/// A **staging-window** operation, and only that. Once a segment is installed
+/// the object's chunk owns its lifetime: readers pin the version, not the
+/// segment, so honouring a release then would unlink an object out from under
+/// them. An installed segment is therefore left to
+/// [`sweep_payload_segments`], which takes it when its chunk reaches `FREE`.
 fn release_payload_segment(shared: &Arc<CoordShared>, seg_id: u32) -> bool {
     let mut st = shared.state.lock().unwrap();
-    let Some(seg) = st.payload_segments.remove(&seg_id) else {
+    if st.payload_segments.get(&seg_id).is_some_and(|e| !e.staged) {
+        return false;
+    }
+    release_payload_segment_locked(&mut st, seg_id)
+}
+
+/// [`release_payload_segment`] with the state lock already held, so a caller
+/// that must decide *and* unlink without a gap (the sweep, and replay's
+/// unlink-iff-`FREE`) can do both under one hold.
+fn release_payload_segment_locked(st: &mut CoordState, seg_id: u32) -> bool {
+    let Some(entry) = st.payload_segments.remove(&seg_id) else {
         return false;
     };
-    // Existing mappings stay valid; the name simply stops resolving.
-    let _ = seg.unlink();
-    if let Some(slot) = seg_id.checked_sub(shared.config.payload_object_seg_id(0)) {
-        st.free_payload_slots.push(slot);
-    }
+    // Existing mappings stay valid; the name simply stops resolving. The id is
+    // deliberately not returned to a free list — see `MAX_PAYLOAD_SEGMENTS`.
+    let _ = entry.segment.unlink();
     true
+}
+
+/// Is a dedicated segment **quiescent** — is nothing inside it still held?
+///
+/// A large object's segment carries at most one pool, of one class, of one
+/// chunk, so this is really "is the object's chunk `FREE`". Two shapes answer
+/// yes: a segment with no pool at all (a raw buffer nobody has described) and a
+/// pool whose chunks have all been recycled by the retire cascade
+/// (`release_manifest_ref` → `release_chunk` → `release_shared` → `Pool::free`).
+///
+/// This is the *only* thing that authorises an unlink after a segment is
+/// installed. Not the creator's liveness, not an explicit release: the chunk's
+/// control word, which is what every reader's pin ultimately holds.
+fn payload_segment_quiescent(seg: &Segment) -> bool {
+    let Ok(pool) = Pool::attach(seg) else {
+        // No pool header: nothing in the segment can be holding it.
+        return true;
+    };
+    (0..pool.total_chunks()).all(|i| {
+        pool.ctrl_by_index(i)
+            .map(|c| c.state() == FREE)
+            .unwrap_or(true)
+    })
+}
+
+/// Close a dedicated segment's staging window: its object's version is
+/// installed, so its lifetime now follows the chunk rather than the creator.
+///
+/// Refused while the segment is still quiescent. An install claims that
+/// something now holds the object; if nothing does, the very next
+/// [`sweep_payload_segments`] would unlink the segment while its writer was
+/// still filling it, which is worse than the leak the install prevents.
+fn install_payload_segment(
+    shared: &Arc<CoordShared>,
+    seg_id: u32,
+    stream: &UnixStream,
+) -> Result<()> {
+    let resp = {
+        let mut st = shared.state.lock().unwrap();
+        match st.payload_segments.get_mut(&seg_id) {
+            None => Response::Error {
+                message: format!("no such payload segment ({seg_id})"),
+            },
+            Some(entry) if payload_segment_quiescent(&entry.segment) => Response::Error {
+                message: format!("payload segment {seg_id} holds no live chunk to install"),
+            },
+            Some(entry) => {
+                entry.staged = false;
+                Response::Ack
+            }
+        }
+    };
+    send_frame(stream, &resp.encode(), &[])
+}
+
+/// Grant a **reader** the fd of an installed dedicated segment it did not
+/// create.
+///
+/// The read side of the large-object path, and the reason the coordinator keeps
+/// every payload segment mapped: a version's manifest names its chunks by
+/// `(segment_id, offset)`, and `shm-artifact` *refuses* a descriptor naming a
+/// segment the reader has not mapped rather than resolving it against another
+/// one. Without this call a second process could see that a large object exists
+/// and never read a byte of it.
+///
+/// Two refusals, both load-bearing:
+///
+/// - **Unknown id.** A segment leaves `payload_segments` exactly when it is
+///   unlinked, and ids are never reused, so an id that is not in the table
+///   names an object that is gone — or one that never existed. Either way there
+///   is no fd, and none is invented: the caller gets an error, not a stale
+///   mapping onto some successor object.
+/// - **Still staged.** Before its install the segment belongs to its creator's
+///   liveness: journal replay can unlink it and recycle its chunk at any
+///   moment, and a reader holds nothing that would stop it. Nothing outside the
+///   creator can legitimately know a staged segment exists — a reader learns of
+///   one only by pinning the version that names it, which cannot happen until
+///   after the install.
+///
+/// The grant races nothing. It is decided and the fd is taken under the same
+/// lock hold [`sweep_payload_segments`] needs to unlink, so a reader either
+/// sees a live entry or sees none; and a reader that reached here through the
+/// pin ordering (pin the version, read its manifest, *then* map) already holds
+/// the manifest's `+1` on the chunk, so the sweep cannot find the segment
+/// quiescent in the first place.
+fn map_payload_segment(shared: &Arc<CoordShared>, seg_id: u32, stream: &UnixStream) -> Result<()> {
+    let granted = {
+        let st = shared.state.lock().unwrap();
+        match st.payload_segments.get(&seg_id) {
+            // Includes "already unlinked": the id is removed from the table by
+            // the unlink itself and is never handed out again.
+            None => Err(format!("no such payload segment ({seg_id})")),
+            Some(entry) if entry.staged => Err(format!(
+                "payload segment {seg_id} is still staged by its creator"
+            )),
+            Some(entry) => Ok((entry.segment.as_raw_fd(), entry.segment.size() as u64)),
+        }
+    };
+    match granted {
+        Ok((fd, len)) => {
+            let resp = Response::PayloadSegmentGranted { seg_id, len };
+            send_frame(stream, &resp.encode(), &[fd])
+        }
+        Err(message) => send_frame(stream, &Response::Error { message }.encode(), &[]),
+    }
+}
+
+/// Unlink every **installed** dedicated segment that has gone quiescent,
+/// returning how many were reclaimed.
+///
+/// The counterpart to the keyed store's tombstone sweep, and the only unlink
+/// path for an installed object. It exists because the releaser is nobody in
+/// particular: the retire cascade that drops a version's last manifest ref runs
+/// in whichever actor happened to supersede or unpin it, and `shm-artifact` has
+/// no coordinator RPC to tell anyone about it. So instead of asking the
+/// releaser to report, the coordinator reads the one thing that is already
+/// authoritative — the chunk's control word — on its own tick.
+///
+/// Double release is structurally impossible: only the coordinator unlinks,
+/// only from `FREE`, and the table `remove` is idempotent.
+fn sweep_payload_segments(shared: &Arc<CoordShared>) -> usize {
+    let mut swept = 0;
+    let mut st = shared.state.lock().unwrap();
+    // One lock hold, so "quiescent" and "unlinked" cannot be separated by
+    // anything that re-describes the segment in between.
+    st.payload_segments.retain(|_, e| {
+        if e.staged || !payload_segment_quiescent(&e.segment) {
+            return true;
+        }
+        let _ = e.segment.unlink();
+        swept += 1;
+        false
+    });
+    swept
+}
+
+/// Journal replay of a held dedicated segment: the creator died inside its
+/// staging window.
+///
+/// **Never a blind unlink.** The creator may have died holding the object's
+/// chunk, so release the *exclusive* hold it could still have on it — the same
+/// thing [`reclaim_one`] does for a `LOANED` or published-but-undelivered chunk
+/// — and unlink only if that leaves the segment quiescent. If a version was
+/// installed before the crash, its manifest still holds the chunk and the
+/// segment survives; the sweep unlinks it when that hold goes.
+///
+/// Deliberately *not* [`reclaim_one`] itself: that also drops a **shared** pin
+/// when the chunk is published with a live refcount, and this record can never
+/// justify doing so. A shared pin the dead actor took has its own
+/// [`ChunkPin`](JournalRecord::ChunkPin) entry — and that path now reaches
+/// dedicated segments too — whereas a refcount this record cannot explain
+/// belongs to an installed manifest or to another reader, and releasing it
+/// would free the object out from under them.
+fn reclaim_payload_segment(shared: &Arc<CoordShared>, seg_id: u32, actor_id: u32) -> bool {
+    let Some(seg) = shared
+        .state
+        .lock()
+        .unwrap()
+        .payload_segments
+        .get(&seg_id)
+        .map(|e| e.segment.clone())
+    else {
+        return false;
+    };
+    if let Ok(pool) = Pool::attach(&seg) {
+        for i in 0..pool.total_chunks() {
+            let Ok(ctrl) = pool.ctrl_by_index(i) else {
+                continue;
+            };
+            let recycled = match ctrl.state() {
+                LOANED if ctrl.owner_actor.load(Ordering::Acquire) == actor_id => {
+                    ctrl.drop_loan().is_ok()
+                }
+                PUBLISHED
+                    if ctrl.refcount() == 0
+                        && ctrl.owner_actor.load(Ordering::Acquire) == actor_id =>
+                {
+                    ctrl.owner_release()
+                }
+                _ => false,
+            };
+            if recycled {
+                if let Ok(desc) = pool.desc_by_index(i) {
+                    let _ = pool.free(&desc);
+                }
+            }
+        }
+    }
+    let mut st = shared.state.lock().unwrap();
+    if payload_segment_quiescent(&seg) {
+        return release_payload_segment_locked(&mut st, seg_id);
+    }
+    // Something still holds the object, so the segment lives on — but the one
+    // process that could ever have sent the install is gone, so hand the
+    // segment to the sweep rather than leave it staged forever. Whatever holds
+    // the chunk now (an installed manifest, another reader) governs from here,
+    // which is the rule the install would have set.
+    if let Some(entry) = st.payload_segments.get_mut(&seg_id) {
+        entry.staged = false;
+    }
+    false
 }
 
 /// Create a dedicated segment for one large payload and grant its fd.
@@ -859,40 +1106,40 @@ fn release_payload_segment(shared: &Arc<CoordShared>, seg_id: u32) -> bool {
 /// mapping. Contiguous by construction, and it cannot fragment the shared arena
 /// because it is never carved out of it.
 ///
-/// **Reclamation is explicit.** The segment is released by
-/// [`Request::ReleasePayloadSegment`] or when the coordinator shuts down. It is
-/// deliberately not tied to the requesting actor's lifetime — the object
-/// outlives the writer — which means an actor that dies without releasing leaks
-/// one segment until shutdown. That is bounded by
-/// [`MAX_PAYLOAD_SEGMENTS`](crate::config::MAX_PAYLOAD_SEGMENTS) and is the one
-/// gap in this path's crash story.
+/// **The segment is born staged.** Until the creator installs a version naming
+/// the object
+/// ([`InstallPayloadSegment`](crate::protocol::Request::InstallPayloadSegment)),
+/// the creator's journal entry is what reclaims it if the creator dies. After
+/// the install the object's chunk is what holds it, and only
+/// [`sweep_payload_segments`] unlinks it — never the creator's death, which
+/// would tear an installed version's data out from under its readers.
 fn grant_payload_segment(shared: &Arc<CoordShared>, bytes: u64, stream: &UnixStream) -> Result<()> {
     let (seg_id, fd, len) = {
         let mut st = shared.state.lock().unwrap();
-        let slot = match st.free_payload_slots.pop() {
-            Some(s) => s,
-            None => {
-                let s = st.next_payload_slot;
-                if s >= crate::config::MAX_PAYLOAD_SEGMENTS {
-                    let resp = Response::Error {
-                        message: format!(
-                            "payload segments exhausted ({} live)",
-                            crate::config::MAX_PAYLOAD_SEGMENTS
-                        ),
-                    };
-                    send_frame(stream, &resp.encode(), &[])?;
-                    return Ok(());
-                }
-                st.next_payload_slot = s + 1;
-                s
-            }
-        };
+        if st.payload_segments.len() >= crate::config::MAX_LIVE_PAYLOAD_SEGMENTS {
+            let resp = Response::Error {
+                message: format!(
+                    "too many live payload segments ({})",
+                    crate::config::MAX_LIVE_PAYLOAD_SEGMENTS
+                ),
+            };
+            send_frame(stream, &resp.encode(), &[])?;
+            return Ok(());
+        }
+        let slot = st.next_payload_slot;
+        if slot >= crate::config::MAX_PAYLOAD_SEGMENTS {
+            let resp = Response::Error {
+                message: "payload segment ids exhausted for this coordinator".to_string(),
+            };
+            send_frame(stream, &resp.encode(), &[])?;
+            return Ok(());
+        }
+        st.next_payload_slot = slot + 1;
         let seg_id = shared.config.payload_object_seg_id(slot);
         let want = shm_core::segment::HEADER_SIZE + bytes as usize;
         let seg = match create_segment(seg_id, want) {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                st.free_payload_slots.push(slot);
                 let resp = Response::Error {
                     message: format!("payload segment: {e}"),
                 };
@@ -902,7 +1149,13 @@ fn grant_payload_segment(shared: &Arc<CoordShared>, bytes: u64, stream: &UnixStr
         };
         let fd = seg.as_raw_fd();
         let len = seg.size() as u64;
-        st.payload_segments.insert(seg_id, seg);
+        st.payload_segments.insert(
+            seg_id,
+            PayloadSegmentEntry {
+                segment: seg,
+                staged: true,
+            },
+        );
         (seg_id, fd, len)
     };
     let resp = Response::PayloadSegmentGranted { seg_id, len };
@@ -1319,6 +1572,11 @@ fn lease_monitor(shared: Arc<CoordShared>) {
         // reader just declared dead above, which is why it runs after the
         // reclaim pass rather than before it.
         sweep_store_tombstones(&shared);
+
+        // Unlink installed dedicated segments whose object has gone quiescent.
+        // Runs after the reclaim pass for the same reason the store sweep does:
+        // the hold that just went away may be one a dead reader was holding.
+        sweep_payload_segments(&shared);
     }
 }
 
@@ -1333,11 +1591,17 @@ fn reap_task_bindings(shared: &Arc<CoordShared>, now_nanos: u64, grace_nanos: u6
         return 0;
     }
     let mut released = 0usize;
+    // A retained ref can name a version whose data lives in a dedicated
+    // segment, and releasing the last pin retires it — which frees that
+    // chunk. Without the map the release fails closed and the chunk stays
+    // published, so the coordinator answers from the segments it owns.
+    let segments = coordinator_segments(shared);
     for b in &won {
         if shm_store::release_task_binding(
             &shared.store_catalog_seg,
             &shared.store_head_seg,
             &shared.store_data_seg,
+            &segments,
             b.artifact_id,
             b.incarnation,
             b.version,
@@ -1361,9 +1625,47 @@ fn sweep_store_tombstones(shared: &Arc<CoordShared>) -> usize {
         &shared.store_catalog_seg,
         &shared.store_head_seg,
         &shared.store_data_seg,
+        &coordinator_segments(shared),
     )
     .unwrap_or(0)
 }
+
+/// A snapshot [`SegmentMap`] over every dedicated payload segment this
+/// coordinator owns.
+///
+/// The sweep re-runs an evicted entry's teardown, and that teardown must be
+/// able to *release* a chunk living in a dedicated segment — otherwise it fails
+/// closed, the entry never goes quiescent, and its catalog slot leaks. The
+/// coordinator holds every such segment already, so it is the one party that
+/// can always answer.
+///
+/// A snapshot rather than a live view of the table because the sweep runs
+/// outside the state lock and must not be able to take it re-entrantly. A
+/// segment unlinked between the snapshot and its use is harmless: the mapping
+/// stays valid (unlink removes the name, not the mapping) and the chunk in it
+/// is already `FREE`, so nothing is released twice.
+fn coordinator_segments(shared: &Arc<CoordShared>) -> Arc<dyn SegmentMap> {
+    let st = shared.state.lock().unwrap();
+    Arc::new(PayloadSegmentSnapshot(
+        st.payload_segments
+            .iter()
+            .map(|(id, e)| (*id, e.segment.clone()))
+            .collect(),
+    ))
+}
+
+/// The snapshot [`coordinator_segments`] hands out.
+struct PayloadSegmentSnapshot(HashMap<u32, Arc<Segment>>);
+
+impl SegmentMap for PayloadSegmentSnapshot {
+    fn segment(&self, segment_id: u32) -> Option<Arc<Segment>> {
+        self.0.get(&segment_id).cloned()
+    }
+}
+
+// `Segment` owns raw pointers into its mapping, so the auto-impl does not
+// apply; the snapshot is immutable and read only through atomics.
+impl std::panic::RefUnwindSafe for PayloadSegmentSnapshot {}
 
 /// Replay a dead actor's borrow journal and reclaim everything it held: every
 /// pinned **chunk** (across every pool the coordinator hosts), every leaked
@@ -1402,6 +1704,13 @@ fn reclaim_dead(
         // The keyed store's shared data pool can also hold a dead actor's
         // journaled chunks (ADR-0007 G3), so route by its segment id too.
         v.push(shared.store_data_seg.clone());
+        // A dedicated segment holding one large object carries its own
+        // one-class pool, so a chunk pinned there is journaled exactly like any
+        // other. Without these, `find` by segment id would miss it and the pin
+        // would be silently dropped instead of reclaimed.
+        for e in st.payload_segments.values() {
+            v.push(e.segment.clone());
+        }
         v
     };
     let pools: Vec<(u32, Pool)> = segs
@@ -1445,12 +1754,12 @@ fn reclaim_dead(
                 }
             }
             JournalRecord::PayloadSegment { segment_id } => {
-                // The owner died holding a dedicated segment. Nothing in the
-                // pool describes it, so `reclaim_one` would never see it; this
-                // is the only thing that frees it.
-                if release_payload_segment(shared, segment_id) {
-                    artifact_pins += 1;
-                }
+                // The creator died inside the segment's staging window. Release
+                // the exclusive hold it may still have on the object's chunk
+                // and unlink only if that leaves the segment quiescent — an
+                // installed version's manifest still holding the chunk keeps
+                // the object alive, and the sweep unlinks it later.
+                reclaim_payload_segment(shared, segment_id, actor_id);
             }
             JournalRecord::StagedManifest {
                 artifact_id,
