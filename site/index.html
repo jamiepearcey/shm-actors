@@ -17,6 +17,7 @@
   <nav>
     <a href="./" class="on">Overview</a>
     <a href="guide.html">Guide</a>
+    <a href="actors.html">Actors</a>
     <a href="benchmarks.html">Benchmarks</a>
     <a href="adrs.html">ADRs</a>
     <a href="api/holon_actor/index.html">API</a>
@@ -91,7 +92,7 @@
   pool that covers for each other.</p>
 
   <pre><code><span class="c">// host side: any number of actors, one mailbox, routed by `to`</span>
-<span class="k">let</span> <span class="k">mut</span> sys = ActorSystem::<span class="a">attach</span>(&node)?;
+<span class="k">let</span> <span class="k">mut</span> sys = ActorSystem::<span class="a">connect</span>(&amp;uds, <span class="g">"pricer"</span>)?;
 sys.<span class="a">spawn</span>(<span class="g">"pricer"</span>, Pricer::<span class="a">new</span>(curve_ref))?;
 sys.<span class="a">spawn</span>(<span class="g">"risk"</span>,   Risk::<span class="a">new</span>(curve_ref))?;
 sys.<span class="a">run</span>()?;
@@ -105,8 +106,8 @@ sys.<span class="a">run</span>()?;
 }
 
 <span class="c">// client side</span>
-<span class="k">let</span> pricer = client.<span class="a">actor_ref</span>::&lt;PriceRequest&gt;(<span class="g">"pricer"</span>)?;
-<span class="k">let</span> reply  = pricer.<span class="a">ask</span>(&req, timeout)?;        <span class="c">// or .tell(&evt)</span></code></pre>
+<span class="k">let</span> pricer = ActorRef::<span class="a">new</span>(&amp;<span class="k">mut</span> node, ActorId::<span class="a">named</span>(<span class="g">"pricer"</span>))?;
+<span class="k">let</span> reply  = pricer.<span class="a">ask</span>::&lt;PriceRequest, PriceReply&gt;(&amp;req)?;   <span class="c">// or .tell(&amp;evt)</span></code></pre>
 
   <ul>
     <li><strong>State lives in shared tables, not inside workers.</strong> A price curve, an order book, a stream of ticks — each is a versioned table (stored in <a href="https://arrow.apache.org/">Apache Arrow</a> format, so analytics tools read it natively). Any worker can read any version, at full speed, without a copy.</li>
@@ -141,7 +142,7 @@ sys.<span class="a">run</span>()?;
   <ul>
     <li><strong>1 restart, 1 redelivery, 0 lost, 0 errors</strong> — clients see replies from both incarnations.</li>
     <li>The dead process's journaled pin and staged chunks are <strong>replayed</strong>, its lease fenced — a zombie waking later can never write into freed memory.</li>
-    <li>The recovery constant is the <strong>lease, not luck</strong>: 500 ms lease → 522–543 ms to first successor reply, run after run.</li>
+    <li>The recovery constant is the <strong>lease, not luck</strong>: 500 ms lease → 508–542 ms to first successor reply across eight runs.</li>
   </ul>
 </section>
 

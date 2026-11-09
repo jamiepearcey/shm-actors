@@ -17,6 +17,7 @@
   <nav>
     <a href="./">Overview</a>
     <a href="guide.html" class="on">Guide</a>
+    <a href="actors.html">Actors</a>
     <a href="benchmarks.html">Benchmarks</a>
     <a href="adrs.html">ADRs</a>
     <a href="api/holon_actor/index.html">API</a>
@@ -30,6 +31,7 @@
   <div class="g">Documentation</div>
   <a class="pg" href="./">Overview</a>
   <a class="pg here" href="guide.html">Guide</a>
+  <a class="pg" href="actors.html">Actor model</a>
   <a class="pg" href="benchmarks.html">Benchmarks</a>
   <a class="pg" href="adrs.html">Decision record</a>
   <a class="pg" href="api/holon_actor/index.html">API reference</a>
@@ -197,7 +199,7 @@ tx.<span class="a">commit</span>()?;            <span class="c">// one CAS: read
   another control-plane call on the hot path. The lease monitor watches actor liveness: on death it
   fences the actor's write leases and replays its journal. Doorbells are the platform seam —
   one-byte UDS writes on the POSIX baseline, futex/eventfd on Linux — chosen because the
-  <em>substrate</em> costs 83.5 ns while a parked wake costs ~4.4 µs: the wake, not the memory
+  <em>substrate</em> costs 83.5 ns while a parked wake costs 8.4–8.7 µs: the wake, not the memory
   model, is the budget.</p>
 </section>
 
@@ -208,23 +210,26 @@ tx.<span class="a">commit</span>()?;            <span class="c">// one CAS: read
   envelopes ride the task queue, payloads live in versioned cells, and the handler pins the exact
   cell version its message named. Dispatch is a sorted table of function pointers — no
   <code>dyn</code>, no allocation on the message path.</p>
-  <pre><code><span class="k">let</span> <span class="k">mut</span> sys = ActorSystem::<span class="a">attach</span>(&node)?;
-sys.<span class="a">spawn</span>(<span class="g">"pricer"</span>, Pricer::<span class="a">new</span>(curve_ref))?;   <span class="c">// any number of actors,</span>
-sys.<span class="a">spawn</span>(<span class="g">"risk"</span>,   Risk::<span class="a">new</span>(curve_ref))?;     <span class="c">// one mailbox, routed by `to`</span>
+  <pre><code><span class="k">let</span> <span class="k">mut</span> sys = ActorSystem::<span class="a">connect</span>(&amp;uds, PRICER_NAME)?;
+sys.<span class="a">spawn</span>(PRICER_NAME, Pricer::<span class="a">new</span>(..))?;   <span class="c">// any number of actors,</span>
+sys.<span class="a">spawn</span>(RISK_NAME,   Risk::<span class="a">new</span>())?;     <span class="c">// one mailbox, routed by `to`</span>
 sys.<span class="a">run</span>()?;
 
 <span class="c">// client side</span>
-<span class="k">let</span> pricer = client.<span class="a">actor_ref</span>::&lt;PriceRequest&gt;(<span class="g">"pricer"</span>)?;
-<span class="k">let</span> reply  = pricer.<span class="a">ask</span>(&req, timeout)?;        <span class="c">// or .tell(&evt)</span></code></pre>
+<span class="k">let</span> <span class="k">mut</span> pricer = ActorRef::<span class="a">new</span>(&amp;<span class="k">mut</span> node, ActorId::<span class="a">named</span>(PRICER_NAME))?;
+<span class="k">let</span> reply = pricer.<span class="a">ask</span>::&lt;PriceRequest, PriceReply&gt;(&amp;req)?;   <span class="c">// or .tell(&amp;evt)</span></code></pre>
   <ul>
     <li><strong>One 64-byte envelope</strong> — one cache line, frozen ABI — is both the mailbox slot and, by design, the future TCP frame header. Small bodies ride inline; anything else is a packed reference into the shared pool.</li>
     <li><strong>The asker allocates the reply chunk</strong> and names it in the request. This came out of the demo, not the whiteboard: the task slot's result word is reused by the free-list before the asker can poll it under concurrency, so the reply must live in memory the asker owns. Handlers time-fence their reply write at half the lease, so a lease-lapsed zombie never writes into freed memory.</li>
     <li><strong>N processes of the same name form a pool</strong>; redelivery + incarnation-tagged replies make failover observable to the client that cares and invisible to the one that doesn't.</li>
   </ul>
-  <p>Measured: ask round trip 9.5 µs p50 parked / 1.2 µs spinning; 168–186 K asks/s at 4 clients ×
-  4 pricers; the envelope layer itself accounts for ~2 µs parked, ~0.7 µs spinning — the rest is
-  the doorbell. Crash-to-successor is the lease plus one tick: 522–543 ms at a 500 ms lease, with
-  one redelivery, zero losses and an exact pool census after.</p>
+  <p>Measured over eight runs: ask round trip 9.0–10.0 µs p50 parked / 1.2–1.4 µs spinning;
+  120–174 K asks/s at 4 clients × 4 pricers (134–220 K at 4 × 1 — four pricers do not beat one
+  here, the parked wake is the bottleneck); the envelope layer itself accounts for 1.3–2.6 µs
+  parked, 0.6–1.0 µs spinning — the rest is the doorbell. Crash-to-successor is the lease plus one
+  tick: 508–542 ms at a 500 ms lease, with one redelivery, zero losses and an exact pool census
+  after.</p>
+  <p><a href="actors.html">The actor model, in full →</a> — payload rules, the <code>Actor</code> trait, the client API, chunk ownership and the failure model.</p>
 </section>
 
 <section id="platform">
@@ -239,7 +244,7 @@ sys.<span class="a">run</span>()?;
 
 <nav class="pgnav" aria-label="Pagination">
   <a href="./"><span class="lab">← Previous</span><span class="ttl" style="display:block">Overview</span></a>
-  <a class="next" href="benchmarks.html"><span class="lab">Next →</span><span class="ttl" style="display:block">Benchmarks</span></a>
+  <a class="next" href="actors.html"><span class="lab">Next →</span><span class="ttl" style="display:block">Actor model</span></a>
 </nav>
 </main>
 <aside class="otp" aria-label="On this page">

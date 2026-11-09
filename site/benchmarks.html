@@ -17,6 +17,7 @@
   <nav>
     <a href="./">Overview</a>
     <a href="guide.html">Guide</a>
+    <a href="actors.html">Actors</a>
     <a href="benchmarks.html" class="on">Benchmarks</a>
     <a href="adrs.html">ADRs</a>
     <a href="api/holon_actor/index.html">API</a>
@@ -30,6 +31,7 @@
   <div class="g">Documentation</div>
   <a class="pg" href="./">Overview</a>
   <a class="pg" href="guide.html">Guide</a>
+  <a class="pg" href="actors.html">Actor model</a>
   <a class="pg here" href="benchmarks.html">Benchmarks</a>
   <a class="pg" href="adrs.html">Decision record</a>
   <a class="pg" href="api/holon_actor/index.html">API reference</a>
@@ -37,6 +39,7 @@
   <a href="#method">Method &amp; wording</a>
   <a href="#flat">The flat set</a>
   <a href="#wake">Wake costs</a>
+  <a href="#spin">Spin vs park</a>
   <a href="#stream">Windowed streams</a>
   <a href="#crash">Crash &amp; census</a>
   <a href="#repro">Reproduce</a>
@@ -47,7 +50,7 @@
   <h1>Benchmarks</h1>
   <p class="sub">Reproduce everything with <code>cargo run -p shm-bench --release -- all</code> —
   the suite prints its own hardware profile first. Numbers below: Apple M4 Max (14 cores), macOS,
-  release builds, ≥ 2 runs per session.</p>
+  release builds. Substrate rows: 2 full suite runs. Actor rows: 8 runs of <code>holon-demo bench</code> (n = 100 000 asks each).</p>
 </div>
 
 <section id="method" class="first" style="padding-top:28px">
@@ -70,11 +73,11 @@
     <tr><th>operation</th><th class="n">p50</th><th>flat across</th></tr>
     <tr><td>version pin + drop</td><td class="n">≤ 1 tick</td><td>1 → 10 000 committed versions</td></tr>
     <tr><td>task claim</td><td class="n">≤ 1 tick</td><td>capacity 256 → 65 536</td></tr>
-    <tr><td><code>as_arrow</code> zero-copy reconstruct</td><td class="n">208–250 ns</td><td>1 000 → 1 000 000 rows</td></tr>
-    <tr><td><code>read_batch</code> view build</td><td class="n">459–541 ns</td><td>1 000 → 1 000 000 rows</td></tr>
+    <tr><td><code>as_arrow</code> zero-copy reconstruct</td><td class="n">292–333 ns</td><td>1 000 → 1 000 000 rows</td></tr>
+    <tr><td><code>read_batch</code> view build</td><td class="n">541–584 ns</td><td>1 000 → 1 000 000 rows</td></tr>
     <tr><td>ring hop, one way, cross-process</td><td class="n">83.5 ns</td><td>same as cross-core</td></tr>
-    <tr><td>append commit (chained manifests)</td><td class="n">1.4–1.6 µs</td><td>version 0 → 100 000</td></tr>
-    <tr><td>delta read, one version behind</td><td class="n">~290 ns</td><td>any history, any window size</td></tr>
+    <tr><td>append commit (chained manifests)</td><td class="n">1.33–1.42 µs</td><td>version 0 → 100 000</td></tr>
+    <tr><td>delta read, one version behind</td><td class="n">250–292 ns</td><td>any history, any window size</td></tr>
   </table></div>
 </section>
 
@@ -84,19 +87,61 @@
   <div class="tblwrap"><table>
     <tr><th>path</th><th class="n">p50</th><th>note</th></tr>
     <tr><td>busy-poll ring hop</td><td class="n">83.5 ns</td><td>the substrate's floor</td></tr>
-    <tr><td>parked <code>poll(2)</code> wake</td><td class="n">~4.4 µs</td><td>53× the hop — the whole case for the futex ADR</td></tr>
-    <tr><td>bare task round trip, parked</td><td class="n">7.5 µs</td><td>submit → claim → complete, matched wake</td></tr>
-    <tr><td>full actor ask, parked</td><td class="n">9.5 µs</td><td>envelope + pool + catalog + journaled pin + Arrow adds ~2 µs</td></tr>
-    <tr><td>full actor ask, spinning</td><td class="n">1.2 µs</td><td>envelope layer's share: ~0.7 µs</td></tr>
+    <tr><td>parked <code>poll(2)</code> wake</td><td class="n">8.4–8.7 µs</td><td>one way, publish → wake. ~100× the hop — the whole case for the futex ADR</td></tr>
+    <tr><td>bare task round trip, parked</td><td class="n">7.3–7.8 µs</td><td>submit → claim → complete, matched wake</td></tr>
+    <tr><td>full actor ask, parked</td><td class="n">9.0–10.0 µs</td><td>p99 19.7–25.8 µs. Envelope + pool + catalog + journaled pin + Arrow adds 1.3–2.6 µs</td></tr>
+    <tr><td>full actor ask, spinning</td><td class="n">1.2–1.4 µs</td><td>p99 2.3–2.5 µs. Envelope layer's share: 0.6–1.0 µs over a 0.4–0.6 µs bare round trip</td></tr>
     <tr><td>in-process task round trip</td><td class="n">≤ 1 tick</td><td>the 7 : 1 parked ratio is wake cost, not envelope cost</td></tr>
   </table></div>
   <div class="tblwrap"><table>
     <tr><th>actor throughput (parked)</th><th class="n">asks/s</th></tr>
-    <tr><td>1 client / 1 pricer</td><td class="n">99–105 K</td></tr>
-    <tr><td>4 clients / 1 pricer</td><td class="n">147–160 K</td></tr>
-    <tr><td>4 clients / 4 pricers</td><td class="n">168–186 K</td></tr>
-    <tr><td>task queue, N-pair drain (post ADR-0012)</td><td class="n">5–9 M/s flat</td></tr>
+    <tr><td>1 client / 1 pricer</td><td class="n">90–103 K</td></tr>
+    <tr><td>4 clients / 1 pricer</td><td class="n">134–220 K</td></tr>
+    <tr><td>4 clients / 4 pricers</td><td class="n">120–174 K</td></tr>
+    <tr><td>4 clients / 2 actors in <em>one</em> process (routed by <code>to</code>)</td><td class="n">133–148 K</td></tr>
+    <tr><td>task queue, N-pair drain (post ADR-0012)</td><td class="n">5.6–11.3 M/s flat</td></tr>
   </table></div>
+  <p>Read those spreads before reading the midpoints. Actor throughput is the noisiest thing this
+  suite measures — the 4/1 column moved 134 K → 220 K across eight runs of the same binary — and on
+  this 14-core box <strong>four pricers do not beat one</strong>: the parked wake, not the handler,
+  is the bottleneck, so adding pricers mostly adds doorbell traffic. Treat these as an order of
+  magnitude, not a ranking, and re-run before believing any change to them.</p>
+</section>
+
+<section id="spin">
+  <div class="eyebrow">The operating curve</div>
+  <h2>Spin and park are one axis, not two modes</h2>
+  <p>The mailbox had two settings: park on the first miss, or never park. Both are endpoints.
+  <code>SpinBudget</code> walks the axis between them — busy-poll for <em>n</em> nanoseconds, then
+  give the core back. One 1-client / 1-pricer run per budget, the same budget on both halves of the
+  round trip, 50 000 asks per point, three runs. Ranges are across runs.</p>
+  <div class="tblwrap"><table>
+    <tr><th>budget</th><th class="n">ask p50</th><th class="n">p95</th><th class="n">p99</th><th class="n">p99.9</th><th class="n">asks/s</th><th class="n">cores</th></tr>
+    <tr><td>park on first miss</td><td class="n">9.2–9.8 µs</td><td class="n">11.7–18.5 µs</td><td class="n">18.6–27.2 µs</td><td class="n">36.9–69.9 µs</td><td class="n">92–110 K</td><td class="n">1.0</td></tr>
+    <tr><td>0.25 µs</td><td class="n">7.2–11.3 µs</td><td class="n">13.6–18.0 µs</td><td class="n">17.5–23.2 µs</td><td class="n">23.2–38.1 µs</td><td class="n">88–140 K</td><td class="n">1.1–1.3</td></tr>
+    <tr><td>0.5 µs</td><td class="n">9.4–11.1 µs</td><td class="n">15.3–17.4 µs</td><td class="n">21.2–22.8 µs</td><td class="n">35.3–36.4 µs</td><td class="n">86–111 K</td><td class="n">1.1</td></tr>
+    <tr><td>1 µs</td><td class="n">1.2–1.3 µs</td><td class="n">2.0–14.9 µs</td><td class="n">9.0–19.7 µs</td><td class="n">18.6–27.2 µs</td><td class="n">229–659 K</td><td class="n">1.8–2.0</td></tr>
+    <tr><td>1.25–1.75 µs</td><td class="n">1.2–1.4 µs</td><td class="n">2.1–13.6 µs</td><td class="n">9.6–18.8 µs</td><td class="n">17.8–25.3 µs</td><td class="n">354–680 K</td><td class="n">1.5–2.0</td></tr>
+    <tr><td>2 µs</td><td class="n">1.2 µs</td><td class="n">2.1–2.2 µs</td><td class="n">2.8–12.5 µs</td><td class="n">20.0–24.5 µs</td><td class="n">623–652 K</td><td class="n">2.0</td></tr>
+    <tr><td><strong>3 µs</strong> — the default</td><td class="n">1.2 µs</td><td class="n">2.1–2.2 µs</td><td class="n">2.3–2.5 µs</td><td class="n">17.5–18.9 µs</td><td class="n">662–688 K</td><td class="n">2.06</td></tr>
+    <tr><td>10–50 µs</td><td class="n">1.2–1.9 µs</td><td class="n">2.0–2.3 µs</td><td class="n">2.2–3.3 µs</td><td class="n">4.5–70.2 µs</td><td class="n">574–720 K</td><td class="n">1.8–2.1</td></tr>
+    <tr><td>never park</td><td class="n">1.2–1.3 µs</td><td class="n">2.1–2.2 µs</td><td class="n">2.2–2.5 µs</td><td class="n">3.6–8.2 µs</td><td class="n">634–690 K</td><td class="n">2.6–2.7</td></tr>
+  </table></div>
+  <p><strong>The cliff is one round trip wide.</strong> A spinning ask completes in 1.2 µs, so a
+  budget under that cannot cover one and buys nothing — the 0.25 and 0.5 µs rows are strictly worse
+  than parking, burning cycles for latency they never catch. Cross 1 µs and p50 falls
+  <strong>8×</strong> and throughput rises <strong>6×</strong>, because the waiter now sees its own
+  answer instead of paying a scheduler round trip for it. Between 1 and 2 µs the budget straddles
+  the round trip and jitter flips individual asks into a park, which is why that band's p95 swings
+  from 2.0 to 14.9 µs across runs — don't tune to the edge.</p>
+  <p><strong>Spinning costs less total CPU, not more.</strong> The same 50 000 asks take 0.47–0.63
+  core-seconds parked and 0.15–0.20 spinning: two hot cores for a fifth of the time beat one core
+  waiting on the scheduler. The <em>cores</em> column is the saturated worst case — an idle actor
+  spins its budget once, parks, and costs nothing until the doorbell rings.</p>
+  <p>Past 3 µs only p99.9 keeps improving, and never-park buys the best tail of all (3.6–8.2 µs) for
+  another 0.6 of a core. That is the real trade, and it is a per-actor choice: a hot pricing actor
+  wants the core, a background reconciliation actor does not.</p>
+  <pre><code>cargo run -p holon-demo --release -- spin-sweep --n 50000 --runs 3</code></pre>
 </section>
 
 <section id="stream">
@@ -107,19 +152,20 @@
   reads stay bounded.</p>
   <div class="tblwrap"><table>
     <tr><th>keep</th><th class="n">append p50 / p99</th><th class="n">window p50 (n)</th><th class="n">delta read</th><th class="n">full read</th><th class="n">live chunks max (bound)</th></tr>
-    <tr><td class="n">16</td><td class="n">1.4 / 2–3.7 µs</td><td class="n">3.6–4.2 µs (6 250)</td><td class="n">0.29 µs</td><td class="n">7–8 µs · 32 batches</td><td class="n">48 (66)</td></tr>
-    <tr><td class="n">256</td><td class="n">1.4 / 1.8–3.3 µs</td><td class="n">31–36 µs (391)</td><td class="n">0.29 µs</td><td class="n">90–99 µs · 416 batches</td><td class="n">576 (1 026)</td></tr>
-    <tr><td class="n">4 096</td><td class="n">1.5 / 2.3–3.8 µs</td><td class="n">0.74–1.0 ms (25)</td><td class="n">0.29 µs</td><td class="n">1.3–1.7 ms · 5 792 batches</td><td class="n">7 488 (16 386)</td></tr>
+    <tr><td class="n">16</td><td class="n">1.33–1.42 / 1.75–1.96 µs</td><td class="n">3.5–3.7 µs (6 250)</td><td class="n">0.29 µs</td><td class="n">7.2–7.8 µs · 32 batches</td><td class="n">48 (66)</td></tr>
+    <tr><td class="n">256</td><td class="n">1.375 / 1.79–1.83 µs</td><td class="n">30.6–31.0 µs (391)</td><td class="n">0.29 µs</td><td class="n">88.8–91.2 µs · 416 batches</td><td class="n">576 (1 026)</td></tr>
+    <tr><td class="n">4 096</td><td class="n">1.50 / 2.00 µs</td><td class="n">0.67–0.69 ms (25)</td><td class="n">0.29 µs</td><td class="n">1.27–1.37 ms · 5 792 batches</td><td class="n">7 488 (16 386)</td></tr>
   </table></div>
-  <p>A Window costs ~120–180 ns per kept chunk (member parse + two generation validations + one CAS
-  + a 24 B descriptor write). Amortised over the policy that is 0.1–0.2 µs per commit — a seventh
-  of an append — but the per-window tail is real and reported, not hidden in an average.</p>
+  <p>A Window costs ~120–225 ns per kept chunk (member parse + two generation validations + one CAS
+  + a 24 B descriptor write) — 225 ns at <code>keep</code> = 16, ~120 ns at 256, ~165 ns at 4 096.
+  Amortised over the policy that is 0.12–0.23 µs per commit — a sixth of an append — but the
+  per-window tail is real and reported, not hidden in an average.</p>
 
   <h3>The losing shapes</h3>
   <div class="tblwrap"><table>
     <tr><th>shape</th><th>result</th><th>reading</th></tr>
-    <tr><td>Window on <em>every</em> commit (max_depth = 1, keep = 256)</td><td class="n">6.4–6.8 µs/commit · delta read 0.7 µs</td><td>4.5× an append and the member table is summed per read — the policy <em>is</em> the amortisation; don't set max_depth below keep.</td></tr>
-    <tr><td>Unbounded append, N = 20 000</td><td class="n">commit 1.4 µs · read 8.5 ms · 40 000 chunks live</td><td>Commit stays flat — memory and read cost are what the window exists to bound.</td></tr>
+    <tr><td>Window on <em>every</em> commit (max_depth = 1, keep = 256)</td><td class="n">6.1–6.5 µs/commit · delta read 0.67 µs</td><td>4.5× an append and the member table is summed per read — the policy <em>is</em> the amortisation; don't set max_depth below keep.</td></tr>
+    <tr><td>Unbounded append, N = 20 000</td><td class="n">commit 1.42–1.46 µs · read 7.5–8.1 ms · 40 000 chunks live</td><td>Commit stays flat — memory and read cost are what the window exists to bound.</td></tr>
     <tr><td>Reader pinned across 4 096 commits (keep = 256)</td><td class="n">768 → 1 536 → 768 chunks</td><td>A stale pin holds exactly the one window it pinned — 2× the policy bound, never the history.</td></tr>
   </table></div>
 </section>
@@ -128,11 +174,11 @@
   <div class="eyebrow">ADR-0015</div>
   <h2>Crash &amp; census</h2>
   <div class="tblwrap"><table>
-    <tr><th>measurement</th><th class="n">run 1</th><th class="n">run 2</th></tr>
-    <tr><td>kill −9 → successor's first reply (500 ms lease)</td><td class="n">521.9 ms</td><td class="n">542.6 ms</td></tr>
-    <tr><td>restarts / redelivered / lost / errors</td><td class="n">1 / 1 / 0 / 0</td><td class="n">1 / 1 / 0 / 0</td></tr>
-    <tr><td>pool census after crash</td><td class="n">= baseline</td><td class="n">= baseline</td></tr>
-    <tr><td>census after evicting the cell</td><td class="n">= empty baseline</td><td class="n">= empty baseline</td></tr>
+    <tr><th>measurement</th><th class="n">8 runs</th></tr>
+    <tr><td>kill −9 → successor's first reply (500 ms lease)</td><td class="n">508.0 – 542.1 ms</td></tr>
+    <tr><td>restarts / redelivered / lost / errors</td><td class="n">1 / 1 / 0 / 0, every run</td></tr>
+    <tr><td>pool census after crash</td><td class="n">= baseline, every run</td></tr>
+    <tr><td>census after evicting the cell</td><td class="n">= empty baseline, every run</td></tr>
   </table></div>
   <p>The census is the invariant that makes every other number trustworthy: after any hostile
   scenario — commit races, leaked-pin replay, <code>kill -9</code> churn loops — free chunks minus
@@ -145,13 +191,14 @@
   <pre><code>cargo run -p shm-bench --release -- all        <span class="c"># full suite + hardware profile</span>
 cargo run -p shm-bench --release -- artifact   <span class="c"># pins, commits, windowed streams</span>
 cargo run -p shm-bench --release -- task       <span class="c"># claim scaling, drain shapes</span>
-cargo run -p holon-demo --release -- bench     <span class="c"># actor asks, throughput, crash row</span></code></pre>
+cargo run -p holon-demo --release -- bench     <span class="c"># actor asks, throughput, crash row</span>
+cargo run -p holon-demo --release -- spin-sweep <span class="c"># the spin/park operating curve</span></code></pre>
   <p class="kbd-note">Run everything twice. If your first run disagrees with your second by 30 %,
   that's the machine, not the code — it's why the method section exists.</p>
 </section>
 
 <nav class="pgnav" aria-label="Pagination">
-  <a href="guide.html"><span class="lab">← Previous</span><span class="ttl" style="display:block">Guide</span></a>
+  <a href="actors.html"><span class="lab">← Previous</span><span class="ttl" style="display:block">Actor model</span></a>
   <a class="next" href="adrs.html"><span class="lab">Next →</span><span class="ttl" style="display:block">Decision record</span></a>
 </nav>
 </main>
@@ -160,6 +207,7 @@ cargo run -p holon-demo --release -- bench     <span class="c"># actor asks, thr
   <a href="#method">Method</a>
   <a href="#flat">The flat set</a>
   <a href="#wake">Wake costs</a>
+  <a href="#spin">Spin vs park</a>
   <a href="#stream">Windowed streams</a>
   <a href="#crash">Crash &amp; census</a>
   <a href="#repro">Reproduce</a>

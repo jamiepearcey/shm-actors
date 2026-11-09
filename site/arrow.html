@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Arrow in shared memory — Holon / shm-actors</title>
+<meta name="description" content="shm-arrow and ArrowRef: how an Apache Arrow RecordBatch is written once into shared-memory chunks, moved as a 24-byte descriptor, and read back zero-copy. On-chunk ABI, schema interning, error model, and the ArrowRef task-fabric mapping.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏹</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=Archivo:wght@400;500;600&family=Spline+Sans+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="topbar"><div class="in">
+  <a class="brand" href="./" style="text-decoration:none">holon<em>//</em>shm-actors</a>
+  <nav>
+    <a href="./">Overview</a>
+    <a href="guide.html">Guide</a>
+    <a href="arrow.html" class="on">Arrow</a>
+    <a href="actors.html">Actors</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="adrs.html">ADRs</a>
+    <a href="api/holon_actor/index.html">API</a>
+    <a class="gh" href="https://github.com/jamiepearcey/shm-actors">GitHub</a>
+    <button id="themeToggle" aria-label="Toggle theme">◒</button>
+  </nav>
+</div></div>
+
+<div class="docshell">
+<nav class="sidenav" aria-label="Documentation">
+  <div class="g">Documentation</div>
+  <a class="pg" href="./">Overview</a>
+  <a class="pg" href="guide.html">Guide</a>
+  <a class="pg here" href="arrow.html">Arrow &amp; ArrowRef</a>
+  <a class="pg" href="actors.html">Actor model</a>
+  <a class="pg" href="benchmarks.html">Benchmarks</a>
+  <a class="pg" href="adrs.html">Decision record</a>
+  <a class="pg" href="api/holon_actor/index.html">API reference</a>
+  <div class="g">shm-arrow</div>
+  <a href="#invariant">The invariant</a>
+  <a href="#pieces">Pieces</a>
+  <a href="#layout">On-chunk layout</a>
+  <a href="#write">Write path</a>
+  <a href="#read">Read path</a>
+  <a href="#schemas">Schema interning</a>
+  <a href="#types">Supported types</a>
+  <a href="#errors">Errors</a>
+  <div class="g">ArrowRef</div>
+  <a href="#arrowref">What ArrowRef is</a>
+  <a href="#mapping">Mapping onto shm</a>
+  <a href="#spike">The task-fabric spike</a>
+  <a href="#refront">Re-front plan</a>
+  <a href="#rules">Rules of thumb</a>
+</nav>
+<main>
+<div class="dochead">
+  <div class="crumb"><a href="./">docs</a> / <b>arrow &amp; arrowref</b></div>
+  <h1>Arrow in shared memory</h1>
+  <p class="sub">How a columnar table becomes a 24-byte descriptor: <code>shm-arrow</code> writes an
+  Arrow <code>RecordBatch</code> once into shared-memory chunks and rebuilds it zero-copy on the
+  other side. ArrowRef is the product that wants exactly this contract — descriptors on the wire,
+  payload on the data plane.</p>
+</div>
+
+<section id="invariant" class="first" style="padding-top:28px">
+  <div class="eyebrow">the one idea</div>
+  <h2>Write once, move a descriptor</h2>
+  <p>Everything in the substrate follows one rule: <strong>payloads are written once; everything
+  downstream moves the 24-byte <code>ChunkDesc</code></strong>. <code>shm-arrow</code> is that rule
+  applied to Apache Arrow.</p>
+  <div class="flow" aria-label="Arrow round trip">
+    <div class="fnode">RecordBatch<small>writer process</small></div>
+    <div class="farr">write_batch ▶<small>one copy in</small></div>
+    <div class="fnode hot">chunk(s) in shm<small>immutable once published</small></div>
+    <div class="farr">24 B ChunkDesc ▶<small>ring / task / cell</small></div>
+    <div class="fnode">RecordBatch<small>reader process, zero copy</small></div>
+  </div>
+  <ul>
+    <li><strong>One copy in, zero after.</strong> The writer serializes buffers into a loaned chunk. The reader builds Arrow buffers whose pointers land <em>inside the mapped segment</em>.</li>
+    <li><strong>Reconstruct cost is flat in row count.</strong> 208–250 ns whether the table holds 1 000 or 1 000 000 rows (<a href="benchmarks.html">benchmarks</a>).</li>
+    <li><strong>The write is memcpy-bound.</strong> ~80 GB/s on the dev machine is memory bandwidth, and the docs do not call it “ingestion”.</li>
+  </ul>
+</section>
+
+<section id="pieces">
+  <div class="eyebrow">crates/shm-arrow</div>
+  <h2>Pieces</h2>
+  <div class="tblwrap"><table>
+    <tr><th>item</th><th>role</th></tr>
+    <tr><td><code>SchemaRegistry</code></td><td>Interns <code>SchemaRef</code> ⇄ <code>schema_id: u32</code>. Id <code>0</code> (<code>RAW_SCHEMA_ID</code>) is reserved for untyped bytes.</td></tr>
+    <tr><td><code>ChunkAllocator</code> / <code>PoolAllocator</code></td><td>The allocation seam. <code>PoolAllocator</code> implements it over a <code>shm_core::Pool</code> + <code>Segment</code>; tests and future arenas can supply their own.</td></tr>
+    <tr><td><code>write_batch</code> / <code>write_batch_chunks</code></td><td>Serialize a batch into one chunk, or into as many as it needs.</td></tr>
+    <tr><td><code>read_batch</code> / <code>read_batch_chunks</code></td><td>Validate, then rebuild a <code>RecordBatch</code> over the mapping.</td></tr>
+    <tr><td><code>PinGuard</code> / <code>SegmentBase</code></td><td>The keep-alive owner moved into every reconstructed buffer; also resolves the segment base.</td></tr>
+    <tr><td><code>serialized_len</code></td><td>Exact byte size a batch will occupy, without a dry-run write. <code>None</code> for unsupported types.</td></tr>
+    <tr><td><code>reserve_batch_like</code></td><td>Reserve chunks laid out like a template batch (with per-buffer length overrides) so a producer can fill buffers in place. Readers cannot tell it from a copying write.</td></tr>
+    <tr><td><code>BatchHeader</code>, <code>NodeEntry</code>, <code>BufferEntry</code></td><td>The versioned on-chunk ABI, below.</td></tr>
+  </table></div>
+</section>
+
+<section id="layout">
+  <div class="eyebrow">ABI · SHMARBT2 · format 2</div>
+  <h2>On-chunk layout</h2>
+  <p>A written batch occupies <strong>one or more</strong> loaned chunks. The first (primary) chunk
+  starts with a header and two flat tables; payload buffers follow, each 64-byte aligned (Arrow's
+  required alignment).</p>
+<pre><code><span class="c">primary chunk (chunk_index 0)</span>
+┌──────────────────────────────────────────────────────────────┐
+│ BatchHeader                   32 B at offset 0               │
+│ NodeEntry   × node_count      24 B each                      │
+│ BufferEntry × buffer_count    12 B each                      │
+│ &lt;pad to 64&gt;                                                  │
+│ buffer bytes   (64-byte aligned, packed until chunk fills)   │
+└──────────────────────────────────────────────────────────────┘
+<span class="c">continuation chunks (chunk_index 1..)</span>
+┌──────────────────────────────────────────────────────────────┐
+│ buffer bytes   (64-byte aligned from chunk offset 0)         │
+└──────────────────────────────────────────────────────────────┘</code></pre>
+
+  <h3>BatchHeader — 32 bytes</h3>
+  <div class="tblwrap"><table>
+    <tr><th>field</th><th>type</th><th>meaning</th></tr>
+    <tr><td><code>magic</code></td><td>u64</td><td><code>b"SHMARBT2"</code> little-endian. A v0.2 <code>SHMARBT1</code> chunk is rejected here.</td></tr>
+    <tr><td><code>format</code></td><td>u32</td><td>Layout version, currently <code>2</code>.</td></tr>
+    <tr><td><code>schema_id</code></td><td>u32</td><td>Interned schema id; mirrors <code>ChunkDesc.schema_id</code>.</td></tr>
+    <tr><td><code>row_count</code></td><td>u32</td><td>Rows in the batch.</td></tr>
+    <tr><td><code>node_count</code></td><td>u32</td><td>Length of the flattened pre-order node table.</td></tr>
+    <tr><td><code>buffer_count</code></td><td>u32</td><td>Length of the flattened buffer table.</td></tr>
+    <tr><td><code>chunk_count</code></td><td>u32</td><td>Chunks the batch spans (≥ 1).</td></tr>
+  </table></div>
+
+  <h3>NodeEntry — 24 bytes</h3>
+  <p>One per node in a <strong>pre-order</strong> depth-first walk of each column's
+  <code>ArrayData</code> tree. The <code>DataType</code> is <em>not</em> stored: the reader walks
+  the schema in lockstep, exactly as Arrow IPC does. Only runtime facts are recorded.</p>
+  <div class="tblwrap"><table>
+    <tr><th>field</th><th>type</th><th>meaning</th></tr>
+    <tr><td><code>len</code></td><td>u32</td><td>Logical array length.</td></tr>
+    <tr><td><code>null_count</code></td><td>u32</td><td>Number of nulls.</td></tr>
+    <tr><td><code>has_validity</code></td><td>u32</td><td><code>1</code> if a validity bitmap precedes the data buffers.</td></tr>
+    <tr><td><code>data_buffers</code></td><td>u32</td><td>Non-validity buffers: 1 for a primitive, 2 for <code>Utf8</code> (offsets + values), 1 for <code>List</code> offsets, 0 for <code>Struct</code>.</td></tr>
+    <tr><td><code>child_count</code></td><td>u32</td><td>Child nodes that follow: field count for <code>Struct</code>, 1 for <code>List</code>.</td></tr>
+    <tr><td><code>_pad</code></td><td>u32</td><td>Reserved, zero.</td></tr>
+  </table></div>
+
+  <h3>BufferEntry — 12 bytes</h3>
+  <div class="tblwrap"><table>
+    <tr><th>field</th><th>type</th><th>meaning</th></tr>
+    <tr><td><code>chunk_index</code></td><td>u32</td><td>Which chunk of the batch holds the buffer (0 = primary).</td></tr>
+    <tr><td><code>offset</code></td><td>u32</td><td>Byte offset from the start of that chunk, 64-byte aligned.</td></tr>
+    <tr><td><code>len</code></td><td>u32</td><td>Byte length.</td></tr>
+  </table></div>
+  <p>Absolute address of a buffer: <code>segment_base + chunks[chunk_index].offset + offset</code>,
+  valid for <code>len</code> bytes.</p>
+
+  <div class="callout"><b>Multi-chunk rule.</b> When the next buffer would overflow the chunk, a
+  continuation chunk opens. <strong>Every individual buffer stays contiguous inside one chunk</strong> —
+  a buffer never straddles a boundary, because that would break zero-copy. A single buffer larger
+  than the pool's max chunk size is rejected with <code>Error::Unsupported</code>.</div>
+
+  <p>The records are plain <code>#[repr(C)]</code> PODs placed by hand and never mutated after the
+  chunk is published, so they carry no atomics. Sizes and alignments are pinned with compile-time
+  asserts (32/8, 24/4, 12/4).</p>
+</section>
+
+<section id="write">
+  <div class="eyebrow">shm_arrow::write</div>
+  <h2>Write path</h2>
+<pre><code><span class="k">let</span> registry = <span class="a">SchemaRegistry</span>::<span class="a">new</span>();
+<span class="k">let</span> alloc    = <span class="a">PoolAllocator</span>::<span class="a">new</span>(&amp;pool, &amp;segment);
+
+<span class="c">// common case: the batch fits one chunk</span>
+<span class="k">let</span> desc: <span class="a">ChunkDesc</span> = <span class="a">write_batch</span>(&amp;alloc, &amp;registry, &amp;batch)?;
+
+<span class="c">// large or nested: ordered list, chunks[0] is the primary</span>
+<span class="k">let</span> chunks: <span class="a">Vec</span>&lt;<span class="a">ChunkDesc</span>&gt; = <span class="a">write_batch_chunks</span>(&amp;alloc, &amp;registry, &amp;batch)?;</code></pre>
+  <ol>
+    <li><strong>Intern</strong> the batch's schema to get <code>schema_id</code>.</li>
+    <li><strong>Plan</strong>: flatten each column's array tree into nodes and buffers.</li>
+    <li><strong>Pack</strong> buffers 64-byte aligned against <code>alloc.max_chunk_size()</code>, opening continuation chunks as needed.</li>
+    <li><strong>Allocate and fill</strong>. If allocation fails part-way, every still-<code>FREE</code> chunk is returned (<code>ChunkAllocator::free</code>), so a failed multi-chunk write leaks nothing.</li>
+  </ol>
+  <ul>
+    <li><code>write_batch</code> is a wrapper: if the batch needs several chunks it frees them and returns <code>Error::ChunkTooSmall</code>. Use <code>write_batch_chunks</code> for those.</li>
+    <li><strong>Sliced arrays are normalized.</strong> Any array with a non-zero offset, at any nesting depth, is compacted (via <code>arrow-select</code>'s <code>concat</code>) so the stored representation has offset 0. A reader never sees a non-zero offset.</li>
+  </ul>
+</section>
+
+<section id="read">
+  <div class="eyebrow">shm_arrow::read</div>
+  <h2>Read path</h2>
+<pre><code><span class="k">let</span> pin   = <span class="a">Arc</span>::<span class="a">new</span>(<span class="a">PinGuard</span>::<span class="a">new</span>(segment.<span class="a">clone</span>()));
+<span class="k">let</span> batch = <span class="a">read_batch</span>(pin, &amp;ctrl, &amp;desc, &amp;registry)?;   <span class="c">// buffers point into shm</span>
+
+<span class="c">// multi-chunk: ctrls is parallel to chunks</span>
+<span class="k">let</span> batch = <span class="a">read_batch_chunks</span>(pin, &amp;chunks, &amp;ctrls, &amp;registry)?;</code></pre>
+  <p>Each Arrow <code>Buffer</code> is built with <code>Buffer::from_custom_allocation</code> over a
+  pointer into the segment and holds a clone of the <code>owner</code> as keep-alive. That is why a
+  batch can outlive the call that produced it, but never the pin it views.</p>
+
+  <h3>Validation order</h3>
+  <p>Cheap, fail-closed, in this order:</p>
+  <ol>
+    <li><code>ctrl.validate(desc)</code> for <strong>every</strong> chunk — generation must match, else <code>shm_core::Error::StaleDescriptor</code>.</li>
+    <li>Header <code>magic</code> and <code>format</code>, else <code>BadMagic</code>.</li>
+    <li>Header <code>schema_id</code> equals <code>chunks[0].schema_id</code>, else <code>SchemaMismatch</code>.</li>
+    <li><code>chunk_count == chunks.len()</code> and every buffer entry lies inside its chunk, else <code>Layout</code>.</li>
+    <li>Registry lookup, else <code>UnknownSchema</code>.</li>
+  </ol>
+
+  <div class="callout"><b>The caller's half of the contract.</b> The reader must hold every chunk in
+  <code>PUBLISHED</code> state with a shared pin for as long as <code>owner</code> lives. Given that,
+  the mapped bytes are immutable and reading them is sound. <code>PinGuard</code> is the canonical
+  owner (it keeps the <code>Arc&lt;Segment&gt;</code> mapped); a full runtime also holds the
+  <code>ChunkCtrl</code> refcount so the chunk cannot be recycled under the reader.</div>
+</section>
+
+<section id="schemas">
+  <div class="eyebrow">schema.rs · ADR-0003 item E</div>
+  <h2>Schema interning</h2>
+  <p>A <code>schema_id</code> is a <code>u32</code> carried in both the <code>ChunkDesc</code> and the
+  batch header. The wire form of a schema is its <strong>canonical Arrow-IPC schema message</strong>
+  (<code>serialize_schema</code> / <code>deserialize_schema</code>), a pure function of the schema and
+  byte-identical across processes on the same Arrow version.</p>
+  <ul>
+    <li><strong>Content hash.</strong> <code>schema_content_hash</code> is FNV-1a (64-bit) over those bytes. It is process-independent and is the key both the registry and the coordinator intern on.</li>
+    <li><strong>Local vs coordinator ids.</strong> <code>intern</code> mints an id locally; <code>insert(id, schema)</code> installs one learned from the coordinator. Keyed on the content hash, both resolve to the same slot for the same schema.</li>
+    <li><strong>Seeding.</strong> <code>SchemaRegistry::with_schemas(&amp;[..])</code> gives a writer and reader identical ids without a coordinator round trip.</li>
+    <li><strong>Lookups.</strong> <code>id_for(&amp;schema)</code> and <code>resolve(id)</code> are read-only; <code>resolve</code> of an id never installed yields <code>None</code>, surfaced as <code>UnknownSchema</code> on read.</li>
+  </ul>
+  <div class="callout"><b>Open edge.</b> The registry is in-process. A reader in another process must
+  receive the schema from the coordinator before its first read — an unresolved id is an explicit
+  error, never a guess.</div>
+</section>
+
+<section id="types">
+  <div class="eyebrow">scope · v0.3</div>
+  <h2>Supported types</h2>
+  <div class="tblwrap"><table>
+    <tr><th>supported</th><th>not yet</th></tr>
+    <tr>
+      <td>Primitives, <code>Utf8</code> and other offset-based types; nested <code>Struct</code>, <code>List</code>, <code>LargeList</code>, <code>FixedSizeList</code> with recursive children; sliced arrays (normalized); batches spanning several chunks.</td>
+      <td><code>Dictionary</code>, <code>Union</code>, <code>Map</code>, <code>RunEndEncoded</code> — rejected with <code>Error::Unsupported</code>. A buffer larger than one chunk.</td>
+    </tr>
+  </table></div>
+</section>
+
+<section id="errors">
+  <div class="eyebrow">error.rs</div>
+  <h2>Errors</h2>
+  <div class="tblwrap"><table>
+    <tr><th>variant</th><th>means</th></tr>
+    <tr><td><code>Core(shm_core::Error)</code></td><td>Substrate failure. A recycled chunk is <code>StaleDescriptor</code>.</td></tr>
+    <tr><td><code>Arrow(ArrowError)</code></td><td>Schema or array construction failed.</td></tr>
+    <tr><td><code>BadMagic</code></td><td>Not an shm-arrow batch chunk, or a pre-v0.3 layout.</td></tr>
+    <tr><td><code>UnknownSchema(id)</code></td><td>Schema id not in the local registry; resolve it from the coordinator first.</td></tr>
+    <tr><td><code>SchemaMismatch { desc, header }</code></td><td>Descriptor and header disagree on <code>schema_id</code>.</td></tr>
+    <tr><td><code>ChunkTooSmall { need, have }</code></td><td>Does not fit in the allocated chunk.</td></tr>
+    <tr><td><code>Unsupported(&amp;'static str)</code></td><td>Type or buffer size outside scope.</td></tr>
+    <tr><td><code>Layout(&amp;'static str)</code></td><td>Internally inconsistent layout: corruption or a version mismatch, not a plain stale descriptor.</td></tr>
+  </table></div>
+</section>
+
+<section id="arrowref">
+  <div class="eyebrow">ArrowRef</div>
+  <h2>What ArrowRef is</h2>
+  <p>ArrowRef (the <code>query-cache</code> codebase) is a <strong>descriptor-first retained-execution
+  cache</strong>. Queue and control messages never carry large payloads: Arrow or Parquet data is
+  retained once, referenced by descriptors, and moved only by explicit data-plane fetches. Its task
+  fabric is that invariant applied to work — <em>submit task → worker executes → retained output
+  ref → ack</em>.</p>
+  <p>That is the same invariant <code>shm-arrow</code> implements at the byte level, which is why
+  shm-actors is a candidate substrate for it. shm-actors stays <strong>clean-room</strong>: it has no
+  dependency on ArrowRef, and the integration work lives in a separate spike crate and ADRs.</p>
+</section>
+
+<section id="mapping">
+  <div class="eyebrow">ADR-0005 §2</div>
+  <h2>Mapping ArrowRef onto shm primitives</h2>
+  <div class="tblwrap"><table>
+    <tr><th>ArrowRef concept</th><th>shm-actors primitive</th></tr>
+    <tr><td>Retained Arrow input (<code>InputRef::ArrowRef</code>)</td><td>An Arrow batch written once with <code>shm-arrow</code>; the reference is its 24-byte <code>ChunkDesc</code>.</td></tr>
+    <tr><td>Descriptor-only task queue</td><td><code>shm-task</code> <code>TaskQueue</code>: claim is exactly-once, descriptors only.</td></tr>
+    <tr><td>Output as a retained ref</td><td>A new <code>shm-artifact</code> version, installed with a single linearising CAS.</td></tr>
+    <tr><td>Ack / clear-on-ack</td><td>Release the retained input: refcount → 0 → reclaimed, generation bumps.</td></tr>
+    <tr><td>Crash / retry lease</td><td><code>TaskQueue::reap</code> plus the borrow-journal replay.</td></tr>
+    <tr><td>Chunk leases (“referenced chunks stay valid while tasks run”)</td><td><code>ChunkCtrl</code> refcount and generation-checked descriptors.</td></tr>
+    <tr><td>Durability (hash-framed WAL)</td><td>Not provided by shm: memory is volatile. A WAL stays the durability anchor.</td></tr>
+  </table></div>
+</section>
+
+<section id="spike">
+  <div class="eyebrow">crates/shm-arrowref-spike · ADR-0005</div>
+  <h2>The task-fabric spike</h2>
+  <p>A runnable example, not a shipped library and not a port. It proves one surface end to end
+  against a small hand-written mock of ArrowRef's task contract.</p>
+  <ol>
+    <li>A requester retains an Arrow input <strong>once</strong> in shared memory and submits only its 24-byte descriptor to a <code>TaskQueue</code>.</li>
+    <li>A worker (a thread standing in for a process; the handles are the ones a cross-process actor gets) claims it exactly once and reads the input <strong>zero-copy</strong>.</li>
+    <li>It computes a derived batch and retains it as a new <code>Artifact</code> version, then completes the task with a 24-byte result descriptor naming that version.</li>
+    <li>The requester waits, reads the output zero-copy, and acks: the retained input is released and reclaimed.</li>
+  </ol>
+  <p>The queue never carries a payload. Control messages are 24 bytes each; the Arrow data is
+  written once and thereafter only referenced.</p>
+  <div class="callout"><b>Where it stops.</b> The spike surfaced concrete API gaps (durable task WAL,
+  lifecycle-tied leases, evict-current) recorded in
+  <a href="adrs.html">ADR-0005</a>. Run it from the workspace root:
+  <code>managed-build cargo run -p shm-arrowref-spike</code>.</div>
+</section>
+
+<section id="refront">
+  <div class="eyebrow">direction</div>
+  <h2>Re-front, not rebuild</h2>
+  <p>The target for ArrowRef is five planes: a thin <strong>translator front</strong> (subdomain →
+  tenant → typed descriptor envelope); the <strong>dispatch fabric</strong> (shm-actors, the spine of
+  that plane only); a node/control plane with the tenancy catalog and a WAL; a per-tenant
+  <strong>worker cluster</strong> with fd-granted segments; and the existing cross-host cluster.</p>
+  <ul>
+    <li><strong>Boundary rule:</strong> descriptors never cross a host; bytes do. shm-actors is same-host only.</li>
+    <li><strong>Strangler order:</strong> tenancy catalog first, then the keyed store and typed-ref envelope, then the Tasks wedge behind a feature flag, topics next, the DuckDB worker path last.</li>
+    <li><strong>Isolation</strong> comes from per-tenant segments granted by file descriptor, not from a software check.</li>
+  </ul>
+  <p>Full detail: <code>docs/ARROWREF-TARGET-ARCHITECTURE.md</code> and
+  <code>docs/ARROWREF-INTERFACE-COLLAPSED.md</code> in the repository.</p>
+</section>
+
+<section id="rules">
+  <div class="eyebrow">practice</div>
+  <h2>Rules of thumb</h2>
+  <ul>
+    <li><strong>Never ship the batch, ship the descriptor.</strong> If a message grows with row count, the design is wrong.</li>
+    <li><strong>Keep the pin as long as the batch.</strong> A <code>RecordBatch</code> from <code>read_batch</code> is a view; its owner must stay alive and the chunk must stay <code>PUBLISHED</code>.</li>
+    <li><strong>Treat <code>StaleDescriptor</code> as a normal outcome.</strong> It means the data was reclaimed, which is the designed behavior for a late reader.</li>
+    <li><strong>Seed or resolve schemas before reading.</strong> <code>UnknownSchema</code> is an ordering bug, not a data bug.</li>
+    <li><strong>Size arenas with <code>serialized_len</code></strong>, and use <code>write_batch_chunks</code> for anything that may exceed one chunk.</li>
+    <li><strong>Check the type list first.</strong> Dictionary-encoded columns must be materialized before they can be written.</li>
+  </ul>
+</section>
+
+<nav class="pgnav" aria-label="Pagination">
+  <a href="guide.html"><span class="lab">← Previous</span><span class="ttl" style="display:block">Guide</span></a>
+  <a class="next" href="actors.html"><span class="lab">Next →</span><span class="ttl" style="display:block">Actor model</span></a>
+</nav>
+</main>
+<aside class="otp" aria-label="On this page">
+  <div class="t">On this page</div>
+  <a href="#invariant">The invariant</a>
+  <a href="#pieces">Pieces</a>
+  <a href="#layout">On-chunk layout</a>
+  <a href="#write">Write path</a>
+  <a href="#read">Read path</a>
+  <a href="#schemas">Schema interning</a>
+  <a href="#types">Supported types</a>
+  <a href="#errors">Errors</a>
+  <a href="#arrowref">ArrowRef</a>
+  <a href="#mapping">Mapping</a>
+  <a href="#spike">Spike</a>
+  <a href="#refront">Re-front</a>
+  <a href="#rules">Rules of thumb</a>
+</aside>
+</div>
+
+<footer class="site"><div class="in">
+  <div>Holon · an actor framework on the shm-actors substrate · Apache-2.0</div>
+  <div class="mono"><a href="adrs.html">decision record</a> · <a href="benchmarks.html">benchmarks</a> · <a href="api/holon_actor/index.html">API</a></div>
+</div></footer>
+<script src="site.js"></script>
+</body>
+</html>

@@ -26,10 +26,10 @@ every benchmark, and all sixteen ADRs.
 |---|---:|
 | ring hop, cross-process, p50 | 83.5 ns |
 | version pin, 1 → 10 000 versions | ≤ 1 tick |
-| zero-copy table read, 1 k → 1 M rows | 208–250 ns, flat |
-| append commit, version 0 → 100 000 | 1.4–1.6 µs, flat |
-| stream delta read, any history | ~290 ns, flat |
-| actor ask round trip (parked / spinning) | 9.5 µs / 1.2 µs |
+| zero-copy table read, 1 k → 1 M rows | 292–333 ns, flat |
+| append commit, version 0 → 100 000 | 1.33–1.42 µs, flat |
+| stream delta read, any history | 250–292 ns, flat |
+| actor ask round trip (parked / spinning) | 9.0–10.0 µs / 1.2–1.4 µs |
 | messages lost across a `kill -9` mid-message | 0 |
 
 Apple M4 Max, macOS dev profile, release builds, ≥ 2 runs. “≤ 1 tick” = at the

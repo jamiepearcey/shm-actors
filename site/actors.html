@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The actor model — Holon / shm-actors</title>
+<meta name="description" content="How to write Holon actors: POD payloads and schema ids, the Actor trait, hosting many actors on one mailbox, tell/ask/ask_ref from a client, the Cx handler surface, chunk ownership, and the failure model.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏹</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=Archivo:wght@400;500;600&family=Spline+Sans+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="topbar"><div class="in">
+  <a class="brand" href="./" style="text-decoration:none">holon<em>//</em>shm-actors</a>
+  <nav>
+    <a href="./">Overview</a>
+    <a href="guide.html">Guide</a>
+    <a href="actors.html" class="on">Actors</a>
+    <a href="benchmarks.html">Benchmarks</a>
+    <a href="adrs.html">ADRs</a>
+    <a href="api/holon_actor/index.html">API</a>
+    <a class="gh" href="https://github.com/jamiepearcey/shm-actors">GitHub</a>
+    <button id="themeToggle" aria-label="Toggle theme">◒</button>
+  </nav>
+</div></div>
+
+<div class="docshell">
+<nav class="sidenav" aria-label="Documentation">
+  <div class="g">Documentation</div>
+  <a class="pg" href="./">Overview</a>
+  <a class="pg" href="guide.html">Guide</a>
+  <a class="pg here" href="actors.html">Actor model</a>
+  <a class="pg" href="benchmarks.html">Benchmarks</a>
+  <a class="pg" href="adrs.html">Decision record</a>
+  <a class="pg" href="api/holon_actor/index.html">API reference</a>
+  <div class="g">The model</div>
+  <a href="#laws">Two laws</a>
+  <a href="#message">What a message is</a>
+  <div class="g">Writing code</div>
+  <a href="#payload">Payloads</a>
+  <a href="#actor">The Actor trait</a>
+  <a href="#host">Hosting actors</a>
+  <a href="#call">Calling an actor</a>
+  <a href="#cx">The handler context</a>
+  <a href="#latency">Latency knob</a>
+  <div class="g">Semantics</div>
+  <a href="#ownership">Chunk ownership</a>
+  <a href="#failure">Failure model</a>
+  <a href="#rules">Rules &amp; traps</a>
+</nav>
+<main>
+<div class="dochead">
+  <div class="crumb"><a href="./">docs</a> / <b>actor model</b></div>
+  <h1>The actor model</h1>
+  <p class="sub">What an actor is in Holon, what a message is, and the exact API you write against —
+  <code>holon-core</code> for the ABI, <code>holon-actor</code> for the runtime. Every signature on
+  this page is the one in the crates today (ADR-0015, ADR-0017); the working code is
+  <code>crates/holon-demo</code>.</p>
+</div>
+
+<section id="laws" class="first" style="padding-top:28px">
+  <div class="eyebrow">The model</div>
+  <h2>Two laws</h2>
+  <p><strong>Actors own no state. Memory nodes own no code.</strong> Everything else in this page
+  falls out of those two sentences.</p>
+  <div class="grid2">
+    <div class="card"><h4>An actor is a handler, not a container</h4><p>An actor struct holds <em>addresses</em> — a <code>CellRef</code> naming a shared table, a counter that is explicitly scratch. It never holds the data. A handler pins the exact cell version its message names, reads it zero-copy, and drops the pin when it returns. Kill the process: nothing of value dies with it.</p></div>
+    <div class="card"><h4>A memory node is data, not a service</h4><p>Cells, streams and artifacts are versioned Arrow bytes in shared memory with no attached behaviour. Any actor may read any version at full speed; no actor is the gatekeeper of one. That is what makes a worker pool interchangeable and a restart free.</p></div>
+  </div>
+  <p>Concretely: one process hosts any number of actors of any types, sharing one mailbox — the
+  coordinator's <code>shm-task</code> queue — and the envelope's <code>to</code> field picks which
+  handler runs. Several processes that <code>spawn</code> the <em>same name</em> form a pool: same
+  <code>ActorId</code>, same queue, exactly-once claim decides who gets each message.</p>
+  <div class="callout"><b>Where this page sits.</b> The <a href="guide.html">guide</a> explains the
+  substrate underneath — rings, cells, tasks, the borrow journal. This page is the layer you write
+  against. Read <a href="guide.html#task">Tasks</a> and <a href="guide.html#cells">Versioned
+  cells</a> first if a term here is unfamiliar.</div>
+</section>
+
+<section id="message">
+  <div class="eyebrow">holon-core · ADR-0015 §4</div>
+  <h2>What a message is</h2>
+  <p>A message is one chunk of the keyed store's shared pool: a 64-byte <code>Envelope</code> at
+  offset 0, then the body inline at offset 64. The chunk travels as the task's 24-byte
+  <code>ChunkDesc</code> — the data never moves, the descriptor does.</p>
+
+  <div class="flow">
+    <div class="fnode">Envelope<small>64 B, offset 0</small></div>
+    <div class="farr">+<small>same chunk</small></div>
+    <div class="fnode hot">inline body<small><code>body_len</code> B, offset 64</small></div>
+    <div class="farr">or<small>if it won't fit</small></div>
+    <div class="fnode">LocalRef<small>via <code>payload</code></small></div>
+  </div>
+
+  <p>The envelope is a frozen ABI: <code>#[repr(C, align(64))]</code>, exactly one cache line,
+  magic-validated on decode, and designed to double as the frame header when a cross-host
+  transport lands.</p>
+
+  <div class="tblwrap"><table>
+    <thead><tr><th>field</th><th>type</th><th>what it carries</th></tr></thead>
+    <tbody>
+      <tr><td><code>to</code> / <code>from</code></td><td>u64</td><td><code>ActorId</code>s. <code>ActorId::named("pricer")</code> hashes the service name, so every process in a pool answers on one id.</td></tr>
+      <tr><td><code>corr</code></td><td>u64</td><td>Correlation id: an <code>Ask</code> and its <code>Reply</code>/<code>Err</code> share it.</td></tr>
+      <tr><td><code>payload</code></td><td>u64</td><td>A <code>LocalRef</code> (packed, host-scoped) when the body is not inline.</td></tr>
+      <tr><td><code>schema_id</code></td><td>u32</td><td>Which <code>Payload</code> this is. Dispatch is a binary search on this.</td></tr>
+      <tr><td><code>kind</code></td><td>u16</td><td><code>Tell</code>=1, <code>Ask</code>=2, <code>Reply</code>=3, <code>Err</code>=4.</td></tr>
+      <tr><td><code>flags</code></td><td>u16</td><td><code>FLAG_INLINE_PAYLOAD</code>, <code>FLAG_LOCAL_REF</code>, <code>FLAG_NO_REPLY</code>.</td></tr>
+      <tr><td><code>body_len</code></td><td>u16</td><td>Inline body length. Inline bodies cap at <code>MAX_INLINE_BODY</code> = 192 bytes.</td></tr>
+      <tr><td><code>reply_gen</code></td><td>u32</td><td>The generation of the asker's reply chunk — the epoch check that stops a zombie writing into memory that has been reclaimed and re-handed-out.</td></tr>
+      <tr><td><code>deadline</code> / <code>epoch</code></td><td>u32</td><td>Time fencing for the handler's reply write.</td></tr>
+      <tr><td><code>magic</code> / <code>abi_version</code></td><td>u32/u16</td><td><code>0x484f_4c4e</code> and <code>1</code>. A mismatch is a decode error, not a misread.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="payload">
+  <div class="eyebrow">holon-core::Payload</div>
+  <h2>Payloads: plain old data with a schema id</h2>
+  <p>A message body is a POD struct. No pointers, no <code>Drop</code>, no padding — it is memcpy'd
+  into shared memory and read by another process, so <code>SharedPod</code> is the contract and
+  <code>bytemuck</code> proves it. <code>Payload</code> adds one thing: a <code>SCHEMA_ID</code>
+  that the receiver dispatches on.</p>
+
+  <pre><code><span class="k">use</span> holon_core::Payload;
+<span class="k">use</span> shm_core::SharedPod;
+
+<span class="k">pub const</span> PRICE_REQUEST_SCHEMA: <span class="k">u32</span> = <span class="g">1001</span>;
+
+<span class="c">#[repr(C)]</span>
+<span class="c">#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]</span>
+<span class="k">pub struct</span> PriceRequest {
+    <span class="k">pub</span> tenor: <span class="k">f64</span>,
+    <span class="k">pub</span> notional: <span class="k">f64</span>,
+    <span class="k">pub</span> seq: <span class="k">u64</span>,
+}
+
+<span class="c">// SAFETY: #[repr(C)], three 8-byte scalars, no padding, no pointers, no Drop.</span>
+<span class="k">unsafe impl</span> SharedPod <span class="k">for</span> PriceRequest {}
+<span class="k">impl</span> Payload <span class="k">for</span> PriceRequest {
+    <span class="k">const</span> SCHEMA_ID: <span class="k">u32</span> = PRICE_REQUEST_SCHEMA;
+}</code></pre>
+
+  <p><code>Payload</code> gives you <code>as_bytes()</code> and <code>from_bytes()</code> for free.
+  Schema ids are yours to allocate and must be stable across processes — they are the wire
+  contract. Bodies larger than 192 bytes do not ride inline; they go in a cell or an object and the
+  message carries the reference.</p>
+</section>
+
+<section id="actor">
+  <div class="eyebrow">holon-actor::Actor</div>
+  <h2>The <code>Actor</code> trait</h2>
+  <p>Two methods. <code>accepts()</code> lists the schema ids this actor handles — the runtime
+  builds a sorted function-pointer table from it, so dispatch is a binary search with no
+  <code>dyn</code> and no allocation on the message path. <code>handle()</code> runs one message at
+  a time, which is why you never write a lock.</p>
+
+  <pre><code><span class="k">impl</span> Actor <span class="k">for</span> Pricer {
+    <span class="k">fn</span> <span class="a">accepts</span>() -&gt; &amp;<span class="k">'static</span> [<span class="k">u32</span>] {
+        &amp;[PRICE_REQUEST_SCHEMA]
+    }
+
+    <span class="k">fn</span> <span class="a">handle</span>(
+        &amp;<span class="k">mut self</span>,
+        _msg: &amp;Envelope,
+        body: &amp;[<span class="k">u8</span>],
+        cx: &amp;<span class="k">mut</span> Cx&lt;<span class="k">'_</span>&gt;,
+    ) -&gt; holon_core::Result&lt;Reply&gt; {
+        <span class="k">let</span> req   = PriceRequest::<span class="a">from_bytes</span>(body)?;
+        <span class="k">let</span> curve = cx.<span class="a">pin</span>(&amp;<span class="k">self</span>.curve)?;        <span class="c">// journaled: kill -9 safe</span>
+        <span class="k">let</span> rate  = <span class="a">interpolate</span>(&amp;curve, req.tenor)
+            .<span class="a">map_err</span>(holon_core::Error::Handler)?;
+
+        Reply::<span class="a">of</span>(&amp;PriceReply {
+            px: <span class="a">price</span>(rate, req.tenor, req.notional),
+            curve_version: curve.<span class="a">version</span>(),      <span class="c">// which edition answered</span>
+            incarnation:   <span class="k">self</span>.incarnation,      <span class="c">// which process answered</span>
+            attempt:       cx.<span class="a">attempt</span>(),          <span class="c">// 0 = first delivery</span>
+        })
+    }
+}</code></pre>
+
+  <p>The struct behind it holds a <code>CellRef</code> — a key, not data — plus whatever
+  process-local scratch you are willing to lose:</p>
+
+  <pre><code><span class="k">pub struct</span> Pricer {
+    curve: CellRef,      <span class="c">// CellRef::new(CURVE_KEY) — an address</span>
+    handled: <span class="k">u64</span>,      <span class="c">// scratch; lost on restart, by design</span>
+    incarnation: <span class="k">u32</span>,  <span class="c">// std::process::id()</span>
+}</code></pre>
+
+  <div class="callout"><b>The tell for a wrong actor.</b> If restarting your actor would lose
+  something a caller cares about, the state is in the wrong place. Move it into a cell and pin it
+  per message — that is the whole trade this framework makes.</div>
+</section>
+
+<section id="host">
+  <div class="eyebrow">holon-actor::ActorSystem</div>
+  <h2>Hosting actors</h2>
+  <p>An <code>ActorSystem</code> owns a <code>shm-runtime</code> <code>Node</code>, hosts any number
+  of actors, and runs one mailbox loop. Register Arrow schemas before spawning; set the lease and
+  the wait strategy; then <code>run()</code> until the stop flag flips.</p>
+
+  <pre><code><span class="k">let</span> <span class="k">mut</span> sys = ActorSystem::<span class="a">connect</span>(&amp;uds, PRICER_NAME)?;
+sys.<span class="a">intern_schema</span>(&amp;<span class="a">curve_schema</span>())?;
+sys.<span class="a">set_lease</span>(Duration::<span class="a">from_millis</span>(<span class="g">500</span>));  <span class="c">// DEFAULT_LEASE</span>
+sys.<span class="a">set_spin_budget</span>(SpinBudget::<span class="a">from_micros</span>(<span class="g">3</span>));  <span class="c">// the default; 0 = park at once</span>
+sys.<span class="a">set_stop</span>(stop.<span class="a">clone</span>());                 <span class="c">// Arc&lt;AtomicBool&gt;</span>
+
+<span class="c">// Two actors, one mailbox: the envelope's `to` picks the host.</span>
+sys.<span class="a">spawn</span>(PRICER_NAME, Pricer::<span class="a">new</span>(kill_after, result))?;
+sys.<span class="a">spawn</span>(RISK_NAME,   Risk::<span class="a">new</span>())?;
+
+sys.<span class="a">run</span>()?;</code></pre>
+
+  <div class="tblwrap"><table>
+    <thead><tr><th>call</th><th>effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>connect(uds, name)</code></td><td>Attach to the coordinator over a Unix socket; segment fds arrive by <code>SCM_RIGHTS</code>. <code>name</code> is this <em>node's</em> identity.</td></tr>
+      <tr><td><code>spawn(name, actor)</code></td><td>Host an actor under <code>ActorId::named(name)</code>; returns the id. Same name in another process = a pool member, not a conflict.</td></tr>
+      <tr><td><code>set_lease(d)</code></td><td>How long a claim survives a dead handler. Crash-to-successor is the lease plus one tick — 508–542 ms at 500 ms.</td></tr>
+      <tr><td><code>set_spin_budget(b)</code></td><td>How long a worker busy-polls before parking. Defaults to <code>DEFAULT_SPIN_BUDGET</code> = 3 µs, which is where the measured curve stops paying. See <a href="#latency">below</a>.</td></tr>
+      <tr><td><code>set_spin(bool)</code></td><td>Sugar for the two endpoints: never park, or park on the first miss.</td></tr>
+      <tr><td><code>set_stop(flag)</code></td><td>Cooperative shutdown; <code>run()</code> returns when the flag is set.</td></tr>
+      <tr><td><code>intern_schema(&amp;schema)</code></td><td>Register an Arrow schema, returning its id. Do it before <code>run()</code>.</td></tr>
+      <tr><td><code>node()</code> / <code>node_mut()</code></td><td>Escape hatch to the substrate for anything the actor layer does not wrap.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Head-of-line note: co-hosted actors share one mailbox, so a slow handler delays its
+  neighbours. Per-actor mailboxes are not built — split into processes when isolation matters.</p>
+</section>
+
+<section id="call">
+  <div class="eyebrow">holon-actor::ActorRef</div>
+  <h2>Calling an actor</h2>
+  <p>A client attaches its own <code>Node</code> and opens an <code>ActorRef</code> per target. One
+  node can carry several refs; they share the mailbox and differ only in <code>to</code>.</p>
+
+  <pre><code><span class="k">let</span> <span class="k">mut</span> node = Node::<span class="a">connect</span>(uds, <span class="g">"client-0"</span>, Arc::<span class="a">new</span>(SchemaRegistry::<span class="a">new</span>()))?;
+<span class="k">let</span> <span class="k">mut</span> pricer = ActorRef::<span class="a">new</span>(&amp;<span class="k">mut</span> node, ActorId::<span class="a">named</span>(PRICER_NAME))?;
+<span class="k">let</span> <span class="k">mut</span> risk   = ActorRef::<span class="a">new</span>(&amp;<span class="k">mut</span> node, ActorId::<span class="a">named</span>(RISK_NAME))?;
+pricer.<span class="a">set_spin</span>(spin);
+
+<span class="c">// fire and forget</span>
+pricer.<span class="a">tell</span>(&amp;evt)?;
+
+<span class="c">// request / response, typed both ways</span>
+<span class="k">let</span> rep: PriceReply = pricer.<span class="a">ask</span>::&lt;PriceRequest, PriceReply&gt;(&amp;req)?;
+
+<span class="c">// zero-copy reply: read straight out of the reply chunk, release on drop</span>
+<span class="k">let</span> guard = pricer.<span class="a">ask_ref</span>(PriceRequest::SCHEMA_ID, req.<span class="a">as_bytes</span>(), reply_cap)?;
+<span class="k">let</span> rep = guard.<span class="a">payload</span>::&lt;PriceReply&gt;()?;
+
+<span class="c">// pipelined: submit now, collect later</span>
+<span class="k">let</span> <span class="k">mut</span> pending = pricer.<span class="a">ask_start</span>(PriceRequest::SCHEMA_ID, req.<span class="a">as_bytes</span>())?;
+<span class="k">while</span> pricer.<span class="a">ask_poll</span>(&amp;<span class="k">mut</span> pending)?.<span class="a">is_none</span>() { <span class="c">/* do other work */</span> }</code></pre>
+
+  <div class="tblwrap"><table>
+    <thead><tr><th>method</th><th>shape</th><th>when</th></tr></thead>
+    <tbody>
+      <tr><td><code>tell</code> / <code>tell_raw_to</code></td><td>submit, no wait</td><td>Events. Sets <code>FLAG_NO_REPLY</code>; no reply chunk is allocated.</td></tr>
+      <tr><td><code>ask</code></td><td>typed in, typed out, blocking</td><td>The default. Copies the reply body out.</td></tr>
+      <tr><td><code>ask_raw</code> / <code>ask_raw_to</code></td><td>bytes in, <code>(Envelope, Vec&lt;u8&gt;)</code> out</td><td>Schema id known at runtime, or you want the envelope.</td></tr>
+      <tr><td><code>ask_ref</code> / <code>ask_ref_to</code></td><td><code>ReplyRef</code> guard</td><td>Zero-copy read of the reply. Frees the chunk on drop, or on explicit <code>release()</code>.</td></tr>
+      <tr><td><code>ask_start</code> / <code>ask_poll</code> / <code>ask_ready</code></td><td><code>PendingAsk</code></td><td>Pipelining and many-in-flight. <code>ask_poll_ref</code> for the zero-copy variant.</td></tr>
+      <tr><td><code>ask_start_sized</code></td><td>explicit reply capacity</td><td>Replies bigger than <code>DEFAULT_REPLY_BODY</code> (192 B), up to <code>MAX_REPLY_BODY</code> (64 KiB − 1).</td></tr>
+      <tr><td><code>ask_abandon</code> / <code>sweep_orphans</code></td><td>cleanup</td><td>Walk away from an ask; reclaim chunks whose answer never came. <code>orphan_count()</code> reports the backlog.</td></tr>
+      <tr><td><code>retarget</code></td><td>change <code>to</code></td><td>Reuse the ref against a different actor without rebuilding it.</td></tr>
+      <tr><td><code>done_fd</code> / <code>add_done_waiter</code></td><td>readiness fd</td><td>Fold asks into an external event loop instead of blocking.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="cx">
+  <div class="eyebrow">holon-actor::Cx</div>
+  <h2>The handler context</h2>
+  <p><code>Cx</code> is everything a handler is allowed to do to the outside world. It is passed per
+  message and borrows for exactly that message.</p>
+
+  <div class="tblwrap"><table>
+    <thead><tr><th>method</th><th>gives you</th></tr></thead>
+    <tbody>
+      <tr><td><code>pin(&amp;CellRef) -&gt; Pinned</code></td><td>A journaled, zero-copy view of a cell. <code>Pinned</code> derefs to an Arrow <code>RecordBatch</code> and reports its <code>version()</code>. The pin is recorded in the borrow journal, so a <code>kill -9</code> mid-read is reclaimed by the coordinator, not leaked.</td></tr>
+      <tr><td><code>publish(topic, event, data)</code></td><td>Append to a <code>holon-topic</code> log; returns the sequence. <code>publish_with</code> for the full form.</td></tr>
+      <tr><td><code>topics()</code> / <code>objects()</code></td><td>Direct handles to the topic log and object store when the shorthands are not enough.</td></tr>
+      <tr><td><code>put_object(..)</code> / <code>max_object_bytes()</code></td><td>Park a payload too big for a message body and pass its reference instead.</td></tr>
+      <tr><td><code>self_id()</code> / <code>sender()</code></td><td>Who is running, who asked.</td></tr>
+      <tr><td><code>corr()</code></td><td>The correlation id — the thing to log if you want to trace an ask end to end.</td></tr>
+      <tr><td><code>attempt()</code></td><td>Redelivery count: <code>0</code> is a first delivery, <code>&gt; 0</code> means a previous holder died or lapsed. Echo it into your reply if callers need to know.</td></tr>
+      <tr><td><code>max_reply()</code></td><td>How many bytes the asker set aside. Exceeding it is an error, not a truncation — check it before building a variable-length reply.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="latency">
+  <div class="eyebrow">Tuning</div>
+  <h2>The latency knob is a budget, not a switch</h2>
+  <p>Both halves of an ask can wait: the worker for a message, the asker for its answer. Each
+  waits the same way — busy-poll for a budget, then park on a doorbell and give the core back.</p>
+  <pre><code>sys.<span class="a">set_spin_budget</span>(SpinBudget::<span class="a">from_micros</span>(<span class="g">3</span>));   <span class="c">// the default</span>
+sys.<span class="a">set_spin_budget</span>(SpinBudget::PARK_NOW);         <span class="c">// idle actor: give the core back at once</span>
+sys.<span class="a">set_spin_budget</span>(SpinBudget::NEVER_PARK);       <span class="c">// hot path: keep the core, best tail</span>
+
+pricer.<span class="a">set_spin_budget</span>(SpinBudget::<span class="a">from_micros</span>(<span class="g">3</span>));  <span class="c">// the asker's half, set independently</span></code></pre>
+  <p>Why a budget beats a switch: a parked wake is a <em>scheduler round trip</em> — enqueue the
+  waiter, IPI the target core, exit its idle state, resume a thread whose cache is now cold. That
+  costs microseconds and has nothing to do with copying. A spinning round trip costs 1.2 µs. So a
+  budget that covers one round trip lets the waiter see its own answer and skip the scheduler
+  entirely; the queue only touches the notification machinery when it actually goes quiet.</p>
+  <div class="tblwrap"><table>
+    <tr><th>budget</th><th class="n">ask p50</th><th class="n">p99</th><th class="n">asks/s</th><th class="n">cores</th><th>reading</th></tr>
+    <tr><td>park on first miss</td><td class="n">9.2–9.8 µs</td><td class="n">18.6–27.2 µs</td><td class="n">92–110 K</td><td class="n">1.0</td><td>Every message pays a scheduler round trip.</td></tr>
+    <tr><td>0.25–0.5 µs</td><td class="n">7.2–11.3 µs</td><td class="n">17.5–22.8 µs</td><td class="n">86–140 K</td><td class="n">1.1</td><td>Below one round trip. Burns cycles, catches nothing — strictly worse than parking.</td></tr>
+    <tr><td>1–1.75 µs</td><td class="n">1.2–1.4 µs</td><td class="n">9.0–19.7 µs</td><td class="n">229–680 K</td><td class="n">1.5–2.0</td><td>Straddles the round trip; jitter flips asks into a park and the tail is unstable.</td></tr>
+    <tr><td><strong>3 µs</strong> (default)</td><td class="n">1.2 µs</td><td class="n">2.3–2.5 µs</td><td class="n">662–688 K</td><td class="n">2.06</td><td>p50 and p99 both settled. Past here only p99.9 improves.</td></tr>
+    <tr><td>never park</td><td class="n">1.2–1.3 µs</td><td class="n">2.2–2.5 µs</td><td class="n">634–690 K</td><td class="n">2.6–2.7</td><td>Best tail (p99.9 3.6–8.2 µs), bought with another 0.6 of a core.</td></tr>
+  </table></div>
+  <p>Two things that surprise people. <strong>Spinning uses less total CPU</strong> — the same
+  50 000 asks cost 0.47–0.63 core-seconds parked and 0.15–0.20 spinning, because two hot cores for
+  a fifth of the time beat one core waiting on the scheduler. And <strong>the cost is bounded and
+  paid on the way to idle</strong>: an actor with nothing to do spins its budget once, parks, and
+  costs nothing until the doorbell rings. The <em>cores</em> column above is the saturated worst
+  case, not the resting cost.</p>
+  <div class="callout"><b>Set it per actor, from the workload.</b> The budget's job is to cover the
+  gap between messages. A pricing actor taking a message every few microseconds should hold its
+  core; a reconciliation actor that wakes twice a minute should hand it back on the first miss.
+  Full curve and method on the <a href="benchmarks.html#spin">benchmarks page</a>.</div>
+</section>
+
+<section id="ownership">
+  <div class="eyebrow">ADR-0007 G1 · ADR-0015</div>
+  <h2>Who owns which chunk</h2>
+  <p>Both chunks in an ask are allocated by the <em>asker</em>. This is the single most
+  counter-intuitive rule in the framework, and it came out of crash testing rather than design.</p>
+
+  <div class="tblwrap"><table>
+    <thead><tr><th>chunk</th><th>allocated by</th><th>held how</th><th>freed by</th></tr></thead>
+    <tbody>
+      <tr><td>request envelope</td><td>the asker</td><td>bare descriptor (<code>FREE</code>)</td><td>the handler process, <em>after</em> <code>complete</code></td></tr>
+      <tr><td>reply chunk</td><td>the asker</td><td><code>LOANED</code> + journaled</td><td>the asker's <code>ReplyRef</code> guard, or the coordinator</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><strong>Why the reply cannot ride the task slot's result word.</strong> A completed slot is
+  reusable capacity the instant it completes — the very next <code>submit</code> from any client
+  pops it off the LIFO free stack — so a concurrent requester's <code>poll</code> would see
+  <code>StaleHandle</code> instead of its result. The reply therefore lives in memory the asker
+  owns, named in the request as a <code>LocalRef</code>. A stale handle after a wait is provably
+  terminal, so the asker falls back to reading its own chunk: kind <code>Reply</code> = answered,
+  kind <code>Err</code> = the handler failed, still zeroed = never handled.</p>
+
+  <p><strong>Why that chunk is loaned <em>and</em> journaled.</strong> The journal is what lets the
+  coordinator reclaim it when the asker dies mid-ask; the loan is what makes the journal record
+  mean anything, because reclamation dispatches on chunk state and does nothing for a
+  <code>FREE</code> chunk. Loan first, then record. The loan also makes the generation live: a
+  reclaim bumps it, so a handler re-reads the generation and compares it with
+  <code>Envelope::reply_gen</code> before writing. A mismatch means the asker is definitively gone,
+  and the task is failed rather than answered into a chunk that now belongs to someone else.</p>
+
+  <p><strong>Why the request is freed only after <code>complete</code>.</strong> A requeued task
+  still names that chunk, so the successor must read the same bytes. A handler whose
+  <code>complete</code> returns <code>Lost</code> — its lease lapsed, the task was redelivered —
+  leaves the request to the new owner and frees nothing.</p>
+
+  <div class="callout"><b>Stated, not hidden.</b> The request chunk of an ask whose task is never
+  successfully claimed — retries exhausted, or no worker ever runs — is freed by nobody: one chunk
+  per such ask. Closing it needs a coordinator-side sweep of the request descriptors of
+  terminally-failed task slots, which is not built.</div>
+</section>
+
+<section id="failure">
+  <div class="eyebrow">Semantics</div>
+  <h2>The failure model</h2>
+  <ul>
+    <li><strong>Delivery is at-least-once, and says so.</strong> A claim carries a lease; if the holder dies or stalls past it, the task is redelivered and <code>cx.attempt()</code> increments. Handlers that are not idempotent must key on <code>corr</code> themselves — the framework will not pretend the redelivery did not happen.</li>
+    <li><strong>Failover is observable if you care, invisible if you don't.</strong> The demo's replies carry <code>incarnation</code> (which process) and <code>attempt</code> (how many deliveries) alongside <code>curve_version</code> (which edition of the data). Most callers ignore all three; the ones that must reconcile can.</li>
+    <li><strong>A zombie cannot scribble on a live reply.</strong> Handlers time-fence their reply write, and the <code>reply_gen</code> epoch check catches the case where the asker died and its chunk was reclaimed and re-issued.</li>
+    <li><strong>Recovery is mechanical and measured.</strong> <code>kill -9</code> mid-message: the successor answers in the lease plus one tick — 508–542 ms at a 500 ms lease across eight runs — with one redelivery, zero messages lost, and a pool census that balances to the chunk.</li>
+    <li><strong>Handler errors are messages too.</strong> Return <code>Err</code> from <code>handle</code> and the asker receives kind <code>Err</code> with the same <code>corr</code>; it is a reply, not a timeout.</li>
+  </ul>
+  <p>Round trips, for calibration — Apple M4 Max, macOS, release, eight runs of
+  <code>holon-demo bench</code> at 100 000 asks each: <strong>9.0–10.0 µs p50 parked</strong>
+  (p99 19.7–25.8), <strong>1.2–1.4 µs spinning</strong> (p99 2.3–2.5). The envelope, pool, journaled
+  pin and Arrow view together account for 1.3–2.6 µs parked and 0.6–1.0 µs spinning — everything
+  else is the doorbell. Throughput is far noisier: 90–103 K asks/s at 1 client / 1 pricer,
+  134–220 K at 4 / 1, 120–174 K at 4 / 4 — four pricers do not beat one on this box, because the
+  parked wake is the bottleneck, not the handler. <a href="benchmarks.html">Method and caveats →</a></p>
+</section>
+
+<section id="rules">
+  <div class="eyebrow">In practice</div>
+  <h2>Rules &amp; traps</h2>
+  <div class="grid2">
+    <div class="card"><h4>Bodies are POD or they are not bodies</h4><p><code>#[repr(C)]</code>, no padding, no pointers, no <code>Drop</code>. <code>SharedPod</code> is <code>unsafe</code> for a reason: another process reads these bytes with no deserialization step to catch you.</p></div>
+    <div class="card"><h4>192 bytes inline, then indirection</h4><p><code>MAX_INLINE_BODY</code> is 192. Bigger payloads belong in a cell or an object, referenced from the message. Do not grow the message; grow the memory node.</p></div>
+    <div class="card"><h4>Size the reply before you ask</h4><p><code>ask</code> reserves <code>DEFAULT_REPLY_BODY</code> (192 B). A larger answer needs <code>ask_start_sized</code> / <code>ask_ref</code> with an explicit cap, and the handler should consult <code>cx.max_reply()</code>.</p></div>
+    <div class="card"><h4>Schema ids are a wire contract</h4><p>They are yours to allocate, they must be stable across every process in the deployment, and <code>accepts()</code> must list exactly what the actor handles — an unlisted id is a routing error, not a silent drop.</p></div>
+    <div class="card"><h4>Don't hold a pin across messages</h4><p><code>Pinned</code> borrows for the handler call. Holding one longer pins a version against reclamation and defeats the point; re-pin next message and read the newer edition.</p></div>
+    <div class="card"><h4>Release <code>ReplyRef</code> promptly</h4><p>It is a loaned, journaled chunk. Drop it (or call <code>release()</code>) as soon as you have what you need; leaking guards means leaking pool capacity until the coordinator reclaims.</p></div>
+  </div>
+  <p>The end-to-end reference is <code>crates/holon-demo</code>: two actors in one process, a client
+  pool, a supervisor-injected <code>kill -9</code>, and a census that proves nothing leaked. Run it
+  with <code>cargo run -p holon-demo --release</code>.</p>
+</section>
+
+<nav class="pgnav" aria-label="Pagination">
+  <a href="guide.html"><span class="lab">← Previous</span><span class="ttl" style="display:block">Guide</span></a>
+  <a class="next" href="benchmarks.html"><span class="lab">Next →</span><span class="ttl" style="display:block">Benchmarks</span></a>
+</nav>
+</main>
+<aside class="otp" aria-label="On this page">
+  <div class="t">On this page</div>
+  <a href="#laws">Two laws</a>
+  <a href="#message">What a message is</a>
+  <a href="#payload">Payloads</a>
+  <a href="#actor">The Actor trait</a>
+  <a href="#host">Hosting actors</a>
+  <a href="#call">Calling an actor</a>
+  <a href="#cx">Handler context</a>
+  <a href="#latency">Latency knob</a>
+  <a href="#ownership">Chunk ownership</a>
+  <a href="#failure">Failure model</a>
+  <a href="#rules">Rules &amp; traps</a>
+</aside>
+</div>
+
+<footer class="site"><div class="in">
+  <div>Holon · an actor framework on the shm-actors substrate · Apache-2.0</div>
+  <div class="mono"><a href="adrs.html">decision record</a> · <a href="benchmarks.html">benchmarks</a> · <a href="api/holon_actor/index.html">API</a></div>
+</div></footer>
+<script src="site.js"></script>
+</body>
+</html>
